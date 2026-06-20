@@ -18,7 +18,12 @@ pub const Context = struct {
         self.releaseSweepLock();
     }
 
-    pub fn maintain(self: *Context, now_ms: u64, has_local_client: bool) !bool {
+    pub const LocalClientPresence = enum {
+        none,
+        present,
+    };
+
+    pub fn maintain(self: *Context, now_ms: u64, local_client_presence: LocalClientPresence) !bool {
         if (!self.enabled()) {
             self.releaseSweepLock();
             self.initial_sweep_satisfied = true;
@@ -29,7 +34,7 @@ pub const Context = struct {
         const has_records = daemon_cleanup.hasRecords(self.allocator);
         const decision = cleanupMaintenanceDecision(.{
             .has_records = has_records,
-            .has_local_client = has_local_client,
+            .has_local_client = local_client_presence == .present,
             .has_lock = self.sweep_lock != null,
             .initial_sweep_satisfied = self.initial_sweep_satisfied,
             .shutdown_satisfied = self.shutdown_satisfied,
@@ -82,12 +87,12 @@ pub const Context = struct {
 
     fn runSweep(self: *Context) !void {
         daemon_log.infof(self.allocator, "cleanup sweep started", .{});
-        try daemon_cleanup.sweepRecords(
-            self.allocator,
-            self.cleanup_retry_limit_ms,
-            self,
-            cleanupRecordViaRemote,
-        );
+        try daemon_cleanup.sweepRecords(.{
+            .allocator = self.allocator,
+            .cleanup_retry_limit_ms = self.cleanup_retry_limit_ms,
+            .context = self,
+            .clean_fn = cleanupRecordViaRemote,
+        });
         daemon_log.infof(self.allocator, "cleanup sweep finished", .{});
     }
 };
@@ -170,7 +175,7 @@ fn cleanupRecordViaRemote(
     daemon_log.infof(
         allocator,
         "cleanup record enqueueing remote cleanup guid={s} host={s}@{s}:{s}",
-        .{ record.guid, record.remote_user, record.remote_host, record.remote_port },
+        .{ record.guid, record.endpoint.user, record.endpoint.host, record.endpoint.port },
     );
     try transport_ssh.enqueueCleanupRequestToRemote(allocator, cleanup_context.daemon_dispatcher, record);
     daemon_log.infof(

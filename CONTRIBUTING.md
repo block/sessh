@@ -13,7 +13,9 @@ have comments summarizing what they do, and why (if it's not obvious)
 Favor small sets of arguments to functions. When larger sets of arguments are
 warranted and the arguments are non-obvious, use named-parameter-structs.
 
-Don't use threads. Use non-blocking IO instead.
+Don't use threads for production code. Use non-blocking IO instead. Test code
+can use threads when that is the cleanest way to exercise the behavior under
+test.
 
 ## Development Setup
 

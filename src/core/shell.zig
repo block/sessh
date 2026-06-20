@@ -1,9 +1,6 @@
 const std = @import("std");
-const c = std.c;
 
-const io_helpers = @import("io.zig");
-
-pub fn joinArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
+fn joinArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -25,37 +22,6 @@ fn appendQuotedArg(allocator: std.mem.Allocator, out: *std.ArrayList(u8), arg: [
         }
     }
     try out.append(allocator, '\'');
-}
-
-pub fn writeArg(fd: c.fd_t, arg: []const u8) !void {
-    if (arg.len == 0) {
-        try io_helpers.writeAll(fd, "''");
-        return;
-    }
-    if (isPlainArg(arg)) {
-        try io_helpers.writeAll(fd, arg);
-        return;
-    }
-    try io_helpers.writeAll(fd, "'");
-    for (arg) |byte| {
-        if (byte == '\'') {
-            try io_helpers.writeAll(fd, "'\\''");
-        } else {
-            var one = [_]u8{byte};
-            try io_helpers.writeAll(fd, &one);
-        }
-    }
-    try io_helpers.writeAll(fd, "'");
-}
-
-fn isPlainArg(arg: []const u8) bool {
-    for (arg) |byte| {
-        switch (byte) {
-            'A'...'Z', 'a'...'z', '0'...'9', '_', '-', '.', '/', ':', '@', '%', '+', '=' => {},
-            else => return false,
-        }
-    }
-    return true;
 }
 
 test "joinArgs produces shell-split ssh options" {

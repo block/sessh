@@ -3,6 +3,8 @@ const c = std.c;
 const posix = std.posix;
 
 const io = @import("../core/io.zig");
+const core_fds = @import("../core/fds.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const protocol = @import("../protocol/mod.zig");
 const daemon_executable = @import("executable.zig");
 const daemon_handshake = @import("handshake.zig");
@@ -27,13 +29,13 @@ pub fn connect(allocator: std.mem.Allocator) !c.fd_t {
 }
 
 pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
-    const fd = try connectOrStart(allocator, exe);
-    defer _ = c.close(fd);
+    var fd = core_fds.OwnedFd.init(try connectOrStart(allocator, exe));
+    defer fd.deinit();
 }
 
 pub fn ensureStartedForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
-    const fd = try connectOrStartForDirName(allocator, exe, dir_name);
-    defer _ = c.close(fd);
+    var fd = core_fds.OwnedFd.init(try connectOrStartForDirName(allocator, exe, dir_name));
+    defer fd.deinit();
 }
 
 pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
@@ -58,38 +60,49 @@ pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, d
 
     var pipe = try daemon_startup.ReadyPipe.init();
     defer pipe.deinit();
-    if (!try spawnDaemonIfNamespaceUnlocked(allocator, exe, dir_name, pipe.write_fd, startup_lock.file.handle)) {
+    if (!try spawnDaemonIfNamespaceUnlocked(.{
+        .allocator = allocator,
+        .exe = exe,
+        .dir_name = dir_name,
+        .ready_pipe = &pipe,
+        .startup_lock = &startup_lock,
+    })) {
         return error.DaemonDidNotStart;
     }
     pipe.closeWrite();
-    switch (try daemon_startup.waitForReady(pipe.read_fd)) {
+    switch (try daemon_startup.waitForReady(&pipe)) {
         .ready => return connectAndHandshakeForDirName(allocator, dir_name),
         .closed, .timed_out => return error.DaemonDidNotStart,
     }
 }
 
-fn spawnDaemonIfNamespaceUnlocked(
+const DaemonSpawnOptions = struct {
     allocator: std.mem.Allocator,
     exe: []const u8,
     dir_name: []const u8,
-    ready_fd: c.fd_t,
-    startup_lock_fd: c.fd_t,
-) !bool {
+    ready_pipe: *daemon_startup.ReadyPipe,
+    startup_lock: *daemon_startup.StartupLock,
+};
+
+fn spawnDaemonIfNamespaceUnlocked(options: DaemonSpawnOptions) !bool {
+    const allocator = options.allocator;
+    const exe = options.exe;
+    const dir_name = options.dir_name;
     var namespace_executables = (try daemon_executable.installNamespaceExecutablesForDaemonStart(allocator, exe, dir_name)) orelse return false;
     defer namespace_executables.deinit();
     const argv = [_][]const u8{ namespace_executables.daemon, dir_name };
     var env_map = try std.process.getEnvMap(allocator);
     defer env_map.deinit();
-    try daemon_startup.addReadyFdToEnvMap(allocator, &env_map, ready_fd);
-    try daemon_startup.addStartupLockFdToEnvMap(allocator, &env_map, startup_lock_fd);
-    try socket_transport.clearCloseOnExec(startup_lock_fd);
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.env_map = &env_map;
-    child.pgid = 0;
-    try child.spawn();
+    try daemon_startup.addReadyFdToEnvMap(allocator, &env_map, options.ready_pipe.write_fd);
+    try daemon_startup.addStartupLockFdToEnvMap(allocator, &env_map, options.startup_lock.file.handle);
+    try socket_transport.clearCloseOnExec(options.startup_lock.file.handle);
+    var daemon_process = std.process.Child.init(&argv, allocator);
+    daemon_process.stdin_behavior = .Ignore;
+    daemon_process.stdout_behavior = .Ignore;
+    daemon_process.stderr_behavior = .Ignore;
+    daemon_process.env_map = &env_map;
+    daemon_process.pgid = 0;
+    try daemon_process.spawn();
     return true;
 }
 
@@ -105,23 +118,159 @@ pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
     try io.writeAll(posix.STDOUT_FILENO, path);
     try io.writeAll(posix.STDOUT_FILENO, "\n");
 
-    try protocol.sendDaemonLogRequestFrame(allocator, fd, .{});
+    var subscriber = try DaemonLogSubscriber.init(allocator, fd, posix.STDOUT_FILENO);
+    defer subscriber.deinit();
+    try subscriber.run();
+}
 
-    while (true) {
-        var frame = readDaemonLogFrameBlocking(allocator, fd) catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => return err,
+fn daemonLogRequestWriter(allocator: std.mem.Allocator) !protocol.FrameWriteState {
+    const payload = try protocol.encodeClientDaemonPayload(allocator, .{ .log_request = .{} });
+    defer allocator.free(payload);
+    return protocol.FrameWriteState.init(allocator, .client_daemon, payload);
+}
+
+const DaemonLogSubscriber = struct {
+    allocator: std.mem.Allocator,
+    dispatcher: dispatcher.Dispatcher,
+    daemon_fd: c.fd_t,
+    output_fd: c.fd_t,
+    reader: protocol.FrameReader,
+    request_writer: ?protocol.FrameWriteState,
+    watch_id: ?dispatcher.FdWatchId = null,
+    err: ?anyerror = null,
+
+    fn init(allocator: std.mem.Allocator, daemon_fd: c.fd_t, output_fd: c.fd_t) !DaemonLogSubscriber {
+        var request_writer = try daemonLogRequestWriter(allocator);
+        errdefer request_writer.deinit();
+        return .{
+            .allocator = allocator,
+            // PROCESS_EVENT_LOOP: `sessh --daemon-log` is a foreground
+            // subscriber. This Dispatcher owns only its daemon socket and
+            // stdout writes; it is not the long-lived sesshd dispatcher.
+            .dispatcher = try dispatcher.Dispatcher.init(allocator),
+            .daemon_fd = daemon_fd,
+            .output_fd = output_fd,
+            .reader = protocol.FrameReader.init(allocator),
+            .request_writer = request_writer,
         };
-        defer frame.deinit(allocator);
+    }
+
+    fn deinit(self: *DaemonLogSubscriber) void {
+        if (self.request_writer) |*writer| writer.deinit();
+        self.dispatcher.deinit();
+        self.reader.deinit();
+        self.* = undefined;
+    }
+
+    fn run(self: *DaemonLogSubscriber) !void {
+        self.watch_id = try self.dispatcher.watchFd(.{
+            .fd = self.daemon_fd,
+            .events = .{ .writable = true },
+            .handler = .{
+                .ctx = self,
+                .callback = handleDaemonLogEvent,
+            },
+        });
+        try self.dispatcher.run();
+        if (self.err) |err| return err;
+    }
+
+    fn stop(self: *DaemonLogSubscriber, err: ?anyerror) void {
+        self.err = err;
+        self.dispatcher.stop();
+    }
+
+    fn handleFrame(self: *DaemonLogSubscriber, frame: *const protocol.OwnedFrame) !void {
         switch (frame.message_type) {
             .client_daemon => {
-                var entry = try protocol.decodeClientDaemonLogEntry(allocator, frame.payload);
-                defer entry.deinit(allocator);
-                const line = try daemonLogLine(allocator, entry.unix_ms, entry.message);
-                defer allocator.free(line);
-                try io.writeAll(posix.STDOUT_FILENO, line);
+                var entry = try protocol.decodeClientDaemonLogEntry(self.allocator, frame.payload);
+                defer entry.deinit(self.allocator);
+                const line = try daemonLogLine(self.allocator, entry.unix_ms, entry.message);
+                defer self.allocator.free(line);
+                try io.writeAll(self.output_fd, line);
             },
             else => return error.UnexpectedDaemonFrame,
+        }
+    }
+};
+
+fn finishDaemonLogRequest(subscriber: *DaemonLogSubscriber, event_dispatcher: *dispatcher.Dispatcher) !void {
+    if (subscriber.request_writer) |*writer| {
+        writer.deinit();
+        subscriber.request_writer = null;
+    }
+    const watch_id = subscriber.watch_id orelse return;
+    try event_dispatcher.updateFdEvents(watch_id, .{ .readable = true });
+}
+
+fn writeDaemonLogRequest(
+    subscriber: *DaemonLogSubscriber,
+    event_dispatcher: *dispatcher.Dispatcher,
+    fd_event: dispatcher.FdEvent,
+) !bool {
+    const writer = if (subscriber.request_writer) |*writer| writer else return false;
+    if (!fd_event.writable) return true;
+    switch (try writer.writeReady(subscriber.daemon_fd)) {
+        .blocked, .progress => return true,
+        .done => {
+            try finishDaemonLogRequest(subscriber, event_dispatcher);
+            return false;
+        },
+    }
+}
+
+fn handleDaemonLogEvent(
+    ctx: *anyopaque,
+    handler_event: dispatcher.HandlerEvent,
+) !void {
+    const event_dispatcher = handler_event.dispatcher;
+    const id = handler_event.id;
+    const event = handler_event.event;
+    const subscriber: *DaemonLogSubscriber = @ptrCast(@alignCast(ctx));
+    const watch_id = subscriber.watch_id orelse return;
+    switch (id) {
+        .fd => |fd_id| if (fd_id.index != watch_id.index or fd_id.generation != watch_id.generation) return,
+        .timer => return,
+    }
+
+    const fd_event = switch (event) {
+        .fd => |fd| fd,
+        .timer => return,
+    };
+    if (fd_event.error_event or fd_event.invalid) {
+        subscriber.stop(error.DaemonTransportClosed);
+        return;
+    }
+    if (subscriber.request_writer != null and try writeDaemonLogRequest(subscriber, event_dispatcher, fd_event)) {
+        if (fd_event.hangup) subscriber.stop(null);
+        return;
+    }
+    if (!fd_event.readable) {
+        if (fd_event.hangup) subscriber.stop(null);
+        return;
+    }
+    while (true) {
+        switch (try subscriber.reader.readReady(subscriber.daemon_fd)) {
+            .blocked, .progress => {
+                if (fd_event.hangup) subscriber.stop(null);
+                return;
+            },
+            .frame => |frame| {
+                var owned_frame = frame;
+                defer owned_frame.deinit(subscriber.allocator);
+                subscriber.handleFrame(&owned_frame) catch |err| {
+                    subscriber.stop(err);
+                    return;
+                };
+            },
+            .eof => {
+                subscriber.stop(null);
+                return;
+            },
+            .truncated_frame => {
+                subscriber.stop(error.TruncatedFrame);
+                return;
+            },
         }
     }
 }
@@ -176,23 +325,6 @@ fn formatDaemonLogTimestampParts(buf: *[daemon_log_timestamp_len]u8, local_time:
     });
 }
 
-// BLOCKING_FRAME_READ: `sessh --daemon-log` is an explicit foreground log
-// subscriber. It intentionally waits for future log entries on stdout and is
-// not used by the daemon, pooled transport, or terminal worker.
-fn readDaemonLogFrameBlocking(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
-    var reader = protocol.FrameReader.init(allocator);
-    defer reader.deinit();
-    while (true) {
-        switch (try reader.readBlocking(fd)) {
-            .blocked => return error.WouldBlock,
-            .progress => continue,
-            .frame => |frame| return frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
-    }
-}
-
 test "daemon log timestamp uses readable milliseconds" {
     var local_time = std.mem.zeroes(LocalTm);
     local_time.tm_hour = 3;
@@ -203,10 +335,78 @@ test "daemon log timestamp uses readable milliseconds" {
     try std.testing.expectEqualStrings("03:04:05.007", text);
 }
 
-pub fn connectAndHandshake(allocator: std.mem.Allocator) !c.fd_t {
-    const dir_name = try socket_namespace.selectedDirName(allocator);
-    defer allocator.free(dir_name);
-    return connectAndHandshakeForDirName(allocator, dir_name);
+test "daemon log subscriber reads frames with dispatcher" {
+    const protocol_test_helpers = @import("../protocol/test_helpers.zig");
+    const allocator = std.testing.allocator;
+    var daemon_pair: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &daemon_pair) != 0) return error.SocketPairFailed;
+    var daemon_fd_open = true;
+    defer {
+        if (daemon_fd_open) _ = c.close(daemon_pair[0]);
+    }
+    const output_pipe = try posix.pipe();
+    defer _ = c.close(output_pipe[0]);
+    var output_write_open = true;
+    defer {
+        if (output_write_open) _ = c.close(output_pipe[1]);
+    }
+
+    const TestPeer = struct {
+        fd: c.fd_t,
+        err: ?anyerror = null,
+
+        fn run(peer: *@This()) void {
+            peer.runInner() catch |err| {
+                peer.err = err;
+            };
+        }
+
+        fn runInner(peer: *@This()) !void {
+            defer _ = c.close(peer.fd);
+            var request = protocol_test_helpers.readFrameForTest(std.testing.allocator, peer.fd) catch |err| switch (err) {
+                error.EndOfStream => return error.MissingDaemonLogRequest,
+                else => return err,
+            };
+            defer request.deinit(std.testing.allocator);
+            if (request.message_type != .client_daemon) return error.UnexpectedDaemonFrame;
+            var item = try protocol.decodePayload(protocol.pb.ClientDaemonItem, std.testing.allocator, request.payload);
+            defer item.deinit(std.testing.allocator);
+            switch (item.payload orelse return error.MissingClientDaemonPayload) {
+                .log_request => {},
+                else => return error.UnexpectedClientDaemonPayload,
+            }
+
+            try protocol_test_helpers.sendClientDaemonPayloadFrameBlocking(std.testing.allocator, peer.fd, .{
+                .log_entry = .{
+                    .unix_ms = 0,
+                    .message = "dispatcher log event",
+                },
+            });
+        }
+    };
+
+    var peer = TestPeer{ .fd = daemon_pair[1] };
+    var peer_thread = try std.Thread.spawn(.{}, TestPeer.run, .{&peer});
+    defer {
+        if (daemon_fd_open) {
+            _ = c.close(daemon_pair[0]);
+            daemon_fd_open = false;
+        }
+        peer_thread.join();
+    }
+
+    var subscriber = try DaemonLogSubscriber.init(allocator, daemon_pair[0], output_pipe[1]);
+    defer subscriber.deinit();
+    try subscriber.run();
+    if (peer.err) |err| return err;
+
+    _ = c.close(output_pipe[1]);
+    output_write_open = false;
+    var buf: [256]u8 = undefined;
+    const n = c.read(output_pipe[0], &buf, buf.len);
+    if (n <= 0) return error.MissingDaemonLogOutput;
+    const output = buf[0..@intCast(n)];
+    try std.testing.expect(std.mem.indexOf(u8, output, "dispatcher log event\n") != null);
 }
 
 pub fn connectForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
@@ -216,8 +416,8 @@ pub fn connectForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.
 }
 
 pub fn connectAndHandshakeForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
-    const fd = try connectForDirName(allocator, dir_name);
-    errdefer _ = c.close(fd);
-    try daemon_handshake.initiateForegroundClientHandshake(allocator, fd);
-    return fd;
+    var fd = core_fds.OwnedFd.init(try connectForDirName(allocator, dir_name));
+    defer fd.deinit();
+    try daemon_handshake.initiateForegroundClientHandshake(allocator, fd.get());
+    return fd.take();
 }

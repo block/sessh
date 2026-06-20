@@ -40,16 +40,29 @@ pub const SpawnWithInheritedListenerOptions = struct {
     args_after_socket_path: []const []const u8 = &.{},
 };
 
+pub fn namespaceSocketPath(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    socket_file_name: []const u8,
+) ![]u8 {
+    const exe_dir = std.fs.path.dirname(exe) orelse return error.InvalidRemoteProcessExecutablePath;
+    const namespace = std.fs.path.basename(exe_dir);
+    const root = try socket_transport.shortSesshRuntimeDir(allocator);
+    defer allocator.free(root);
+    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ root, namespace, socket_file_name });
+}
+
 pub fn spawnWithInheritedListener(
     allocator: std.mem.Allocator,
     options: SpawnWithInheritedListenerOptions,
 ) !std.process.Child.Id {
     try socket_transport.ensureSocketDir(allocator, options.socket_path);
     const listen_fd = try socket_transport.listenSocket(options.socket_path);
-    errdefer _ = c.close(listen_fd);
-    try socket_transport.clearCloseOnExec(listen_fd);
+    var owned_listen_fd = core_fds.OwnedFd.init(listen_fd);
+    defer owned_listen_fd.deinit();
+    try socket_transport.clearCloseOnExec(owned_listen_fd.get());
 
-    const listen_fd_arg = try std.fmt.allocPrint(allocator, "{}", .{listen_fd});
+    const listen_fd_arg = try std.fmt.allocPrint(allocator, "{}", .{owned_listen_fd.get()});
     defer allocator.free(listen_fd_arg);
 
     const argv_len = 3 + options.args_after_socket_path.len;
@@ -62,11 +75,24 @@ pub fn spawnWithInheritedListener(
         argv[3 + index] = arg;
     }
 
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    _ = c.close(listen_fd);
-    return child.id;
+    var worker_process = std.process.Child.init(argv, allocator);
+    worker_process.stdin_behavior = .Ignore;
+    worker_process.stdout_behavior = .Ignore;
+    worker_process.stderr_behavior = .Ignore;
+    try worker_process.spawn();
+    owned_listen_fd.deinit();
+    return worker_process.id;
+}
+
+test "worker namespace socket path uses executable namespace" {
+    const allocator = std.testing.allocator;
+    const exe = "/tmp/sessh-test-root/runtime.remote/3.dev.abcdef12/sessh-terminal-remote";
+    const path = try namespaceSocketPath(allocator, exe, "terminal-123-0.sock");
+    defer allocator.free(path);
+
+    const root = try socket_transport.shortSesshRuntimeDir(allocator);
+    defer allocator.free(root);
+    const expected = try std.fmt.allocPrint(allocator, "{s}/3.dev.abcdef12/terminal-123-0.sock", .{root});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, path);
 }

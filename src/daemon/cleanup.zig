@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
@@ -16,6 +17,67 @@ const pb = protocol.pb;
 pub const LocalProcessIdentity = struct {
     pid: u64,
     start_time: []const u8,
+
+    pub fn clone(allocator: std.mem.Allocator, identity: LocalProcessIdentity) !LocalProcessIdentity {
+        return .{
+            .pid = identity.pid,
+            .start_time = try allocator.dupe(u8, identity.start_time),
+        };
+    }
+
+    pub fn deinit(self: *LocalProcessIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.start_time);
+        self.* = undefined;
+    }
+};
+
+pub const RemoteProcessIdentity = struct {
+    pid: u64,
+    start_time: []const u8,
+    socket_path: []const u8,
+
+    pub fn clone(allocator: std.mem.Allocator, identity: RemoteProcessIdentity) !RemoteProcessIdentity {
+        const start_time = try allocator.dupe(u8, identity.start_time);
+        errdefer allocator.free(start_time);
+        const socket_path = try allocator.dupe(u8, identity.socket_path);
+        errdefer allocator.free(socket_path);
+        return .{
+            .pid = identity.pid,
+            .start_time = start_time,
+            .socket_path = socket_path,
+        };
+    }
+
+    pub fn deinit(self: *RemoteProcessIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.start_time);
+        allocator.free(self.socket_path);
+        self.* = undefined;
+    }
+
+    pub fn fromProto(process: pb.DaemonTunnelItem.RemoteProcessIdentity) RemoteProcessIdentity {
+        return .{
+            .pid = process.pid,
+            .start_time = process.start_time,
+            .socket_path = process.daemon_socket_path,
+        };
+    }
+
+    pub fn fromDaemonIdentity(identity: daemon_identity.DaemonIdentity) RemoteProcessIdentity {
+        return .{
+            .pid = identity.pid,
+            .start_time = identity.start_time,
+            .socket_path = identity.socket_path,
+        };
+    }
+
+    pub fn toProto(self: RemoteProcessIdentity, guid: []const u8) pb.DaemonTunnelItem.RemoteProcessIdentity {
+        return .{
+            .pid = self.pid,
+            .start_time = self.start_time,
+            .daemon_socket_path = self.socket_path,
+            .guid = guid,
+        };
+    }
 };
 
 pub const RemoteEndpoint = struct {
@@ -24,16 +86,16 @@ pub const RemoteEndpoint = struct {
     port: []const u8,
 };
 
+// Persistent cleanup records bind the local owner identity to the remote
+// endpoint and remote process identity. The local identity prevents a later
+// process that reused the same pid from causing cleanup, while the remote pid
+// and start token prevent us from hanging up an unrelated process after reboot
+// or pid reuse.
 pub const Record = struct {
     guid: []const u8,
-    local_pid: u64,
-    local_start_time: []const u8,
-    remote_user: []const u8,
-    remote_host: []const u8,
-    remote_port: []const u8,
-    remote_pid: u64,
-    remote_start_time: []const u8,
-    remote_socket_path: []const u8,
+    local: LocalProcessIdentity,
+    endpoint: RemoteEndpoint,
+    remote: RemoteProcessIdentity,
 };
 
 const RecordJson = struct {
@@ -76,31 +138,27 @@ pub fn makeRemoteProcessIdentity(
     identity: daemon_identity.DaemonIdentity,
     guid: []const u8,
 ) pb.DaemonTunnelItem.RemoteProcessIdentity {
-    return .{
-        .pid = identity.pid,
-        .start_time = identity.start_time,
-        .daemon_socket_path = identity.socket_path,
-        .guid = guid,
-    };
+    return RemoteProcessIdentity.fromDaemonIdentity(identity).toProto(guid);
 }
 
-pub fn recordRemoteProcessStarted(
+pub const RecordRemoteProcessStartedOptions = struct {
     allocator: std.mem.Allocator,
     local: LocalProcessIdentity,
     endpoint: RemoteEndpoint,
     process: pb.DaemonTunnelItem.RemoteProcessIdentity,
-) !void {
+};
+
+pub fn recordRemoteProcessStarted(options: RecordRemoteProcessStartedOptions) !void {
+    const allocator = options.allocator;
+    const local = options.local;
+    const endpoint = options.endpoint;
+    const process = options.process;
     try validateGuidForFile(process.guid);
     const record = Record{
         .guid = process.guid,
-        .local_pid = local.pid,
-        .local_start_time = local.start_time,
-        .remote_user = endpoint.user,
-        .remote_host = endpoint.host,
-        .remote_port = endpoint.port,
-        .remote_pid = process.pid,
-        .remote_start_time = process.start_time,
-        .remote_socket_path = process.daemon_socket_path,
+        .local = local,
+        .endpoint = endpoint,
+        .remote = RemoteProcessIdentity.fromProto(process),
     };
     try writeRecord(allocator, record);
 }
@@ -114,55 +172,18 @@ pub fn deleteRecordByGuid(allocator: std.mem.Allocator, guid: []const u8) void {
     };
 }
 
-pub fn sendRemoteProcessStarted(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    stream_id: u64,
-    process: pb.DaemonTunnelItem.RemoteProcessIdentity,
-) !void {
-    try protocol.sendDaemonTunnelPayloadFrame(allocator, fd, .{ .remote_process_started = .{
-        .stream_id = stream_id,
-        .process = process,
-    } });
-}
-
-pub fn sendRemoteProcessRecorded(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    stream_id: u64,
-) !void {
-    try protocol.sendDaemonTunnelPayloadFrame(allocator, fd, .{ .remote_process_recorded = .{
-        .stream_id = stream_id,
-    } });
-}
-
-pub fn sendRemoteProcessCleanupRequest(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    process: pb.DaemonTunnelItem.RemoteProcessIdentity,
-) !void {
-    try protocol.sendDaemonTunnelPayloadFrame(allocator, fd, .{ .remote_process_cleanup_request = .{
-        .process = process,
-    } });
-}
-
-pub fn handleRemoteProcessCleanupRequest(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    identity: daemon_identity.DaemonIdentity,
-    request: pb.DaemonTunnelItem.RemoteProcessCleanupRequest,
-) !void {
-    const process = request.process orelse return error.UnexpectedFrame;
-    const result = cleanupRemoteProcess(allocator, identity, process) catch .missing;
-    try sendRemoteProcessCleanupResponse(allocator, fd, process, result);
-}
-
-pub fn handleRemoteProcessCleanupRequestQueued(
+pub const RemoteProcessCleanupRequestQueuedOptions = struct {
     allocator: std.mem.Allocator,
     mux_writer: *frame_write_queue.FrameWriteQueue,
     identity: daemon_identity.DaemonIdentity,
     request: pb.DaemonTunnelItem.RemoteProcessCleanupRequest,
-) !void {
+};
+
+pub fn handleRemoteProcessCleanupRequestQueued(options: RemoteProcessCleanupRequestQueuedOptions) !void {
+    const allocator = options.allocator;
+    const mux_writer = options.mux_writer;
+    const identity = options.identity;
+    const request = options.request;
     const process = request.process orelse return error.UnexpectedFrame;
     const result = cleanupRemoteProcess(allocator, identity, process) catch .missing;
     try queueRemoteProcessCleanupResponse(mux_writer, process, result);
@@ -236,12 +257,18 @@ pub fn markSweepStarted(
     try lock.file.sync();
 }
 
-pub fn sweepRecords(
+pub const SweepRecordsOptions = struct {
     allocator: std.mem.Allocator,
     cleanup_retry_limit_ms: u64,
     context: *anyopaque,
     clean_fn: SweepCleanFn,
-) !void {
+};
+
+pub fn sweepRecords(options: SweepRecordsOptions) !void {
+    const allocator = options.allocator;
+    const cleanup_retry_limit_ms = options.cleanup_retry_limit_ms;
+    const context = options.context;
+    const clean_fn = options.clean_fn;
     const procs_dir = procsDir(allocator) catch |err| switch (err) {
         error.MissingStateHome => return,
         else => return err,
@@ -260,7 +287,14 @@ pub fn sweepRecords(
         const guid = guidFromRecordFilename(entry.name) catch continue;
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ procs_dir, entry.name });
         defer allocator.free(path);
-        try sweepRecordPath(allocator, path, guid, cleanup_retry_limit_ms, context, clean_fn);
+        try sweepRecordPath(.{
+            .allocator = allocator,
+            .path = path,
+            .guid = guid,
+            .cleanup_retry_limit_ms = cleanup_retry_limit_ms,
+            .context = context,
+            .clean_fn = clean_fn,
+        });
     }
 }
 
@@ -317,22 +351,6 @@ fn cleanupGuidOnCurrentDaemon(allocator: std.mem.Allocator, guid: []const u8) !C
     return .missing;
 }
 
-fn sendRemoteProcessCleanupResponse(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    process: pb.DaemonTunnelItem.RemoteProcessIdentity,
-    result: CleanupResult,
-) !void {
-    const result_payload: pb.DaemonTunnelItem.RemoteProcessCleanupResponse.result_union = switch (result) {
-        .cleaned => .{ .cleaned = .{} },
-        .missing => .{ .missing = .{} },
-    };
-    try protocol.sendDaemonTunnelPayloadFrame(allocator, fd, .{ .remote_process_cleanup_response = .{
-        .process = process,
-        .result = result_payload,
-    } });
-}
-
 fn queueRemoteProcessCleanupResponse(
     mux_writer: *frame_write_queue.FrameWriteQueue,
     process: pb.DaemonTunnelItem.RemoteProcessIdentity,
@@ -386,14 +404,14 @@ fn writeRecordInProcsDir(allocator: std.mem.Allocator, procs_dir: []const u8, re
 
 fn recordJsonFromRecord(record: Record) RecordJson {
     return .{
-        .local_pid = record.local_pid,
-        .local_start_time = record.local_start_time,
-        .remote_user = record.remote_user,
-        .remote_host = record.remote_host,
-        .remote_port = record.remote_port,
-        .remote_pid = record.remote_pid,
-        .remote_start_time = record.remote_start_time,
-        .remote_socket_path = record.remote_socket_path,
+        .local_pid = record.local.pid,
+        .local_start_time = record.local.start_time,
+        .remote_user = record.endpoint.user,
+        .remote_host = record.endpoint.host,
+        .remote_port = record.endpoint.port,
+        .remote_pid = record.remote.pid,
+        .remote_start_time = record.remote.start_time,
+        .remote_socket_path = record.remote.socket_path,
     };
 }
 
@@ -453,14 +471,19 @@ fn fileMtimeUnixMs(stat: std.fs.File.Stat) u64 {
     return std.math.cast(u64, mtime_ms) orelse std.math.maxInt(u64);
 }
 
-fn sweepRecordPath(
+const SweepRecordOptions = struct {
     allocator: std.mem.Allocator,
     path: []const u8,
     guid: []const u8,
     cleanup_retry_limit_ms: u64,
     context: *anyopaque,
     clean_fn: SweepCleanFn,
-) !void {
+};
+
+fn sweepRecordPath(options: SweepRecordOptions) !void {
+    const allocator = options.allocator;
+    const path = options.path;
+    const guid = options.guid;
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -474,21 +497,30 @@ fn sweepRecordPath(
     const persisted = parsed.value;
     const record = Record{
         .guid = guid,
-        .local_pid = persisted.local_pid,
-        .local_start_time = persisted.local_start_time,
-        .remote_user = persisted.remote_user,
-        .remote_host = persisted.remote_host,
-        .remote_port = persisted.remote_port,
-        .remote_pid = persisted.remote_pid,
-        .remote_start_time = persisted.remote_start_time,
-        .remote_socket_path = persisted.remote_socket_path,
+        .local = .{
+            .pid = persisted.local_pid,
+            .start_time = persisted.local_start_time,
+        },
+        .endpoint = .{
+            .user = persisted.remote_user,
+            .host = persisted.remote_host,
+            .port = persisted.remote_port,
+        },
+        .remote = .{
+            .pid = persisted.remote_pid,
+            .start_time = persisted.remote_start_time,
+            .socket_path = persisted.remote_socket_path,
+        },
     };
 
-    if (daemon_identity.processIdentityMatches(allocator, record.local_pid, record.local_start_time)) return;
+    if (daemon_identity.processIdentityMatches(allocator, record.local.pid, record.local.start_time)) return;
 
+    // The record's mtime is the retry-age clock. The JSON payload describes
+    // the remote process identity, while the filesystem timestamp lets cleanup
+    // abandon stale records without rewriting them during normal retries.
     const now_ms = nowUnixMs();
     const record_mtime_unix_ms = fileMtimeUnixMs(stat);
-    if (cleanup_retry_limit_ms > 0 and record_mtime_unix_ms > 0 and now_ms -| record_mtime_unix_ms >= cleanup_retry_limit_ms) {
+    if (options.cleanup_retry_limit_ms > 0 and record_mtime_unix_ms > 0 and now_ms -| record_mtime_unix_ms >= options.cleanup_retry_limit_ms) {
         daemon_log.infof(allocator, "cleanup record expired guid={s}", .{guid});
         std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -497,7 +529,7 @@ fn sweepRecordPath(
         return;
     }
 
-    const result = clean_fn(context, allocator, record) catch return;
+    const result = options.clean_fn(options.context, allocator, record) catch return;
     switch (result) {
         .cleaned, .missing => std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -514,6 +546,50 @@ fn sweepLockPath(allocator: std.mem.Allocator) ![]u8 {
 
 test "record path rejects path separators" {
     try std.testing.expectError(error.InvalidGuid, validateGuidForFile("s-nope/nope"));
+}
+
+test "local process identity clone owns start time" {
+    const borrowed = LocalProcessIdentity{
+        .pid = 42,
+        .start_time = "local-start",
+    };
+
+    var owned = try LocalProcessIdentity.clone(std.testing.allocator, borrowed);
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(borrowed.pid, owned.pid);
+    try std.testing.expectEqualStrings(borrowed.start_time, owned.start_time);
+    try std.testing.expect(borrowed.start_time.ptr != owned.start_time.ptr);
+}
+
+test "remote process identity clone owns string fields" {
+    const borrowed = RemoteProcessIdentity{
+        .pid = 43,
+        .start_time = "remote-start",
+        .socket_path = "/tmp/sesshd.sock",
+    };
+
+    var owned = try RemoteProcessIdentity.clone(std.testing.allocator, borrowed);
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(borrowed.pid, owned.pid);
+    try std.testing.expectEqualStrings(borrowed.start_time, owned.start_time);
+    try std.testing.expectEqualStrings(borrowed.socket_path, owned.socket_path);
+    try std.testing.expect(borrowed.start_time.ptr != owned.start_time.ptr);
+    try std.testing.expect(borrowed.socket_path.ptr != owned.socket_path.ptr);
+}
+
+test "daemon identity maps to cleanup protocol identity" {
+    const process = makeRemoteProcessIdentity(.{
+        .pid = 44,
+        .start_time = "daemon-start",
+        .socket_path = "/tmp/daemon.sock",
+    }, "s-550e8400-e29b-41d4-a716-446655440000");
+
+    try std.testing.expectEqual(@as(u64, 44), process.pid);
+    try std.testing.expectEqualStrings("daemon-start", process.start_time);
+    try std.testing.expectEqualStrings("/tmp/daemon.sock", process.daemon_socket_path);
+    try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", process.guid);
 }
 
 test "record filename provides cleanup guid" {
@@ -534,14 +610,20 @@ test "cleanup record JSON omits filename-owned identity and age fields" {
     defer json_writer.deinit();
     try std.json.Stringify.value(recordJsonFromRecord(.{
         .guid = "s-550e8400-e29b-41d4-a716-446655440000",
-        .local_pid = 12,
-        .local_start_time = "local-start",
-        .remote_user = "user",
-        .remote_host = "host",
-        .remote_port = "22",
-        .remote_pid = 34,
-        .remote_start_time = "remote-start",
-        .remote_socket_path = "/tmp/sesshd.sock",
+        .local = .{
+            .pid = 12,
+            .start_time = "local-start",
+        },
+        .endpoint = .{
+            .user = "user",
+            .host = "host",
+            .port = "22",
+        },
+        .remote = .{
+            .pid = 34,
+            .start_time = "remote-start",
+            .socket_path = "/tmp/sesshd.sock",
+        },
     }), .{}, &json_writer.writer);
     const bytes = try json_writer.toOwnedSlice();
     defer std.testing.allocator.free(bytes);
@@ -567,25 +649,37 @@ test "cleanup record writer uses filename identity for session and proxy resourc
 
     try writeRecordInProcsDir(allocator, procs_dir, .{
         .guid = session_guid,
-        .local_pid = 12,
-        .local_start_time = "local-start",
-        .remote_user = "user",
-        .remote_host = "host",
-        .remote_port = "22",
-        .remote_pid = 34,
-        .remote_start_time = "remote-start",
-        .remote_socket_path = "/tmp/session.sock",
+        .local = .{
+            .pid = 12,
+            .start_time = "local-start",
+        },
+        .endpoint = .{
+            .user = "user",
+            .host = "host",
+            .port = "22",
+        },
+        .remote = .{
+            .pid = 34,
+            .start_time = "remote-start",
+            .socket_path = "/tmp/session.sock",
+        },
     });
     try writeRecordInProcsDir(allocator, procs_dir, .{
         .guid = proxy_guid,
-        .local_pid = 56,
-        .local_start_time = "proxy-local-start",
-        .remote_user = "proxy-user",
-        .remote_host = "proxy-host",
-        .remote_port = "2222",
-        .remote_pid = 78,
-        .remote_start_time = "proxy-remote-start",
-        .remote_socket_path = "/tmp/proxy.sock",
+        .local = .{
+            .pid = 56,
+            .start_time = "proxy-local-start",
+        },
+        .endpoint = .{
+            .user = "proxy-user",
+            .host = "proxy-host",
+            .port = "2222",
+        },
+        .remote = .{
+            .pid = 78,
+            .start_time = "proxy-remote-start",
+            .socket_path = "/tmp/proxy.sock",
+        },
     });
 
     const session_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ procs_dir, session_guid });
@@ -687,14 +781,14 @@ test "expired cleanup record is deleted without invoking remote cleanup" {
     file.close();
 
     var invoked = false;
-    try sweepRecordPath(
-        allocator,
-        record_path,
-        "p-550e8400-e29b-41d4-a716-446655440000",
-        1,
-        &invoked,
-        testSweepCleanMarksInvoked,
-    );
+    try sweepRecordPath(.{
+        .allocator = allocator,
+        .path = record_path,
+        .guid = "p-550e8400-e29b-41d4-a716-446655440000",
+        .cleanup_retry_limit_ms = 1,
+        .context = &invoked,
+        .clean_fn = testing.sweepCleanMarksInvoked,
+    });
 
     try std.testing.expect(!invoked);
     try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(record_path, .{}));
@@ -715,25 +809,34 @@ test "cleanup sweep skips live local owner and deletes missing dead owner" {
     const dead_guid = "p-550e8400-e29b-41d4-a716-446655440000";
     try writeRecordInProcsDir(allocator, procs_dir, .{
         .guid = live_guid,
-        .local_pid = local.pid,
-        .local_start_time = local.start_time,
-        .remote_user = "user",
-        .remote_host = "host",
-        .remote_port = "22",
-        .remote_pid = 34,
-        .remote_start_time = "remote-start",
-        .remote_socket_path = "/tmp/live.sock",
+        .local = local,
+        .endpoint = .{
+            .user = "user",
+            .host = "host",
+            .port = "22",
+        },
+        .remote = .{
+            .pid = 34,
+            .start_time = "remote-start",
+            .socket_path = "/tmp/live.sock",
+        },
     });
     try writeRecordInProcsDir(allocator, procs_dir, .{
         .guid = dead_guid,
-        .local_pid = 99999999,
-        .local_start_time = "missing-local",
-        .remote_user = "user",
-        .remote_host = "host",
-        .remote_port = "22",
-        .remote_pid = 99999998,
-        .remote_start_time = "missing-remote",
-        .remote_socket_path = "/tmp/dead.sock",
+        .local = .{
+            .pid = 99999999,
+            .start_time = "missing-local",
+        },
+        .endpoint = .{
+            .user = "user",
+            .host = "host",
+            .port = "22",
+        },
+        .remote = .{
+            .pid = 99999998,
+            .start_time = "missing-remote",
+            .socket_path = "/tmp/dead.sock",
+        },
     });
 
     const live_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ procs_dir, live_guid });
@@ -741,37 +844,53 @@ test "cleanup sweep skips live local owner and deletes missing dead owner" {
     const dead_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ procs_dir, dead_guid });
     defer allocator.free(dead_path);
 
-    var context = TestSweepContext{};
-    try sweepRecordPath(allocator, live_path, live_guid, 0, &context, testSweepCleanReturnsMissing);
+    var context = testing.SweepContext{};
+    try sweepRecordPath(.{
+        .allocator = allocator,
+        .path = live_path,
+        .guid = live_guid,
+        .cleanup_retry_limit_ms = 0,
+        .context = &context,
+        .clean_fn = testing.sweepCleanReturnsMissing,
+    });
     try std.testing.expectEqual(@as(usize, 0), context.invocations);
     {
         const file = try std.fs.openFileAbsolute(live_path, .{});
         file.close();
     }
 
-    try sweepRecordPath(allocator, dead_path, dead_guid, 0, &context, testSweepCleanReturnsMissing);
+    try sweepRecordPath(.{
+        .allocator = allocator,
+        .path = dead_path,
+        .guid = dead_guid,
+        .cleanup_retry_limit_ms = 0,
+        .context = &context,
+        .clean_fn = testing.sweepCleanReturnsMissing,
+    });
     try std.testing.expectEqual(@as(usize, 1), context.invocations);
     try std.testing.expectEqualStrings(dead_guid, context.last_guid.?);
     try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(dead_path, .{}));
 }
 
-const TestSweepContext = struct {
-    invocations: usize = 0,
-    last_guid: ?[]const u8 = null,
-};
+const testing = if (builtin.is_test) struct {
+    const SweepContext = struct {
+        invocations: usize = 0,
+        last_guid: ?[]const u8 = null,
+    };
 
-fn testSweepCleanReturnsMissing(ctx: *anyopaque, allocator: std.mem.Allocator, record: Record) !CleanupResult {
-    _ = allocator;
-    const context: *TestSweepContext = @ptrCast(@alignCast(ctx));
-    context.invocations += 1;
-    context.last_guid = record.guid;
-    return .missing;
-}
+    fn sweepCleanReturnsMissing(ctx: *anyopaque, allocator: std.mem.Allocator, record: Record) !CleanupResult {
+        _ = allocator;
+        const context: *SweepContext = @ptrCast(@alignCast(ctx));
+        context.invocations += 1;
+        context.last_guid = record.guid;
+        return .missing;
+    }
 
-fn testSweepCleanMarksInvoked(ctx: *anyopaque, allocator: std.mem.Allocator, record: Record) !CleanupResult {
-    _ = allocator;
-    _ = record;
-    const invoked: *bool = @ptrCast(@alignCast(ctx));
-    invoked.* = true;
-    return .cleaned;
-}
+    fn sweepCleanMarksInvoked(ctx: *anyopaque, allocator: std.mem.Allocator, record: Record) !CleanupResult {
+        _ = allocator;
+        _ = record;
+        const invoked: *bool = @ptrCast(@alignCast(ctx));
+        invoked.* = true;
+        return .cleaned;
+    }
+} else struct {};

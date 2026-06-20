@@ -4,11 +4,9 @@ const posix = std.posix;
 
 const config = @import("../core/config.zig");
 const client_ui = @import("../session/client_ui.zig");
+const posix_pty = @import("../tty/posix_pty.zig");
 const ssh_opts = @import("../transport/ssh_options.zig");
 const proxy_worker = @import("../stream/proxy_worker.zig");
-
-extern "c" fn ttyname(fd: c_int) ?[*:0]u8;
-extern "c" fn openpty(amaster: *c_int, aslave: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
 
 pub const ProxyStreamPlan = struct {
     command_level: config.FilterLevel,
@@ -34,22 +32,31 @@ pub const AutoProxyDiagnosticsFileRequest = struct {
     stderr_fd: c.fd_t,
 };
 
-pub fn terminalPresentation(
+pub const TerminalPresentationRequest = struct {
     filter_level: config.FilterLevel,
     diagnostics_level: config.DiagnosticsLevel,
     diagnostics_output_is_tty: bool,
-) client_ui.ReconnectPresentation {
-    if (diagnostics_level == .jsonl) return .jsonl;
-    if (!diagnostics_output_is_tty) return .line;
-    return switch (diagnostics_level) {
+};
+
+pub const StreamStatusModeRequest = struct {
+    filter_level: config.FilterLevel,
+    diagnostics_level: config.DiagnosticsLevel,
+    has_daemon_control: bool,
+    diagnostics_output_is_tty: bool,
+};
+
+pub fn terminalPresentation(request: TerminalPresentationRequest) client_ui.ReconnectPresentation {
+    if (request.diagnostics_level == .jsonl) return .jsonl;
+    if (!request.diagnostics_output_is_tty) return .line;
+    return switch (request.diagnostics_level) {
         .jsonl => unreachable,
         .line => .line,
         .title => .title,
-        .status => switch (filter_level) {
+        .status => switch (request.filter_level) {
             .unhygienic => .none,
             .hygienic, .emulated => .title,
         },
-        .overlay => switch (filter_level) {
+        .overlay => switch (request.filter_level) {
             .unhygienic => .none,
             .hygienic => .title,
             .emulated => .overlay,
@@ -57,18 +64,13 @@ pub fn terminalPresentation(
     };
 }
 
-pub fn streamStatusMode(
-    filter_level: config.FilterLevel,
-    diagnostics_level: config.DiagnosticsLevel,
-    has_daemon_control: bool,
-    diagnostics_output_is_tty: bool,
-) proxy_worker.StreamReconnectStatusMode {
-    if (diagnostics_level == .jsonl) return .jsonl;
-    if (!diagnostics_output_is_tty) return .line;
-    if (diagnostics_level == .line) return .line;
-    if (diagnostics_level == .title) return .title;
-    if (has_daemon_control) return .client_control;
-    return switch (filter_level) {
+pub fn streamStatusMode(request: StreamStatusModeRequest) proxy_worker.StreamReconnectStatusMode {
+    if (request.diagnostics_level == .jsonl) return .jsonl;
+    if (!request.diagnostics_output_is_tty) return .line;
+    if (request.diagnostics_level == .line) return .line;
+    if (request.diagnostics_level == .title) return .title;
+    if (request.has_daemon_control) return .client_control;
+    return switch (request.filter_level) {
         .unhygienic => .disabled,
         .hygienic, .emulated => .status_line,
     };
@@ -89,7 +91,7 @@ pub fn proxyStreamPlan(request: ProxyStreamPlanRequest) ProxyStreamPlan {
                 .wrap_visible_ssh = false,
                 .client_ctrl_r = false,
             };
-            const wrap_visible_ssh = outerSshAllocatesTty(request.ssh_options, request.tty_request, request.shell_command_args, request.stdin_is_tty);
+            const wrap_visible_ssh = outerSshAllocatesTty(request);
             break :blk .{
                 .command_level = .hygienic,
                 .use_daemon_control = true,
@@ -126,25 +128,20 @@ fn sameTerminalFd(left: c.fd_t, right: c.fd_t) bool {
 
 fn ttyPathForFd(allocator: std.mem.Allocator, fd: c.fd_t) !?[]u8 {
     if (c.isatty(fd) == 0) return null;
-    const path_z = ttyname(fd) orelse return null;
-    return try allocator.dupe(u8, std.mem.span(path_z));
+    const path = posix_pty.name(fd) orelse return null;
+    return try allocator.dupe(u8, path);
 }
 
-fn outerSshAllocatesTty(
-    ssh_options: []const []const u8,
-    tty_request: ssh_opts.SshTtyRequest,
-    shell_command_args: []const []const u8,
-    stdin_is_tty: bool,
-) bool {
-    const explicit = explicitTtyRequest(ssh_options);
-    if (explicit) |request| return switch (request) {
+fn outerSshAllocatesTty(request: ProxyStreamPlanRequest) bool {
+    const explicit = explicitTtyRequest(request.ssh_options);
+    if (explicit) |explicit_request| return switch (explicit_request) {
         .none => false,
-        .requested => stdin_is_tty,
+        .requested => request.stdin_is_tty,
         .forced => true,
     };
-    return switch (tty_request) {
-        .none => stdin_is_tty and shell_command_args.len == 0,
-        .requested => stdin_is_tty,
+    return switch (request.tty_request) {
+        .none => request.stdin_is_tty and request.shell_command_args.len == 0,
+        .requested => request.stdin_is_tty,
         .forced => true,
     };
 }
@@ -210,35 +207,90 @@ fn optionValueFromOptions(options: []const []const u8, index: usize, option_pos:
 }
 
 test "stream status mode follows diagnostics level" {
-    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.jsonl, streamStatusMode(.emulated, .jsonl, true, true));
-    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.line, streamStatusMode(.emulated, .line, true, true));
-    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.line, streamStatusMode(.emulated, .overlay, true, false));
-    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.title, streamStatusMode(.hygienic, .title, true, true));
-    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.client_control, streamStatusMode(.emulated, .overlay, true, true));
-    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.status_line, streamStatusMode(.emulated, .overlay, false, true));
-    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.status_line, streamStatusMode(.hygienic, .status, false, true));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.jsonl, streamStatusMode(.{
+        .filter_level = .emulated,
+        .diagnostics_level = .jsonl,
+        .has_daemon_control = true,
+        .diagnostics_output_is_tty = true,
+    }));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.line, streamStatusMode(.{
+        .filter_level = .emulated,
+        .diagnostics_level = .line,
+        .has_daemon_control = true,
+        .diagnostics_output_is_tty = true,
+    }));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.line, streamStatusMode(.{
+        .filter_level = .emulated,
+        .diagnostics_level = .overlay,
+        .has_daemon_control = true,
+        .diagnostics_output_is_tty = false,
+    }));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.title, streamStatusMode(.{
+        .filter_level = .hygienic,
+        .diagnostics_level = .title,
+        .has_daemon_control = true,
+        .diagnostics_output_is_tty = true,
+    }));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.client_control, streamStatusMode(.{
+        .filter_level = .emulated,
+        .diagnostics_level = .overlay,
+        .has_daemon_control = true,
+        .diagnostics_output_is_tty = true,
+    }));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.status_line, streamStatusMode(.{
+        .filter_level = .emulated,
+        .diagnostics_level = .overlay,
+        .has_daemon_control = false,
+        .diagnostics_output_is_tty = true,
+    }));
+    try std.testing.expectEqual(proxy_worker.StreamReconnectStatusMode.status_line, streamStatusMode(.{
+        .filter_level = .hygienic,
+        .diagnostics_level = .status,
+        .has_daemon_control = false,
+        .diagnostics_output_is_tty = true,
+    }));
 }
 
 test "terminal presentation follows diagnostics level" {
     try std.testing.expectEqual(
         client_ui.ReconnectPresentation.overlay,
-        terminalPresentation(.emulated, .overlay, true),
+        terminalPresentation(.{
+            .filter_level = .emulated,
+            .diagnostics_level = .overlay,
+            .diagnostics_output_is_tty = true,
+        }),
     );
     try std.testing.expectEqual(
         client_ui.ReconnectPresentation.title,
-        terminalPresentation(.emulated, .status, true),
+        terminalPresentation(.{
+            .filter_level = .emulated,
+            .diagnostics_level = .status,
+            .diagnostics_output_is_tty = true,
+        }),
     );
     try std.testing.expectEqual(
         client_ui.ReconnectPresentation.title,
-        terminalPresentation(.hygienic, .overlay, true),
+        terminalPresentation(.{
+            .filter_level = .hygienic,
+            .diagnostics_level = .overlay,
+            .diagnostics_output_is_tty = true,
+        }),
     );
     try std.testing.expectEqual(
         client_ui.ReconnectPresentation.line,
-        terminalPresentation(.emulated, .overlay, false),
+        terminalPresentation(.{
+            .filter_level = .emulated,
+            .diagnostics_level = .overlay,
+            .diagnostics_output_is_tty = false,
+        }),
     );
     try std.testing.expectEqual(
         client_ui.ReconnectPresentation.jsonl,
-        terminalPresentation(.emulated, .jsonl, false),
+        terminalPresentation(.{
+            .filter_level = .emulated,
+            .diagnostics_level = .jsonl,
+            .diagnostics_output_is_tty = false,
+        }),
     );
 }
 
@@ -312,18 +364,15 @@ test "proxy stream plan disables ctrl-r when visible ssh is not wrapped" {
 }
 
 test "auto proxy diagnostics file only infers a matching diagnostics tty" {
-    var master_fd: c.fd_t = -1;
-    var slave_fd: c.fd_t = -1;
-    if (openpty(&master_fd, &slave_fd, null, null, null) != 0) return error.OpenPtyFailed;
-    defer if (master_fd >= 0) posix.close(master_fd);
-    defer if (slave_fd >= 0) posix.close(slave_fd);
+    var pty = try posix_pty.open();
+    defer pty.close();
 
     const explicit = try autoProxyDiagnosticsFile(std.testing.allocator, .{
         .explicit_diagnostics_file = "/tmp/sessh-diagnostics.log",
         .use_daemon_control = true,
         .wrap_visible_ssh = false,
-        .stdin_fd = slave_fd,
-        .stderr_fd = slave_fd,
+        .stdin_fd = pty.slave_fd,
+        .stderr_fd = pty.slave_fd,
     });
     try std.testing.expect(explicit == null);
 
@@ -331,8 +380,8 @@ test "auto proxy diagnostics file only infers a matching diagnostics tty" {
         .explicit_diagnostics_file = null,
         .use_daemon_control = true,
         .wrap_visible_ssh = true,
-        .stdin_fd = slave_fd,
-        .stderr_fd = slave_fd,
+        .stdin_fd = pty.slave_fd,
+        .stderr_fd = pty.slave_fd,
     });
     try std.testing.expect(wrapped == null);
 
@@ -340,8 +389,8 @@ test "auto proxy diagnostics file only infers a matching diagnostics tty" {
         .explicit_diagnostics_file = null,
         .use_daemon_control = false,
         .wrap_visible_ssh = false,
-        .stdin_fd = slave_fd,
-        .stderr_fd = slave_fd,
+        .stdin_fd = pty.slave_fd,
+        .stderr_fd = pty.slave_fd,
     });
     try std.testing.expect(no_daemon_control == null);
 
@@ -349,12 +398,12 @@ test "auto proxy diagnostics file only infers a matching diagnostics tty" {
         .explicit_diagnostics_file = null,
         .use_daemon_control = true,
         .wrap_visible_ssh = false,
-        .stdin_fd = slave_fd,
-        .stderr_fd = slave_fd,
+        .stdin_fd = pty.slave_fd,
+        .stderr_fd = pty.slave_fd,
     });
     defer if (inferred) |path| std.testing.allocator.free(path);
-    const path_z = ttyname(slave_fd) orelse return error.MissingTtyName;
-    try std.testing.expectEqualStrings(std.mem.span(path_z), inferred.?);
+    const path = posix_pty.name(pty.slave_fd) orelse return error.MissingTtyName;
+    try std.testing.expectEqualStrings(path, inferred.?);
 }
 
 test "diagnostics doc describes current public levels and diagnostics file behavior" {

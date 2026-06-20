@@ -25,7 +25,7 @@ The namespace directory also contains `sesshd`, `sessh-broker`, `sessh-proxy`,
 `sessh-terminal-remote`, and `sessh-proxy-remote` symlinks pointing at the
 active executable.
 
-Live terminal-emulator sessions and proxy streams are tracked by the daemon in
+Live terminal-emulator sessions and proxy sessions are tracked by the daemon in
 memory. If the daemon exits, those live processes are expected to exit too, so
 there is no per-GUID runtime-directory state to recover.
 The public topology is the single `sesshd` socket, not one user-addressable
@@ -38,7 +38,7 @@ State lives under `$XDG_STATE_HOME/sessh` or `~/.local/state/sessh`.
 Cleanup records live under `procs/`, one JSON file per remote resource GUID.
 Those records survive local daemon death and laptop reboot so a future daemon can
 ask the remote daemon to hang up stale work. There is intentionally no public
-list/attach/kill state model.
+session-management state model.
 
 # Cache
 

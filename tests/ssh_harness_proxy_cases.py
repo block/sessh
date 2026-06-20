@@ -17,32 +17,7 @@ def test_ssh_terminal_and_proxy_streams_share_tcp_connection(tmp):
     env["SESSH_FAKE_SSH_G_HOSTNAME"] = "pool-host"
     env["SESSH_FAKE_SSH_G_PORT"] = "2222"
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("127.0.0.1", 0))
-    server.listen()
-    server_port = server.getsockname()[1]
-    server_stop = threading.Event()
-
-    def echo_server():
-        while not server_stop.is_set():
-            try:
-                server.settimeout(0.1)
-                conn, _ = server.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            threading.Thread(target=echo_connection, args=(conn,), daemon=True).start()
-
-    def echo_connection(conn):
-        with conn:
-            while True:
-                data = conn.recv(4096)
-                if not data:
-                    return
-                conn.sendall(data)
-
-    threading.Thread(target=echo_server, daemon=True).start()
+    server, server_stop, server_port = start_tcp_echo_server()
 
     def send_ssh_transport_acquire(conn):
         request = sessh_pb().ClientDaemonItem.SshTransportAcquire(host="test-host", bootstrap=True)
@@ -69,7 +44,7 @@ def test_ssh_terminal_and_proxy_streams_share_tcp_connection(tmp):
                 shell_command=command,
             ),
         )
-        recv_until_message(conn, SESSION_ATTACHED, timeout=30.0)
+        recv_until_message(conn, SESSION_READY, timeout=30.0)
         recv_draw_until(conn, terminal_marker.encode("utf-8"), timeout=30.0)
         return conn
 
@@ -256,7 +231,7 @@ def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
     fake_trace = tmp / "fake-ssh.trace"
     fake_config = tmp / "ssh_config"
     remote_shell = tmp / "remote-shell"
-    marker = "SSH_ATTACH_READY"
+    marker = "SSH_SESSION_READY"
     fake_config.write_text("Host test-host\n")
     remote_shell.write_text(
         f"#!/bin/sh\n"
@@ -303,7 +278,7 @@ def test_ssh_transport_cache_hit_suppresses_bootstrap_status(tmp):
         raise AssertionError(ssh_failure_diagnostics("sessh returned non-zero on cache hit", result, fake_log, fake_trace))
     if marker not in result.stdout:
         raise AssertionError(
-            ssh_failure_diagnostics("ssh cache-hit attach did not render remote output", result, fake_log, fake_trace)
+            ssh_failure_diagnostics("ssh cache-hit session did not render remote output", result, fake_log, fake_trace)
         )
     if "sessh: bootstrapping..." in result.stdout or "sessh: bootstrapping..." in result.stderr:
         raise AssertionError(ssh_failure_diagnostics("cache-hit bootstrap displayed upload status", result, fake_log, fake_trace))
@@ -353,13 +328,13 @@ def test_ssh_clean_remote_exit_preserves_status(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_pre_attach_stderr_forwards_immediately(tmp):
+def test_ssh_pre_session_ready_stderr_forwards_immediately(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
     remote_shell = tmp / "remote-shell"
-    marker = "SSH_PRE_ATTACH_STDERR_READY"
-    raw_ssh_error = "pre-attach ssh warning: \x1b[31mred"
+    marker = "SSH_PRE_SESSION_READY_STDERR_READY"
+    raw_ssh_error = "pre-session-ready ssh warning: \x1b[31mred"
     remote_shell.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n")
     remote_shell.chmod(0o700)
     write_fake_ssh(fake_bin / "ssh")
@@ -963,4 +938,3 @@ def test_ssh_isolation_mode_process_uses_proxy_process(tmp):
         raise AssertionError(log_text)
     if "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
-

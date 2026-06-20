@@ -46,13 +46,13 @@ const scm_rights = switch (builtin.os.tag) {
     else => 1,
 };
 
-pub fn BufferWithFdProgress(comptime Slice: type) type {
+fn BufferWithFdProgress(comptime Slice: type) type {
     return struct {
         // Byte buffer and fd state for a single logical transfer. On send,
         // `fd` starts as the descriptor that still needs to be sent. On
         // receive, `fd` is filled when SCM_RIGHTS data arrives. In both
-        // directions, this object owns any descriptor currently stored in
-        // `fd`; use takeFd to transfer ownership out. `offset` is the number of
+        // directions, this object owns the descriptor stored in `fd`; use
+        // takeFd to transfer ownership out. `offset` is the number of
         // buffer bytes already sent/received.
         buffer: Slice = &.{},
         fd: ?c.fd_t = null,
@@ -93,7 +93,7 @@ pub fn BufferWithFdProgress(comptime Slice: type) type {
 pub const SendBufferWithFdProgress = BufferWithFdProgress([]const u8);
 pub const RecvBufferWithFdProgress = BufferWithFdProgress([]u8);
 
-pub fn ByteProgress(comptime Slice: type) type {
+fn ByteProgress(comptime Slice: type) type {
     return struct {
         buffer: Slice = &.{},
         offset: usize = 0,
@@ -126,7 +126,11 @@ pub const BufferProgressStatus = enum {
 pub fn sendByteProgress(fd: c.fd_t, progress: *SendByteProgress) !BufferProgressStatus {
     if (progress.complete()) return .complete;
 
-    const written = sendBytes(fd, progress.remaining(), c.MSG.DONTWAIT) catch |err| switch (err) {
+    const written = sendBytes(.{
+        .sock_fd = fd,
+        .bytes = progress.remaining(),
+        .flags = c.MSG.DONTWAIT,
+    }) catch |err| switch (err) {
         error.WouldBlock => return .blocked,
         else => return err,
     };
@@ -158,10 +162,6 @@ pub fn sendBufferWithFdProgress(sock_fd: c.fd_t, progress: *SendBufferWithFdProg
     return sendBufferWithFdProgressWithFlags(sock_fd, progress, c.MSG.DONTWAIT);
 }
 
-pub fn sendBufferWithFdProgressBlocking(sock_fd: c.fd_t, progress: *SendBufferWithFdProgress) !BufferProgressStatus {
-    return sendBufferWithFdProgressWithFlags(sock_fd, progress, 0);
-}
-
 fn sendBufferWithFdProgressWithFlags(
     sock_fd: c.fd_t,
     progress: *SendBufferWithFdProgress,
@@ -171,7 +171,12 @@ fn sendBufferWithFdProgressWithFlags(
 
     const remaining = progress.remaining();
     const sent = if (progress.fd) |passed_fd| sent: {
-        const n = sendFdPrefix(sock_fd, remaining, passed_fd, flags) catch |err| switch (err) {
+        const n = sendFdPrefix(.{
+            .sock_fd = sock_fd,
+            .bytes = remaining,
+            .passed_fd = passed_fd,
+            .flags = flags,
+        }) catch |err| switch (err) {
             error.WouldBlock => return .blocked,
             else => return err,
         };
@@ -179,7 +184,11 @@ fn sendBufferWithFdProgressWithFlags(
         progress.fd = null;
         break :sent n;
     } else sent: {
-        const n = sendBytes(sock_fd, remaining, flags) catch |err| switch (err) {
+        const n = sendBytes(.{
+            .sock_fd = sock_fd,
+            .bytes = remaining,
+            .flags = flags,
+        }) catch |err| switch (err) {
             error.WouldBlock => return .blocked,
             else => return err,
         };
@@ -190,10 +199,18 @@ fn sendBufferWithFdProgressWithFlags(
     return if (progress.complete()) .complete else .progress;
 }
 
-fn sendFdPrefix(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t, flags: u32) !usize {
+const SendFdPrefixOptions = struct {
+    sock_fd: c.fd_t,
+    bytes: []const u8,
+    passed_fd: c.fd_t,
+    flags: u32,
+};
+
+fn sendFdPrefix(options: SendFdPrefixOptions) !usize {
     // SCM_RIGHTS does not send an integer fd value. The kernel duplicates the
     // underlying open file description into the receiver and reports the new fd
     // number as ancillary data on recvmsg.
+    const bytes = options.bytes;
     if (bytes.len == 0) return error.EmptyFdPayload;
 
     var iov: c.iovec_const = .{
@@ -214,7 +231,7 @@ fn sendFdPrefix(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t, flags: u3
         .level = c.SOL.SOCKET,
         .type = scm_rights,
     };
-    std.mem.bytesAsValue(c.fd_t, control[cmsg_data_offset..][0..@sizeOf(c.fd_t)]).* = passed_fd;
+    std.mem.bytesAsValue(c.fd_t, control[cmsg_data_offset..][0..@sizeOf(c.fd_t)]).* = options.passed_fd;
 
     var msg: c.msghdr_const = .{
         .name = null,
@@ -227,11 +244,11 @@ fn sendFdPrefix(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t, flags: u3
     };
 
     while (true) {
-        const n = c.sendmsg(sock_fd, &msg, flags);
+        const n = c.sendmsg(options.sock_fd, &msg, options.flags);
         if (n >= 0) {
             const sent: usize = @intCast(n);
             if (sent == 0) return error.WriteFailed;
-            io.noteWrite(sock_fd, bytes[0..sent]);
+            io.noteWrite(options.sock_fd, bytes[0..sent]);
             return sent;
         }
         switch (posix.errno(n)) {
@@ -247,14 +264,21 @@ fn sendFdPrefix(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd_t, flags: u3
     }
 }
 
-fn sendBytes(sock_fd: c.fd_t, bytes: []const u8, flags: u32) !usize {
+const SendBytesOptions = struct {
+    sock_fd: c.fd_t,
+    bytes: []const u8,
+    flags: u32,
+};
+
+fn sendBytes(options: SendBytesOptions) !usize {
+    const bytes = options.bytes;
     if (bytes.len == 0) return 0;
 
     while (true) {
-        const n = c.send(sock_fd, bytes.ptr, bytes.len, flags);
+        const n = c.send(options.sock_fd, bytes.ptr, bytes.len, options.flags);
         if (n > 0) {
             const sent: usize = @intCast(n);
-            io.noteWrite(sock_fd, bytes[0..sent]);
+            io.noteWrite(options.sock_fd, bytes[0..sent]);
             return sent;
         }
         if (n == 0) return error.WriteFailed;
@@ -297,10 +321,6 @@ fn sendBytes(sock_fd: c.fd_t, bytes: []const u8, flags: u32) !usize {
 ///   before the error is returned.
 pub fn recvBufferWithFdProgress(sock_fd: c.fd_t, progress: *RecvBufferWithFdProgress) !BufferProgressStatus {
     return recvBufferWithFdProgressWithFlags(sock_fd, progress, c.MSG.DONTWAIT);
-}
-
-pub fn recvBufferWithFdProgressBlocking(sock_fd: c.fd_t, progress: *RecvBufferWithFdProgress) !BufferProgressStatus {
-    return recvBufferWithFdProgressWithFlags(sock_fd, progress, 0);
 }
 
 fn recvBufferWithFdProgressWithFlags(

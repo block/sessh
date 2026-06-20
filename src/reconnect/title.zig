@@ -2,12 +2,13 @@ const std = @import("std");
 const c = std.c;
 
 const io = @import("../core/io.zig");
+const terminal = @import("../tty/terminal.zig");
 
 /// Shared title-bar status helpers for reconnect UI.
 ///
 /// Terminal-emulator reconnects and proxy-stream reconnects have different
 /// places they can draw text, but the title-bar wording and OSC title escaping
-/// should stay identical. These helpers only write temporary local status; the
+/// should stay identical. These helpers write local reconnect status; the
 /// caller still decides what title is safe to restore afterward.
 pub fn formatDelay(delay_ms: u64, buf: []u8) ![]const u8 {
     const seconds = @max(@divTrunc(delay_ms + 999, 1000), 1);
@@ -64,19 +65,19 @@ pub fn writeSwitchCountdownTitle(fd: c.fd_t, delay_ms: u64) !void {
     try writeTitle(fd, title);
 }
 
-pub fn retryTitle(delay_ms: u64, buf: []u8) ![]const u8 {
+fn retryTitle(delay_ms: u64, buf: []u8) ![]const u8 {
     var delay_buf: [16]u8 = undefined;
     const delay = try formatDelay(delay_ms, &delay_buf);
     return std.fmt.bufPrint(buf, "{s} until retry connect", .{delay});
 }
 
-pub fn retryNowTitle(delay_ms: u64, buf: []u8) ![]const u8 {
+fn retryNowTitle(delay_ms: u64, buf: []u8) ![]const u8 {
     var delay_buf: [16]u8 = undefined;
     const delay = try formatDelay(delay_ms, &delay_buf);
     return std.fmt.bufPrint(buf, "{s} retry CTRL-R", .{delay});
 }
 
-pub fn switchCountdownTitle(delay_ms: u64, buf: []u8) ![]const u8 {
+fn switchCountdownTitle(delay_ms: u64, buf: []u8) ![]const u8 {
     var delay_buf: [16]u8 = undefined;
     const delay = try formatDelay(delay_ms, &delay_buf);
     return std.fmt.bufPrint(buf, "{s} until switch", .{delay});
@@ -87,7 +88,7 @@ pub fn writeTitle(fd: c.fd_t, title: []const u8) !void {
     var buf: [256]u8 = undefined;
     var len: usize = 0;
     for (title) |byte| {
-        buf[len] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+        buf[len] = terminal.sanitizedOscTextByte(byte);
         len += 1;
         if (len == buf.len) {
             try io.writeAll(fd, buf[0..len]);

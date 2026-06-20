@@ -1,14 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 
 const dispatcher = @import("../core/dispatcher.zig");
 const protocol = @import("../protocol/mod.zig");
-const protocol_test_helpers = @import("../protocol/test_helpers.zig");
 
 const pb = protocol.pb;
 const max_pending_frames_per_subscriber: usize = 128;
 
-// PROCESS_GLOBAL_REGISTRY: daemon-log subscribers are local clients attached to
+// PROCESS_GLOBAL_REGISTRY: daemon-log subscribers are local clients subscribed to
 // this daemon process. After the initial log request, this module owns the fd.
 // The stream is one-way after subscription: client write-side EOF is harmless,
 // and subscriber disconnect is detected when a later log write fails.
@@ -88,8 +88,11 @@ fn destroySubscriber(allocator: std.mem.Allocator, subscriber: *Subscriber) void
     }
 }
 
-fn writeSubscriber(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+fn writeSubscriber(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
     const subscriber: *Subscriber = @ptrCast(@alignCast(ctx));
+    const daemon_dispatcher = handler_event.dispatcher;
+    const id = handler_event.id;
+    const event = handler_event.event;
     const fd_event = switch (event) {
         .fd => |fd| fd,
         .timer => return error.UnexpectedDaemonLogTimer,
@@ -116,24 +119,32 @@ fn writeSubscriber(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
 
 fn ensureWriteWatch(subscriber: *Subscriber) !void {
     if (subscriber.write_watch_id != null) return;
-    subscriber.write_watch_id = try subscriber.daemon_dispatcher.watchFd(subscriber.fd, .{ .writable = true }, .{
-        .ctx = subscriber,
-        .callback = writeSubscriber,
+    subscriber.write_watch_id = try subscriber.daemon_dispatcher.watchFd(.{
+        .fd = subscriber.fd,
+        .events = .{ .writable = true },
+        .handler = .{
+            .ctx = subscriber,
+            .callback = writeSubscriber,
+        },
     });
 }
 
-fn queueSubscriberFrame(
+const QueueSubscriberFrameOptions = struct {
     allocator: std.mem.Allocator,
     subscriber: *Subscriber,
     message_type: protocol.MessageType,
     payload: []const u8,
-) !void {
+};
+
+fn queueSubscriberFrame(options: QueueSubscriberFrameOptions) !void {
+    const allocator = options.allocator;
+    const subscriber = options.subscriber;
     // Daemon logs are observational. A slow log subscriber must not stall the
     // daemon or accumulate an unbounded queue, so each subscriber gets a small
     // bounded queue. Normal startup bursts are preserved; pathological readers
     // lose later log entries until they drain.
     if (subscriber.pending_frames.items.len >= max_pending_frames_per_subscriber) return;
-    var frame = try protocol.FrameWriteState.init(allocator, message_type, payload);
+    var frame = try protocol.FrameWriteState.init(allocator, options.message_type, options.payload);
     errdefer frame.deinit();
     try subscriber.pending_frames.append(allocator, frame);
     try ensureWriteWatch(subscriber);
@@ -150,7 +161,12 @@ fn sendEntry(allocator: std.mem.Allocator, entry: pb.ClientDaemonItem.DaemonLogE
     var index: usize = 0;
     while (index < subscribers.items.len) {
         const subscriber = subscribers.items[index];
-        queueSubscriberFrame(allocator, subscriber, .client_daemon, item_payload) catch {
+        queueSubscriberFrame(.{
+            .allocator = allocator,
+            .subscriber = subscriber,
+            .message_type = .client_daemon,
+            .payload = item_payload,
+        }) catch {
             removeFailedSubscriber(allocator, subscriber);
             continue;
         };
@@ -170,18 +186,21 @@ pub fn infof(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anyty
     }) catch return;
 }
 
-fn clearForTest(allocator: std.mem.Allocator) void {
-    while (subscribers.items.len != 0) {
-        destroySubscriberAt(allocator, 0);
+const testing = if (builtin.is_test) struct {
+    fn clear(allocator: std.mem.Allocator) void {
+        while (subscribers.items.len != 0) {
+            destroySubscriberAt(allocator, 0);
+        }
+        subscribers.deinit(allocator);
+        subscribers = .empty;
     }
-    subscribers.deinit(allocator);
-    subscribers = .empty;
-}
+} else struct {};
 
 test "daemon log writes new events to live subscribers" {
+    const protocol_test_helpers = @import("../protocol/test_helpers.zig");
     const allocator = std.testing.allocator;
-    clearForTest(allocator);
-    defer clearForTest(allocator);
+    testing.clear(allocator);
+    defer testing.clear(allocator);
 
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
@@ -206,9 +225,10 @@ test "daemon log writes new events to live subscribers" {
 }
 
 test "daemon log keeps a bounded pending queue per slow subscriber" {
+    const protocol_test_helpers = @import("../protocol/test_helpers.zig");
     const allocator = std.testing.allocator;
-    clearForTest(allocator);
-    defer clearForTest(allocator);
+    testing.clear(allocator);
+    defer testing.clear(allocator);
 
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);

@@ -1,32 +1,45 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
 const io = @import("../core/io.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
+const poll_sets = @import("../core/poll_set.zig");
 const app_allocator = @import("../core/app_allocator.zig");
+const non_suspending_timer = @import("../core/non_suspending_timer.zig");
 const daemon_log = @import("../daemon/log.zig");
 const protocol = @import("../protocol/mod.zig");
-const protocol_test_helpers = @import("../protocol/test_helpers.zig");
+const protocol_test_helpers = if (builtin.is_test) @import("../protocol/test_helpers.zig") else struct {};
+const frame_write_queue = @import("../transport/frame_write_queue.zig");
 const client_log = @import("../core/client_log.zig");
 const proxy_diagnostics = @import("proxy_diagnostics_channel.zig");
-const reconnect_control = @import("../reconnect/control.zig");
 const reconnect = @import("../reconnect/mod.zig");
 const byte_stream = @import("byte_stream.zig");
+const local_stream_interrupt = @import("local_stream_interrupt.zig");
 const mux_proxy = @import("mux_proxy.zig");
 const proxy_remote = @import("proxy_remote.zig");
 const raw_bridge = @import("raw_bridge.zig");
 const status_output = @import("status_output.zig");
-const terminal = @import("../tty/terminal.zig");
+const stream_input_control = @import("stream_input_control.zig");
+const stream_liveness = @import("stream_liveness.zig");
 const pb = protocol.pb;
 
 const max_buffered_bytes = 1024 * 1024;
 const max_chunk_bytes = 16 * 1024;
-const transport_ping_interval_ms: u64 = 1_000;
-const stream_unresponsive_after_ms: u64 = 10_000;
 const proxy_mux_stream_id: u64 = 1;
 const StreamState = byte_stream.StreamState;
+const StreamInputControl = stream_input_control.StreamInputControl;
+const StreamControlAction = stream_input_control.StreamControlAction;
+const StreamLiveness = stream_liveness.StreamLiveness;
+const LocalStreamInterrupt = local_stream_interrupt.LocalStreamInterrupt;
+const ReadSomeResult = io.ReadSomeResult;
+
+const ProxyDataPayload = struct {
+    offset: u64,
+    data: []const u8,
+};
 
 const StreamOutcome = union(enum) {
     complete,
@@ -37,6 +50,7 @@ const StreamOutcome = union(enum) {
 
 pub const StreamReconnectStatusMode = status_output.Mode;
 pub const forwardRawDuplex = raw_bridge.forwardRawDuplex;
+pub const ProxyMuxContext = mux_proxy.ProxyMuxContext;
 pub const ProxyMuxStream = mux_proxy.ProxyMuxStream;
 pub const closeProxyMuxStreams = mux_proxy.closeProxyMuxStreams;
 pub const closeProxyMuxStream = mux_proxy.closeProxyMuxStream;
@@ -46,18 +60,19 @@ pub const forwardProxyRemoteFrameToMux = mux_proxy.forwardProxyRemoteFrameToMux;
 pub const handleProxyRemoteControlFrame = mux_proxy.handleProxyRemoteControlFrame;
 pub const findProxyMuxStreamIndex = mux_proxy.findProxyMuxStreamIndex;
 pub const findProxyMuxStreamIndexByWatch = mux_proxy.findProxyMuxStreamIndexByWatch;
-pub const removeProxyMuxStream = mux_proxy.removeProxyMuxStream;
-pub const sendProxyMuxReset = mux_proxy.sendProxyMuxReset;
-pub const queueProxyMuxReset = mux_proxy.queueProxyMuxReset;
 pub const drainProxyProcessWrites = mux_proxy.drainProxyProcessWrites;
 const StreamReconnectStatus = status_output.Status;
+
+const LocalStreamFds = struct {
+    source: c.fd_t,
+    sink: c.fd_t,
+};
 
 pub const LocalStreamOptions = struct {
     guid: []const u8 = "",
     proxy_host: []const u8 = "",
     proxy_port: u16 = 0,
-    source_fd: c.fd_t,
-    sink_fd: c.fd_t,
+    stream_fds: LocalStreamFds,
     reconnect_input_fd: c.fd_t = -1,
     status_mode: StreamReconnectStatusMode,
     intercept_ctrl_r: bool,
@@ -71,17 +86,8 @@ pub const LocalStreamOptions = struct {
 
 // Source EOF is reported as fd readiness on some platforms and as HUP/ERR on
 // others. Either way, a ready source gets a read attempt before we consider the
-// child reaped or the stream complete.
+// worker process reaped or the stream complete.
 const source_poll_events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR;
-
-var local_stream_interrupt_write_fd: c.fd_t = -1;
-
-fn handleLocalStreamInterrupt(_: c_int) callconv(.c) void {
-    const fd = local_stream_interrupt_write_fd;
-    if (fd < 0) return;
-    var byte = [_]u8{1};
-    _ = c.write(fd, &byte, byte.len);
-}
 
 const StreamStepOutcome = union(enum) {
     idle,
@@ -111,7 +117,7 @@ fn sinkWithFd(stdin_fd: c.fd_t, close_fd_on_eof: ?*c.fd_t) StreamSink {
     };
 }
 
-const StreamAttachedClientOptions = struct {
+const StreamActiveClientOptions = struct {
     source: StreamSource = .{},
     sink: StreamSink = .{},
     reconnect_input_fd: c.fd_t = -1,
@@ -124,179 +130,235 @@ const StreamAttachedClientOptions = struct {
     send_proxy_open: bool = false,
 };
 
-const StreamInputControl = struct {
-    enabled: bool,
-    escape_enabled: bool = false,
-    status_visible: bool = false,
-    reconnect_requested: bool = false,
-    disconnect_requested: bool = false,
-    help_requested: bool = false,
-    escape_filter: terminal.EscapeFilter = .{},
-
-    fn filter(self: *StreamInputControl, bytes: []const u8, out: []u8) []const u8 {
-        var input = bytes;
-        var scratch: [max_chunk_bytes]u8 = undefined;
-        if (self.escape_enabled) {
-            const result = self.escape_filter.filter(bytes, &scratch);
-            if (result.end) |end| switch (end) {
-                .disconnect => self.disconnect_requested = true,
-                .help => self.help_requested = true,
-                .repaint => {},
-            };
-            input = result.bytes;
-        }
-
-        if (!self.enabled or !self.status_visible) {
-            @memcpy(out[0..input.len], input);
-            return out[0..input.len];
-        }
-        var written: usize = 0;
-        for (input) |byte| {
-            if (byte == reconnect_control.ctrl_r) {
-                self.reconnect_requested = true;
-                continue;
-            }
-            out[written] = byte;
-            written += 1;
-        }
-        return out[0..written];
-    }
-
-    fn observeControlOnly(self: *StreamInputControl, bytes: []const u8) void {
-        var input = bytes;
-        var scratch: [max_chunk_bytes]u8 = undefined;
-        if (self.escape_enabled) {
-            const result = self.escape_filter.filter(bytes, &scratch);
-            if (result.end) |end| switch (end) {
-                .disconnect => self.disconnect_requested = true,
-                .help => self.help_requested = true,
-                .repaint => {},
-            };
-            input = result.bytes;
-        }
-
-        if (!self.enabled or !self.status_visible) return;
-        for (input) |byte| {
-            if (byte == reconnect_control.ctrl_r) self.reconnect_requested = true;
-        }
-    }
-
-    fn consumeAction(self: *StreamInputControl) StreamControlAction {
-        if (self.disconnect_requested) {
-            self.disconnect_requested = false;
-            self.reconnect_requested = false;
-            self.help_requested = false;
-            return .disconnect;
-        }
-        if (self.help_requested) {
-            self.help_requested = false;
-            return .help;
-        }
-        const requested = self.reconnect_requested;
-        self.reconnect_requested = false;
-        return if (requested) .reconnect else .none;
-    }
+// Owns one active transport. The byte-offset state is outside this type so a
+// caller can drop this transport and resume the same stream over a replacement
+// without duplicating or losing bytes.
+const TransportFds = struct {
+    read: c.fd_t,
+    write: c.fd_t,
 };
 
-const StreamControlAction = enum {
-    none,
-    reconnect,
-    disconnect,
-    help,
-    interrupt,
-};
-
-const StreamLiveness = struct {
-    last_incoming_ms: u64,
-    next_ping_ms: u64,
-    ping_interval_ms: u64 = transport_ping_interval_ms,
-    unresponsive_after_ms: u64 = stream_unresponsive_after_ms,
-
-    fn init(now_ms: u64) StreamLiveness {
-        return .{
-            .last_incoming_ms = now_ms,
-            .next_ping_ms = now_ms + transport_ping_interval_ms,
-        };
-    }
-
-    fn noteIncoming(self: *StreamLiveness, now_ms: u64) void {
-        self.last_incoming_ms = now_ms;
-        self.next_ping_ms = now_ms + self.ping_interval_ms;
-    }
-
-    fn pollTimeoutMs(self: *const StreamLiveness, now_ms: u64, requested_timeout_ms: i32) i32 {
-        var deadline_ms = self.next_ping_ms;
-        const unresponsive_deadline_ms = self.last_incoming_ms + self.unresponsive_after_ms;
-        if (unresponsive_deadline_ms < deadline_ms) deadline_ms = unresponsive_deadline_ms;
-        const liveness_timeout_ms: i32 = if (deadline_ms <= now_ms)
-            if (requested_timeout_ms >= 0 and self.timedOut(now_ms)) requested_timeout_ms else 0
-        else
-            @intCast(@min(deadline_ms - now_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-        if (requested_timeout_ms < 0) return liveness_timeout_ms;
-        return @min(requested_timeout_ms, liveness_timeout_ms);
-    }
-
-    fn timedOut(self: *const StreamLiveness, now_ms: u64) bool {
-        return elapsedMs(self.last_incoming_ms, now_ms) >= self.unresponsive_after_ms;
-    }
-
-    fn pingDue(self: *const StreamLiveness, now_ms: u64) bool {
-        return now_ms >= self.next_ping_ms;
-    }
-
-    fn notePingSent(self: *StreamLiveness, now_ms: u64) void {
-        self.next_ping_ms = now_ms + self.ping_interval_ms;
-    }
-};
-
-// Owns one currently attached transport. The byte-offset state is outside this
-// type so a caller can drop this transport and resume the same stream over a
-// replacement without duplicating or losing bytes.
-const StreamAttachedClient = struct {
+const StreamActiveClient = struct {
     state: *StreamState,
-    transport_read_fd: c.fd_t,
-    transport_write_fd: c.fd_t,
+    transport_fds: TransportFds,
     transport_reader: protocol.FrameReader,
+    transport_writer: frame_write_queue.FrameWriteQueue = undefined,
+    transport_writer_initialized: bool = false,
     control_reader: proxy_diagnostics.Reader,
-    options: StreamAttachedClientOptions,
+    options: StreamActiveClientOptions,
     liveness: StreamLiveness,
     interrupt_fd: c.fd_t = -1,
 
     fn init(
         state: *StreamState,
-        transport_read_fd: c.fd_t,
-        transport_write_fd: c.fd_t,
-        options: StreamAttachedClientOptions,
-    ) !StreamAttachedClient {
+        transport_fds: TransportFds,
+        options: StreamActiveClientOptions,
+    ) !StreamActiveClient {
         state.peer_ready = false;
         state.outbound.outbound_eof_sent = false;
-        try core_fds.setNonBlocking(transport_read_fd);
-        sendResumeMessage(state, transport_write_fd, options.send_proxy_open) catch return error.StreamTransportClosed;
+        try core_fds.setNonBlocking(transport_fds.read);
+        try core_fds.setNonBlocking(transport_fds.write);
         const now_ms = nowMillis();
-        return .{
+        var client = StreamActiveClient{
             .state = state,
-            .transport_read_fd = transport_read_fd,
-            .transport_write_fd = transport_write_fd,
+            .transport_fds = transport_fds,
             .transport_reader = protocol.FrameReader.init(state.allocator),
+            .transport_writer = frame_write_queue.FrameWriteQueue.init(state.allocator),
+            .transport_writer_initialized = true,
             .control_reader = proxy_diagnostics.Reader.init(state.allocator),
             .options = options,
             .liveness = StreamLiveness.init(now_ms),
         };
+        errdefer client.deinit();
+        client.queueResumeMessage(if (options.send_proxy_open) .send_proxy_open else .resume_only) catch return error.StreamTransportClosed;
+        _ = client.drainTransportWrites() catch {};
+        return client;
     }
 
-    fn deinit(self: *StreamAttachedClient) void {
+    fn deinit(self: *StreamActiveClient) void {
         self.transport_reader.deinit();
+        if (self.transport_writer_initialized) self.transport_writer.deinit();
         self.control_reader.deinit();
         self.* = undefined;
     }
 
-    fn step(self: *StreamAttachedClient, requested_timeout_ms: i32) !StreamStepOutcome {
+    fn ensureTransportWriter(self: *StreamActiveClient) void {
+        if (self.transport_writer_initialized) return;
+        self.transport_writer = frame_write_queue.FrameWriteQueue.init(self.state.allocator);
+        self.transport_writer_initialized = true;
+    }
+
+    fn hasPendingTransportWrite(self: *StreamActiveClient) bool {
+        return self.transport_writer_initialized and self.transport_writer.hasPending();
+    }
+
+    fn queueDaemonTunnelPayload(self: *StreamActiveClient, payload: protocol.DaemonTunnelPayload) !void {
+        self.ensureTransportWriter();
+        try self.transport_writer.queueDaemonTunnelPayload(payload);
+    }
+
+    fn queueMuxStreamFrame(self: *StreamActiveClient, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
+        self.ensureTransportWriter();
+        try self.transport_writer.queueMuxStreamFrame(message);
+    }
+
+    const ResumeMessageMode = enum {
+        resume_only,
+        send_proxy_open,
+    };
+
+    fn queueResumeMessage(self: *StreamActiveClient, mode: ResumeMessageMode) !void {
+        try self.queueMuxStreamFrame(.{
+            .stream_id = proxy_mux_stream_id,
+            .message = .{ .open = .{
+                .recv_next_offset = self.state.inbound.recv_next_offset,
+            } },
+        });
+        if (mode != .send_proxy_open) return;
+        try self.queueMuxStreamFrame(.{
+            .stream_id = proxy_mux_stream_id,
+            .message = .{ .payload = .{
+                .offset = 0,
+                .item = .{ .proxy = .{ .payload = .{ .open = .{
+                    .proxy_guid = self.state.guid,
+                    .proxy_host = self.state.proxy_host,
+                    .proxy_port = self.state.proxy_port,
+                } } } },
+            } },
+        });
+    }
+
+    fn queueOpenOk(self: *StreamActiveClient) !void {
+        try self.queueMuxStreamFrame(.{
+            .stream_id = proxy_mux_stream_id,
+            .message = .{ .open_ok = .{
+                .recv_next_offset = self.state.inbound.recv_next_offset,
+            } },
+        });
+    }
+
+    fn queueAck(self: *StreamActiveClient, offset: u64) !void {
+        try self.queueMuxStreamFrame(.{
+            .stream_id = proxy_mux_stream_id,
+            .message = .{ .ack = .{
+                .recv_next_offset = offset,
+            } },
+        });
+    }
+
+    fn queueData(self: *StreamActiveClient, payload: ProxyDataPayload) !void {
+        try self.queueMuxStreamFrame(muxProxyDataFrame(payload));
+    }
+
+    fn queueEof(self: *StreamActiveClient, offset: u64) !void {
+        try self.queueMuxStreamFrame(.{
+            .stream_id = proxy_mux_stream_id,
+            .message = .{ .eof = .{ .final_offset = offset } },
+        });
+    }
+
+    fn queueReset(self: *StreamActiveClient, code: []const u8, message: []const u8) !void {
+        try self.queueMuxStreamFrame(protocol.muxStreamResetFrame(proxy_mux_stream_id, code, message));
+    }
+
+    fn queuePending(self: *StreamActiveClient) !void {
+        if (!self.state.peer_ready) return;
+        const outbound = &self.state.outbound;
+        if (outbound.peer_recv < outbound.outbound_base or
+            outbound.peer_recv > outbound.outboundNext())
+        {
+            return error.StreamAckOutOfRange;
+        }
+        if (outbound.outbound_sent_next < outbound.outbound_base or
+            outbound.outbound_sent_next > outbound.outboundNext())
+        {
+            return error.StreamAckOutOfRange;
+        }
+        // ACKs tell us what the peer has durably received. Separately remember
+        // how far this transport has been queued to send so appending new source
+        // bytes does not cause an overlapping resend on the same still-live
+        // transport. On a replacement transport, the resume frame resets
+        // outbound_sent_next to the peer's reported receive offset, which is
+        // when retransmission is needed.
+        var index: usize = @intCast(outbound.outbound_sent_next - outbound.outbound_base);
+        while (index < outbound.outbound.items.len) {
+            const len = @min(max_chunk_bytes, outbound.outbound.items.len - index);
+            const offset = outbound.outbound_base + index;
+            try self.queueData(.{
+                .offset = offset,
+                .data = outbound.outbound.items[index .. index + len],
+            });
+            index += len;
+            outbound.outbound_sent_next = offset + len;
+        }
+        if (outbound.outbound_eof and !outbound.outbound_eof_acked and !outbound.outbound_eof_sent) {
+            try self.queueEof(outbound.outboundNext());
+            outbound.outbound_eof_sent = true;
+        }
+    }
+
+    fn drainTransportWrites(self: *StreamActiveClient) !frame_write_queue.WriteQueueStatus {
+        if (!self.transport_writer_initialized) return .drained;
+        return self.transport_writer.writeReady(self.transport_fds.write);
+    }
+
+    fn hasPendingSinkWrite(self: *const StreamActiveClient) bool {
+        return self.state.pendingInboundData().len != 0;
+    }
+
+    fn canReadTransport(self: *const StreamActiveClient) bool {
+        return self.state.pendingInboundData().len < max_buffered_bytes;
+    }
+
+    fn drainSinkWrites(self: *StreamActiveClient) !bool {
+        var made_progress = false;
+        while (self.state.pendingInboundData().len != 0) {
+            const sink = self.options.sink;
+            if (sink.fd < 0) return error.StreamSinkClosed;
+            const pending = self.state.pendingInboundData();
+            switch (try io.writeSomeNonBlocking(sink.fd, pending)) {
+                .wrote => |n| {
+                    if (n == 0) break;
+                    if (self.options.reconnect_status) |status| status.observeInbound(pending[0..n]);
+                    try self.state.noteInboundDelivered(n);
+                    made_progress = true;
+                },
+                .would_block => break,
+            }
+        }
+        if (try self.applyInboundEofIfReady()) made_progress = true;
+        if (made_progress) try self.queueAck(self.state.inbound.recv_next_offset);
+        return made_progress;
+    }
+
+    fn applyInboundEofIfReady(self: *StreamActiveClient) !bool {
+        if (!self.state.inbound.inbound_eof or self.state.inbound_eof_applied) return false;
+        const sink = self.options.sink;
+        if (sink.shutdown_on_eof and sink.fd >= 0) _ = c.shutdown(sink.fd, c.SHUT.WR);
+        if (sink.close_fd_on_eof) |sink_fd_ptr| {
+            if (sink_fd_ptr.* >= 0) {
+                _ = c.close(sink_fd_ptr.*);
+                sink_fd_ptr.* = -1;
+            }
+        }
+        if (self.options.close_outbound_on_inbound_eof) {
+            self.state.completeOutboundAfterInboundEof();
+        }
+        self.state.inbound_eof_applied = true;
+        return true;
+    }
+
+    // Advance one proxy-stream owner by servicing whichever fd is ready:
+    // local OpenSSH bytes, daemon-tunnel frames, diagnostics control, reconnect
+    // input, or liveness timers. Keeping this as one explicit state transition
+    // prevents the shared transport fd from blocking on any one local stream.
+    fn step(self: *StreamActiveClient, requested_timeout_ms: i32) !StreamStepOutcome {
         const state = self.state;
         if (state.complete()) return .complete;
 
         const now_before_poll_ms = nowMillis();
         const timeout_ms = self.liveness.pollTimeoutMs(now_before_poll_ms, requested_timeout_ms);
-        var poll = try StreamAttachedClientStepPoll.init(self);
+        var poll = try StreamActiveClientStepPoll.init(self);
         defer poll.deinit();
         try poll.run(timeout_ms);
         const now_after_poll_ms = nowMillis();
@@ -304,8 +366,9 @@ const StreamAttachedClient = struct {
         if (!poll.hasFdEvent()) {
             if (self.liveness.timedOut(now_after_poll_ms)) return .unresponsive;
             if (self.liveness.pingDue(now_after_poll_ms)) {
-                protocol.sendPing(self.transport_write_fd) catch return .transport_closed;
+                if (!self.hasPendingTransportWrite()) try self.queueDaemonTunnelPayload(.{ .ping = .{} });
                 self.liveness.notePingSent(now_after_poll_ms);
+                return .progress;
             }
             return .idle;
         }
@@ -334,8 +397,22 @@ const StreamAttachedClient = struct {
                 return .transport_closed;
             }
         }
+        if (poll.transport_write_event != null) {
+            return switch (self.drainTransportWrites() catch return .transport_closed) {
+                .blocked => .idle,
+                .progress, .drained => .progress,
+            };
+        }
+        if (poll.sink_write_event != null) {
+            const made_progress = self.drainSinkWrites() catch |err| switch (err) {
+                error.StreamSinkClosed => return .complete,
+                else => return err,
+            };
+            _ = self.drainTransportWrites() catch return .transport_closed;
+            return if (made_progress) .progress else .idle;
+        }
         if (if (poll.transport_event) |transport_event| transport_event.readable else false) {
-            const frame = switch (self.transport_reader.readReady(self.transport_read_fd) catch return .transport_closed) {
+            const frame = switch (self.transport_reader.readReady(self.transport_fds.read) catch return .transport_closed) {
                 .blocked => return .idle,
                 .progress => {
                     self.liveness.noteIncoming(nowMillis());
@@ -345,16 +422,15 @@ const StreamAttachedClient = struct {
                 .frame => |frame_value| frame_value,
             };
             self.liveness.noteIncoming(nowMillis());
-            handleFrame(
-                state,
-                self.transport_write_fd,
-                &self.options,
-                frame,
-            ) catch |err| switch (err) {
+            self.handleFrame(frame) catch |err| switch (err) {
                 error.StreamReset => return .complete,
-                error.StreamTransportWriteFailed => return .transport_closed,
                 else => return err,
             };
+            _ = self.drainSinkWrites() catch |err| switch (err) {
+                error.StreamSinkClosed => return .complete,
+                else => return err,
+            };
+            _ = self.drainTransportWrites() catch return .transport_closed;
             // A transport frame can make source bytes or EOF immediately useful
             // without any new source readiness. For example, a resume frame
             // tells us the peer is ready for retransmission, and inbound EOF can mark
@@ -363,11 +439,9 @@ const StreamAttachedClient = struct {
             if (try self.completeAfterSourceReset()) return .complete;
             if (state.complete()) return .complete;
             if (state.peer_ready) {
-                sendPending(state, self.transport_write_fd) catch |err| switch (err) {
-                    error.WriteFailed => return .transport_closed,
-                    else => return err,
-                };
+                try self.queuePending();
             }
+            _ = self.drainTransportWrites() catch return .transport_closed;
             return .progress;
         }
 
@@ -384,103 +458,96 @@ const StreamAttachedClient = struct {
         if (try self.completeAfterSourceReset()) return .complete;
 
         if (state.peer_ready) {
-            sendPending(state, self.transport_write_fd) catch |err| switch (err) {
-                error.WriteFailed => return .transport_closed,
-                else => return err,
-            };
+            try self.queuePending();
+            _ = self.drainTransportWrites() catch return .transport_closed;
         }
         return .idle;
     }
 
-    fn completeAfterSourceReset(self: *StreamAttachedClient) !bool {
+    fn completeAfterSourceReset(self: *StreamActiveClient) !bool {
         if (!self.options.reset_on_source_eof or !self.state.source_eof) return false;
-        try sendReset(self.state, self.transport_write_fd, "SOURCE_CLOSED", "local proxy stream closed");
+        try self.queueReset("SOURCE_CLOSED", "local proxy stream closed");
+        _ = self.drainTransportWrites() catch {};
         return true;
+    }
+
+    fn handleFrame(self: *StreamActiveClient, frame: protocol.OwnedFrame) !void {
+        try handleTransportFrame(
+            self,
+            &self.options,
+            frame,
+        );
     }
 };
 
-const StreamAttachedClientStepPoll = struct {
-    poll_dispatcher: dispatcher.Dispatcher,
-    client: *StreamAttachedClient,
-    transport_watch_id: ?dispatcher.FdWatchId = null,
-    source_watch_id: ?dispatcher.FdWatchId = null,
-    replacement_watch_id: ?dispatcher.FdWatchId = null,
-    control_watch_id: ?dispatcher.FdWatchId = null,
-    reconnect_input_watch_id: ?dispatcher.FdWatchId = null,
-    interrupt_watch_id: ?dispatcher.FdWatchId = null,
-    timer_watch_id: ?dispatcher.TimerWatchId = null,
+// PROCESS_EVENT_LOOP: process-isolated proxy worker wait. The watch set changes
+// after each state-machine step because transport backpressure, source EOF, and
+// replacement-client readiness all change which fds should be observed.
+const StreamActiveClientStepPoll = struct {
+    client: *StreamActiveClient,
     transport_event: ?dispatcher.FdEvent = null,
+    transport_write_event: ?dispatcher.FdEvent = null,
+    sink_write_event: ?dispatcher.FdEvent = null,
     source_event: ?dispatcher.FdEvent = null,
     replacement_event: ?dispatcher.FdEvent = null,
     control_event: ?dispatcher.FdEvent = null,
     reconnect_input_event: ?dispatcher.FdEvent = null,
     interrupt_event: ?dispatcher.FdEvent = null,
-    timer_fired: bool = false,
 
-    fn init(client: *StreamAttachedClient) !StreamAttachedClientStepPoll {
+    fn init(client: *StreamActiveClient) !StreamActiveClientStepPoll {
         return .{
-            .poll_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
             .client = client,
         };
     }
 
-    fn deinit(self: *StreamAttachedClientStepPoll) void {
-        self.poll_dispatcher.deinit();
-    }
+    fn deinit(_: *StreamActiveClientStepPoll) void {}
 
-    fn run(self: *StreamAttachedClientStepPoll, timeout_ms: i32) !void {
-        self.transport_watch_id = try self.poll_dispatcher.watchFd(self.client.transport_read_fd, .{ .readable = true }, .{
-            .ctx = self,
-            .callback = handleStreamAttachedClientStepPollEvent,
-        });
+    fn run(self: *StreamActiveClientStepPoll, timeout_ms: i32) !void {
+        var poll_set = StreamActiveClientPollSet{};
+        if (self.client.canReadTransport()) {
+            poll_set.add(self.client.transport_fds.read, posix.POLL.IN, .transport);
+        }
+        if (self.client.hasPendingTransportWrite()) {
+            poll_set.add(self.client.transport_fds.write, posix.POLL.OUT, .transport_write);
+        }
+        if (self.client.hasPendingSinkWrite() and self.client.options.sink.fd >= 0) {
+            poll_set.add(self.client.options.sink.fd, posix.POLL.OUT, .sink_write);
+        }
 
         const state = self.client.state;
         const source = self.client.options.source;
         if (source.fd >= 0 and !state.outbound.outbound_eof and state.bufferedBytes() < max_buffered_bytes) {
-            self.source_watch_id = try self.poll_dispatcher.watchFd(source.fd, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleStreamAttachedClientStepPollEvent,
-            });
+            poll_set.add(source.fd, source_poll_events, .source);
         }
         if (self.client.options.replacement_listen_fd >= 0) {
-            self.replacement_watch_id = try self.poll_dispatcher.watchFd(self.client.options.replacement_listen_fd, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleStreamAttachedClientStepPollEvent,
-            });
+            poll_set.add(self.client.options.replacement_listen_fd, posix.POLL.IN, .replacement);
         }
         if (self.client.options.control_fd >= 0 and self.client.options.control_input != null) {
-            self.control_watch_id = try self.poll_dispatcher.watchFd(self.client.options.control_fd, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleStreamAttachedClientStepPollEvent,
-            });
+            poll_set.add(self.client.options.control_fd, posix.POLL.IN, .control);
         }
         if (self.client.options.reconnect_input_fd >= 0 and self.client.options.control_input != null) {
             if (self.client.options.control_input) |control| {
                 if (reconnectInputPollEnabled(control)) {
-                    self.reconnect_input_watch_id = try self.poll_dispatcher.watchFd(self.client.options.reconnect_input_fd, .{ .readable = true }, .{
-                        .ctx = self,
-                        .callback = handleStreamAttachedClientStepPollEvent,
-                    });
+                    poll_set.add(self.client.options.reconnect_input_fd, posix.POLL.IN, .reconnect_input);
                 }
             }
         }
         if (self.client.interrupt_fd >= 0) {
-            self.interrupt_watch_id = try self.poll_dispatcher.watchFd(self.client.interrupt_fd, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleStreamAttachedClientStepPollEvent,
-            });
+            poll_set.add(self.client.interrupt_fd, posix.POLL.IN, .interrupt);
         }
-        if (timeout_ms >= 0) {
-            self.timer_watch_id = try self.poll_dispatcher.watchTimerAfter(@intCast(timeout_ms), .{
-                .ctx = self,
-                .callback = handleStreamAttachedClientStepPollEvent,
-            });
+        if (poll_set.count == 0 and timeout_ms < 0) return;
+        const ready = try posix.poll(poll_set.fdSlice(), timeout_ms);
+        if (ready == 0) return;
+        for (poll_set.fdSlice(), poll_set.kindSlice()) |pollfd, kind| {
+            if (pollfd.revents == 0) continue;
+            self.noteFdEvent(kind, fdEventFromRevents(pollfd.fd, pollfd.revents));
         }
-        try self.poll_dispatcher.run();
     }
 
-    fn hasFdEvent(self: *const StreamAttachedClientStepPoll) bool {
+    fn hasFdEvent(self: *const StreamActiveClientStepPoll) bool {
         return self.transport_event != null or
+            self.transport_write_event != null or
+            self.sink_write_event != null or
             self.source_event != null or
             self.replacement_event != null or
             self.control_event != null or
@@ -488,43 +555,42 @@ const StreamAttachedClientStepPoll = struct {
             self.interrupt_event != null;
     }
 
-    fn noteFdEvent(self: *StreamAttachedClientStepPoll, id: dispatcher.WatchId, event: dispatcher.FdEvent) void {
-        if (reconnectInputPollWatchMatches(id, self.transport_watch_id)) {
-            self.transport_event = event;
-        } else if (reconnectInputPollWatchMatches(id, self.source_watch_id)) {
-            self.source_event = event;
-        } else if (reconnectInputPollWatchMatches(id, self.replacement_watch_id)) {
-            self.replacement_event = event;
-        } else if (reconnectInputPollWatchMatches(id, self.control_watch_id)) {
-            self.control_event = event;
-        } else if (reconnectInputPollWatchMatches(id, self.reconnect_input_watch_id)) {
-            self.reconnect_input_event = event;
-        } else if (reconnectInputPollWatchMatches(id, self.interrupt_watch_id)) {
-            self.interrupt_event = event;
+    fn noteFdEvent(self: *StreamActiveClientStepPoll, kind: StreamActiveClientPollKind, event: dispatcher.FdEvent) void {
+        switch (kind) {
+            .transport => self.transport_event = event,
+            .transport_write => self.transport_write_event = event,
+            .sink_write => self.sink_write_event = event,
+            .source => self.source_event = event,
+            .replacement => self.replacement_event = event,
+            .control => self.control_event = event,
+            .reconnect_input => self.reconnect_input_event = event,
+            .interrupt => self.interrupt_event = event,
         }
     }
 };
 
-fn handleStreamAttachedClientStepPollEvent(
-    ctx: *anyopaque,
-    _: *dispatcher.Dispatcher,
-    id: dispatcher.WatchId,
-    event: dispatcher.Event,
-) !void {
-    const poll: *StreamAttachedClientStepPoll = @ptrCast(@alignCast(ctx));
-    switch (event) {
-        .fd => |fd_event| {
-            poll.noteFdEvent(id, fd_event);
-            poll.poll_dispatcher.stop();
-        },
-        .timer => {
-            if (reconnectInputPollTimerMatches(id, poll.timer_watch_id)) {
-                poll.timer_watch_id = null;
-                poll.timer_fired = true;
-                poll.poll_dispatcher.stop();
-            }
-        },
-    }
+const StreamActiveClientPollKind = enum {
+    transport,
+    transport_write,
+    sink_write,
+    source,
+    replacement,
+    control,
+    reconnect_input,
+    interrupt,
+};
+
+const StreamActiveClientPollSet = poll_sets.PollSet(StreamActiveClientPollKind, 8);
+
+fn fdEventFromRevents(fd: c.fd_t, revents: i16) dispatcher.FdEvent {
+    return .{
+        .fd = fd,
+        .readable = (revents & posix.POLL.IN) != 0,
+        .writable = (revents & posix.POLL.OUT) != 0,
+        .hangup = (revents & posix.POLL.HUP) != 0,
+        .error_event = (revents & posix.POLL.ERR) != 0,
+        .invalid = (revents & posix.POLL.NVAL) != 0,
+    };
 }
 
 fn readStreamSource(state: *StreamState, source: StreamSource) !void {
@@ -554,7 +620,7 @@ fn appendStreamSourceBytes(state: *StreamState, source: StreamSource, bytes: []c
 
 fn drainStreamSourcesNonBlocking(
     state: *StreamState,
-    options: *const StreamAttachedClientOptions,
+    options: *const StreamActiveClientOptions,
 ) !void {
     const source = options.source;
     if (source.fd < 0) return;
@@ -571,7 +637,7 @@ fn drainStreamSourcesNonBlocking(
             .would_block => {
                 // Would-block only means there is no source data ready
                 // right now. EOF must come from the source fd itself, not
-                // from a child-status guess.
+                // from a process-status guess.
                 break;
             },
             .eof => {
@@ -584,89 +650,12 @@ fn drainStreamSourcesNonBlocking(
 }
 
 fn readStreamSourceFd(source: StreamSource, buf: []u8) !ReadSomeResult {
-    return readSome(source.fd, buf);
+    return io.readSome(source.fd, buf);
 }
 
 fn readStreamSourceFdNonBlocking(source: StreamSource, buf: []u8) !ReadSomeResult {
-    return readSomeNonBlocking(source.fd, buf);
+    return io.readSomeNonBlocking(source.fd, buf);
 }
-
-fn setCloseOnExec(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const close_on_exec_flag = @as(c_int, @intCast(c.FD_CLOEXEC));
-    if ((flags & close_on_exec_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
-}
-
-const LocalStreamInterrupt = struct {
-    read_fd: c.fd_t = -1,
-    write_fd: c.fd_t = -1,
-    previous_action: posix.Sigaction = undefined,
-    installed: bool = false,
-
-    fn install() !LocalStreamInterrupt {
-        const pipe_fds = try posix.pipe();
-        var interrupt = LocalStreamInterrupt{
-            .read_fd = pipe_fds[0],
-            .write_fd = pipe_fds[1],
-        };
-        errdefer interrupt.closeFds();
-
-        try core_fds.setNonBlocking(interrupt.read_fd);
-        try core_fds.setNonBlocking(interrupt.write_fd);
-        try setCloseOnExec(interrupt.read_fd);
-        try setCloseOnExec(interrupt.write_fd);
-
-        // OpenSSH does not expose a negative local SIGINT return code for
-        // non-tty commands; it exits as ssh failure 255. The stream client uses
-        // this pipe to turn SIGINT into a normal poll event so it can abort the
-        // transport, clean up local terminal state, and return the same status.
-        const action = posix.Sigaction{
-            .handler = .{ .handler = handleLocalStreamInterrupt },
-            .mask = posix.sigemptyset(),
-            .flags = 0,
-        };
-        local_stream_interrupt_write_fd = interrupt.write_fd;
-        posix.sigaction(posix.SIG.INT, &action, &interrupt.previous_action);
-        interrupt.installed = true;
-        return interrupt;
-    }
-
-    fn deinit(self: *LocalStreamInterrupt) void {
-        if (self.installed) {
-            posix.sigaction(posix.SIG.INT, &self.previous_action, null);
-            self.installed = false;
-        }
-        local_stream_interrupt_write_fd = -1;
-        self.closeFds();
-    }
-
-    fn consume(self: *LocalStreamInterrupt) void {
-        var buf: [64]u8 = undefined;
-        while (true) {
-            const n = c.read(self.read_fd, &buf, buf.len);
-            if (n > 0) continue;
-            if (n == 0) return;
-            switch (posix.errno(n)) {
-                .INTR => continue,
-                .AGAIN => return,
-                else => return,
-            }
-        }
-    }
-
-    fn closeFds(self: *LocalStreamInterrupt) void {
-        if (self.read_fd >= 0) {
-            posix.close(self.read_fd);
-            self.read_fd = -1;
-        }
-        if (self.write_fd >= 0) {
-            posix.close(self.write_fd);
-            self.write_fd = -1;
-        }
-    }
-};
 
 const ProxyEndpoint = struct {
     stream: std.net.Stream,
@@ -682,7 +671,7 @@ const ProxyEndpoint = struct {
         };
     }
 
-    fn attachedClientOptions(self: *ProxyEndpoint, replacement_listen_fd: c.fd_t) StreamAttachedClientOptions {
+    fn activeClientOptions(self: *ProxyEndpoint, replacement_listen_fd: c.fd_t) StreamActiveClientOptions {
         return .{
             .source = .{ .fd = self.fd },
             .sink = .{
@@ -702,38 +691,51 @@ const ProxyEndpoint = struct {
     }
 };
 
-pub fn runRemoteWorker(allocator: std.mem.Allocator, guid: []const u8, replacement_listen_fd: c.fd_t, proxy_host: []const u8, proxy_port: u16) !void {
-    var endpoint = try ProxyEndpoint.connect(allocator, proxy_host, proxy_port);
+pub const RemoteWorkerOptions = struct {
+    allocator: std.mem.Allocator,
+    guid: []const u8,
+    replacement_listen_fd: c.fd_t,
+    proxy_host: []const u8,
+    proxy_port: u16,
+};
+
+pub fn runRemoteWorker(options: RemoteWorkerOptions) !void {
+    const allocator = options.allocator;
+    const replacement_listen_fd = options.replacement_listen_fd;
+    var endpoint = try ProxyEndpoint.connect(allocator, options.proxy_host, options.proxy_port);
     defer endpoint.deinit();
 
-    var state = StreamState.init(allocator, guid, "", 0);
+    var state = StreamState.init(.{
+        .allocator = allocator,
+        .guid = options.guid,
+    });
     defer state.deinit();
 
-    var attach_fd: c.fd_t = -1;
-    defer {
-        if (attach_fd >= 0) _ = c.close(attach_fd);
-    }
+    var transport_fd = core_fds.OwnedFd{};
+    defer transport_fd.deinit();
     while (true) {
-        if (attach_fd < 0) {
-            var disconnected_options = endpoint.attachedClientOptions(replacement_listen_fd);
-            attach_fd = try waitForReplacementWhileDisconnected(&state, replacement_listen_fd, &disconnected_options);
+        if (transport_fd.get() < 0) {
+            var disconnected_options = endpoint.activeClientOptions(replacement_listen_fd);
+            transport_fd = core_fds.OwnedFd.init(try waitForReplacementWhileDisconnected(&state, replacement_listen_fd, &disconnected_options));
         }
 
-        const outcome = try runAttachedStream(
+        const connected_fd = transport_fd.get();
+        const outcome = try runConnectedStream(
             &state,
-            attach_fd,
-            attach_fd,
-            endpoint.attachedClientOptions(replacement_listen_fd),
+            .{
+                .read = connected_fd,
+                .write = connected_fd,
+            },
+            endpoint.activeClientOptions(replacement_listen_fd),
         );
         switch (outcome) {
             .complete => return,
             .replacement => |replacement_fd| {
-                _ = c.close(attach_fd);
-                attach_fd = replacement_fd;
+                transport_fd.deinit();
+                transport_fd = core_fds.OwnedFd.init(replacement_fd);
             },
             .transport_closed, .unresponsive => {
-                _ = c.close(attach_fd);
-                attach_fd = -1;
+                transport_fd.deinit();
             },
         }
     }
@@ -742,13 +744,13 @@ pub fn runRemoteWorker(allocator: std.mem.Allocator, guid: []const u8, replaceme
 fn waitForReplacementWhileDisconnected(
     state: *StreamState,
     replacement_listen_fd: c.fd_t,
-    options: *const StreamAttachedClientOptions,
+    options: *const StreamActiveClientOptions,
 ) !c.fd_t {
     while (true) {
-        // The remote proxy process is durable even when no ssh transport is currently
-        // attached. It must keep draining remote fds into the offset-tracked
-        // buffers; otherwise the remote TCP peer can block before a
-        // replacement transport attaches.
+        // The remote proxy process is durable while no ssh transport is
+        // connected. It must keep draining remote fds into the offset-tracked
+        // buffers; otherwise the remote TCP peer can block before a replacement
+        // transport connects.
         var poll = try DisconnectedReplacementPoll.init(state, replacement_listen_fd, options);
         defer poll.deinit();
         try poll.run();
@@ -763,84 +765,71 @@ fn waitForReplacementWhileDisconnected(
     }
 }
 
+// PROCESS_EVENT_LOOP: disconnected process-isolated proxy worker wait. While no
+// transport is connected, the worker still drains the local source into durable
+// byte offsets and waits for a replacement transport.
 const DisconnectedReplacementPoll = struct {
-    poll_dispatcher: dispatcher.Dispatcher,
     state: *StreamState,
     replacement_listen_fd: c.fd_t,
-    options: *const StreamAttachedClientOptions,
-    replacement_watch_id: ?dispatcher.FdWatchId = null,
-    source_watch_id: ?dispatcher.FdWatchId = null,
+    options: *const StreamActiveClientOptions,
     replacement_event: ?dispatcher.FdEvent = null,
     source_event: ?dispatcher.FdEvent = null,
 
     fn init(
         state: *StreamState,
         replacement_listen_fd: c.fd_t,
-        options: *const StreamAttachedClientOptions,
+        options: *const StreamActiveClientOptions,
     ) !DisconnectedReplacementPoll {
         return .{
-            .poll_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
             .state = state,
             .replacement_listen_fd = replacement_listen_fd,
             .options = options,
         };
     }
 
-    fn deinit(self: *DisconnectedReplacementPoll) void {
-        self.poll_dispatcher.deinit();
-    }
+    fn deinit(_: *DisconnectedReplacementPoll) void {}
 
     fn run(self: *DisconnectedReplacementPoll) !void {
-        self.replacement_watch_id = try self.poll_dispatcher.watchFd(self.replacement_listen_fd, .{ .readable = true }, .{
-            .ctx = self,
-            .callback = handleDisconnectedReplacementPollEvent,
-        });
+        var poll_set = DisconnectedReplacementPollSet{};
+        poll_set.add(self.replacement_listen_fd, posix.POLL.IN, .replacement);
 
         const source = self.options.source;
         if (source.fd >= 0 and !self.state.outbound.outbound_eof and self.state.bufferedBytes() < max_buffered_bytes) {
-            self.source_watch_id = try self.poll_dispatcher.watchFd(source.fd, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleDisconnectedReplacementPollEvent,
-            });
+            poll_set.add(source.fd, source_poll_events, .source);
         }
 
-        try self.poll_dispatcher.run();
+        const ready = try posix.poll(poll_set.fdSlice(), -1);
+        if (ready == 0) return;
+        for (poll_set.fdSlice(), poll_set.kindSlice()) |pollfd, kind| {
+            if (pollfd.revents == 0) continue;
+            switch (kind) {
+                .replacement => self.replacement_event = fdEventFromRevents(pollfd.fd, pollfd.revents),
+                .source => self.source_event = fdEventFromRevents(pollfd.fd, pollfd.revents),
+            }
+        }
     }
 };
 
-fn handleDisconnectedReplacementPollEvent(
-    ctx: *anyopaque,
-    _: *dispatcher.Dispatcher,
-    id: dispatcher.WatchId,
-    event: dispatcher.Event,
-) !void {
-    const poll: *DisconnectedReplacementPoll = @ptrCast(@alignCast(ctx));
-    switch (event) {
-        .fd => |fd_event| {
-            if (reconnectInputPollWatchMatches(id, poll.replacement_watch_id)) {
-                poll.replacement_event = fd_event;
-            } else if (reconnectInputPollWatchMatches(id, poll.source_watch_id)) {
-                poll.source_event = fd_event;
-            }
-            poll.poll_dispatcher.stop();
-        },
-        .timer => {},
-    }
-}
+const DisconnectedReplacementPollKind = enum {
+    replacement,
+    source,
+};
+
+const DisconnectedReplacementPollSet = poll_sets.PollSet(DisconnectedReplacementPollKind, 2);
 
 fn acceptWorkerClient(listen_fd: c.fd_t) ?c.fd_t {
     const fd = c.accept(listen_fd, null, null);
     if (fd < 0) return null;
-    setCloseOnExec(fd) catch {
+    core_fds.setCloseOnExec(fd) catch {
         _ = c.close(fd);
         return null;
     };
     return fd;
 }
 
-/// Runs in the local `sessh` process. `start_transport` creates ssh transports
-/// that execute the remote `sessh-broker` role; this loop owns local
-/// stdin/stdout and the reconnect policy.
+/// Runs in the local `sessh` process. `start_transport` creates daemon-tunnel
+/// ssh transports to the remote host; this loop owns local stdin/stdout and the
+/// reconnect policy.
 pub fn runLocalStream(
     allocator: std.mem.Allocator,
     start_transport: anytype,
@@ -851,7 +840,12 @@ pub fn runLocalStream(
     if (control_fd >= 0) core_fds.setNonBlocking(control_fd) catch {};
     if (options.reconnect_input_fd >= 0) core_fds.setNonBlocking(options.reconnect_input_fd) catch {};
 
-    var state = StreamState.init(allocator, options.guid, options.proxy_host, options.proxy_port);
+    var state = StreamState.init(.{
+        .allocator = allocator,
+        .guid = options.guid,
+        .proxy_host = options.proxy_host,
+        .proxy_port = options.proxy_port,
+    });
     defer state.deinit();
     var input_control = StreamInputControl{
         .enabled = options.intercept_ctrl_r or options.reconnect_input_fd >= 0,
@@ -859,18 +853,18 @@ pub fn runLocalStream(
     };
     const ctrl_r_status_enabled = options.ctrl_r_status_enabled orelse (options.intercept_ctrl_r or options.reconnect_input_fd >= 0);
     const status_fd = if (options.status_fd >= 0) options.status_fd else control_fd;
-    var reconnect_status = StreamReconnectStatus.init(
-        options.status_mode,
-        ctrl_r_status_enabled,
-        options.title_fallback,
-        status_fd,
-    );
+    var reconnect_status = StreamReconnectStatus.init(.{
+        .mode = options.status_mode,
+        .ctrl_r_enabled = ctrl_r_status_enabled,
+        .title_fallback = options.title_fallback,
+        .status_fd = status_fd,
+    });
     defer reconnect_status.deinit();
     var local_interrupt = try LocalStreamInterrupt.install();
     defer local_interrupt.deinit();
     var reconnect_context = ProxyReconnectControlContext.init(.{
         .state = &state,
-        .source_fd = options.source_fd,
+        .source_fd = options.stream_fds.source,
         .reconnect_input_fd = options.reconnect_input_fd,
         .control_fd = &control_fd,
         .input_control = &input_control,
@@ -893,13 +887,13 @@ pub fn runLocalStream(
                 reconnect_status.flushDiagnostics();
                 return err;
             }
-            if (try disconnectedSourceClosed(&state, options.source_fd, &input_control)) return 0;
+            if (try disconnectedSourceClosed(&state, options.stream_fds.source, &input_control)) return 0;
             const delay_ms = reconnect.delayMs(attempt);
             const action = waitBeforeReconnect(&reconnect_status, delay_ms, &reconnect_context);
             if (options.reset_on_source_eof and state.source_eof) return 0;
             if (action == .disconnect) return 0;
             if (action == .interrupt) return 255;
-            attempt = reconnect.nextAttempt(attempt, action == .reconnect);
+            attempt = reconnect.nextAttempt(attempt, if (action == .reconnect) .reset else .increment);
             retrying = true;
             continue;
         };
@@ -909,16 +903,18 @@ pub fn runLocalStream(
         input_control.status_visible = false;
 
         transport_loop: while (true) {
-            var attached_client = StreamAttachedClient.init(
+            var active_client = StreamActiveClient.init(
                 &state,
-                transport.readFd(),
-                transport.writeFd(),
+                .{
+                    .read = transport.readFd(),
+                    .write = transport.writeFd(),
+                },
                 .{
                     .source = .{
-                        .fd = options.source_fd,
+                        .fd = options.stream_fds.source,
                         .input_control = &input_control,
                     },
-                    .sink = .{ .fd = options.sink_fd },
+                    .sink = .{ .fd = options.stream_fds.sink },
                     .reconnect_input_fd = options.reconnect_input_fd,
                     .reconnect_status = &reconnect_status,
                     .control_fd = control_fd,
@@ -935,15 +931,15 @@ pub fn runLocalStream(
                 retrying = true;
                 continue :client_loop;
             };
-            defer attached_client.deinit();
+            defer active_client.deinit();
             if (options.status_mode == .client_control and options.control_fd < 0 and options.status_fd < 0) {
                 reconnect_status.setFd(transport.writeFd());
                 reconnect_status.clear();
             }
             var old_unresponsive = false;
             while (true) {
-                attached_client.interrupt_fd = local_interrupt.read_fd;
-                const outcome = attached_client.step(-1) catch .transport_closed;
+                active_client.interrupt_fd = local_interrupt.read_fd;
+                const outcome = active_client.step(-1) catch .transport_closed;
                 switch (outcome) {
                     .complete => {
                         transport.close();
@@ -969,7 +965,7 @@ pub fn runLocalStream(
                             const action = waitBeforeReconnect(&reconnect_status, delay_ms, &reconnect_context);
                             if (action == .disconnect) return 0;
                             if (action == .interrupt) return 255;
-                            attempt = reconnect.nextAttempt(attempt, action == .reconnect);
+                            attempt = reconnect.nextAttempt(attempt, if (action == .reconnect) .reset else .increment);
                             continue;
                         };
                         abortTransport(&transport);
@@ -985,7 +981,7 @@ pub fn runLocalStream(
                         if (options.status_mode == .client_control and options.control_fd < 0 and options.status_fd < 0) {
                             reconnect_status.setFd(-1);
                         }
-                        if (try disconnectedSourceClosed(&state, options.source_fd, &input_control)) return 0;
+                        if (try disconnectedSourceClosed(&state, options.stream_fds.source, &input_control)) return 0;
                         break :transport_loop;
                     },
                     .interrupted => {
@@ -1000,7 +996,8 @@ pub fn runLocalStream(
                 }
                 switch (input_control.consumeAction()) {
                     .disconnect => {
-                        sendReset(&state, transport.writeFd(), "CLIENT_DISCONNECT", "local proxy stream disconnected") catch {};
+                        active_client.queueReset("CLIENT_DISCONNECT", "local proxy stream disconnected") catch {};
+                        _ = active_client.drainTransportWrites() catch {};
                         abortTransport(&transport);
                         return 0;
                     },
@@ -1029,7 +1026,7 @@ pub fn runLocalStream(
         if (options.reset_on_source_eof and state.source_eof) return 0;
         if (action == .disconnect) return 0;
         if (action == .interrupt) return 255;
-        attempt = reconnect.nextAttempt(attempt, action == .reconnect);
+        attempt = reconnect.nextAttempt(attempt, if (action == .reconnect) .reset else .increment);
         retrying = true;
     }
 }
@@ -1040,7 +1037,7 @@ fn disconnectedSourceClosed(
     input_control: *StreamInputControl,
 ) !bool {
     if (source_fd < 0) return false;
-    var options = StreamAttachedClientOptions{
+    var options = StreamActiveClientOptions{
         .source = .{
             .fd = source_fd,
             .input_control = input_control,
@@ -1050,21 +1047,19 @@ fn disconnectedSourceClosed(
     return state.source_eof;
 }
 
-fn runAttachedStream(
+fn runConnectedStream(
     state: *StreamState,
-    transport_read_fd: c.fd_t,
-    transport_write_fd: c.fd_t,
-    options: StreamAttachedClientOptions,
+    transport_fds: TransportFds,
+    options: StreamActiveClientOptions,
 ) !StreamOutcome {
-    var attached_client = StreamAttachedClient.init(
+    var active_client = StreamActiveClient.init(
         state,
-        transport_read_fd,
-        transport_write_fd,
+        transport_fds,
         options,
     ) catch return .transport_closed;
 
     while (true) {
-        switch (try attached_client.step(-1)) {
+        switch (try active_client.step(-1)) {
             .complete => return .complete,
             .transport_closed => return .transport_closed,
             .unresponsive => return .unresponsive,
@@ -1075,28 +1070,24 @@ fn runAttachedStream(
     }
 }
 
-fn handleFrame(
-    state: *StreamState,
-    transport_write_fd: c.fd_t,
-    options: *const StreamAttachedClientOptions,
+fn handleTransportFrame(
+    active_client: *StreamActiveClient,
+    options: *const StreamActiveClientOptions,
     frame: protocol.OwnedFrame,
 ) !void {
     var mutable = frame;
-    defer mutable.deinit(state.allocator);
+    defer mutable.deinit(active_client.state.allocator);
 
     switch (mutable.message_type) {
         .daemon_tunnel => {
-            if (protocol.handleTransportControlFrame(mutable.message_type, mutable.payload, transport_write_fd) catch |err| switch (err) {
-                error.WriteFailed => return error.StreamTransportWriteFailed,
-                else => return err,
-            }) return;
-            var message = try protocol.decodeDaemonMuxStreamFrame(state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
-            try handleMuxStreamFrame(state, transport_write_fd, options, message);
+            if (try handleTransportControlFrame(active_client, mutable.message_type, mutable.payload)) return;
+            var message = try protocol.decodeDaemonMuxStreamFrame(active_client.state.allocator, mutable.payload);
+            defer message.deinit(active_client.state.allocator);
+            try handleMuxStreamFrame(active_client, options, message);
         },
         .error_message => {
-            var message = try protocol.decodePayload(protocol.hpb.Error, state.allocator, mutable.payload);
-            defer message.deinit(state.allocator);
+            var message = try protocol.decodePayload(protocol.hpb.Error, active_client.state.allocator, mutable.payload);
+            defer message.deinit(active_client.state.allocator);
             try io.stderrPrint("sessh: {s}\n", .{message.message});
             if (message.hint) |hint| {
                 if (hint.len > 0) try io.stderrPrint("{s}\n", .{hint});
@@ -1104,8 +1095,8 @@ fn handleFrame(
             return error.StreamReset;
         },
         .client_daemon => {
-            var item = try protocol.decodePayload(pb.ClientDaemonItem, state.allocator, mutable.payload);
-            defer item.deinit(state.allocator);
+            var item = try protocol.decodePayload(pb.ClientDaemonItem, active_client.state.allocator, mutable.payload);
+            defer item.deinit(active_client.state.allocator);
             switch (item.payload orelse return error.StreamUnexpectedFrame) {
                 .connection_event => |event| {
                     if (options.reconnect_status) |status| status.handleConnectionEvent(event);
@@ -1122,69 +1113,87 @@ fn handleFrame(
     }
 }
 
+fn handleTransportControlFrame(
+    active_client: *StreamActiveClient,
+    message_type: protocol.MessageType,
+    payload: []const u8,
+) !bool {
+    switch (try protocol.decodeTransportControlFrame(active_client.state.allocator, message_type, payload) orelse return false) {
+        .ping => {
+            // A ping response must not make frame decoding depend on a
+            // successful write to the same fd. Queueing keeps transport
+            // liveness on the same nonblocking path as other control output.
+            try active_client.queueDaemonTunnelPayload(.{ .pong = .{} });
+        },
+        .pong => {},
+    }
+    return true;
+}
+
 fn handleMuxStreamFrame(
-    state: *StreamState,
-    transport_write_fd: c.fd_t,
-    options: *const StreamAttachedClientOptions,
+    active_client: *StreamActiveClient,
+    options: *const StreamActiveClientOptions,
     frame: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
+    const state = active_client.state;
     if (frame.stream_id != proxy_mux_stream_id) return error.StreamUnexpectedFrame;
     const message = frame.message orelse return error.StreamUnexpectedFrame;
     switch (message) {
         .open => |open| {
             state.peer_ready = true;
             try handleResumeOffset(state, open.recv_next_offset);
-            sendOpenOk(state, transport_write_fd) catch |err| switch (err) {
-                error.WriteFailed => return error.StreamTransportWriteFailed,
-                else => return err,
-            };
-            sendPending(state, transport_write_fd) catch |err| switch (err) {
-                error.WriteFailed => return error.StreamTransportWriteFailed,
-                else => return err,
-            };
+            try active_client.queueOpenOk();
+            try active_client.queuePending();
         },
         .open_ok => |open_ok| {
             state.peer_ready = true;
             try handleAck(state, open_ok.recv_next_offset);
-            sendPending(state, transport_write_fd) catch |err| switch (err) {
-                error.WriteFailed => return error.StreamTransportWriteFailed,
-                else => return err,
-            };
+            try active_client.queuePending();
         },
         .ack => |ack| try handleAck(state, ack.recv_next_offset),
         .payload => |payload| {
             const item = payload.item orelse return error.StreamUnexpectedFrame;
             switch (item) {
-                .proxy => |proxy_item| try handleProxyStreamPayload(state, transport_write_fd, options, payload.offset, proxy_item),
+                .proxy => |proxy_item| try handleProxyStreamPayload(.{
+                    .active_client = active_client,
+                    .options = options,
+                    .offset = payload.offset,
+                    .item = proxy_item,
+                }),
                 .terminal_emulator => return error.StreamUnexpectedFrame,
             }
         },
         .eof => |eof| try handleInboundEof(
-            state,
-            transport_write_fd,
-            options,
+            active_client,
             eof.final_offset,
         ),
         .reset => return error.StreamReset,
     }
 }
 
-fn handleProxyStreamPayload(
-    state: *StreamState,
-    transport_write_fd: c.fd_t,
-    options: *const StreamAttachedClientOptions,
+const ProxyStreamPayloadContext = struct {
+    active_client: *StreamActiveClient,
+    options: *const StreamActiveClientOptions,
     offset: u64,
     item: pb.ProxyStreamItem,
-) !void {
-    const payload = item.payload orelse return error.StreamUnexpectedFrame;
+};
+
+const InboundProxyDataContext = struct {
+    active_client: *StreamActiveClient,
+    options: *const StreamActiveClientOptions,
+    offset: u64,
+    data: []const u8,
+};
+
+fn handleProxyStreamPayload(context: ProxyStreamPayloadContext) !void {
+    const payload = context.item.payload orelse return error.StreamUnexpectedFrame;
     switch (payload) {
-        .data => |data| try handleInboundData(
-            state,
-            transport_write_fd,
-            options,
-            offset,
-            data,
-        ),
+        .data => |data| try handleInboundData(.{
+            .active_client = context.active_client,
+            .options = context.options,
+            .offset = context.offset,
+            .data = data,
+        }),
         else => return error.StreamUnexpectedFrame,
     }
 }
@@ -1197,157 +1206,101 @@ fn handleAck(state: *StreamState, offset: u64) !void {
     try state.ackOutbound(offset);
 }
 
-fn handleInboundData(
-    state: *StreamState,
-    transport_write_fd: c.fd_t,
-    options: *const StreamAttachedClientOptions,
-    offset: u64,
-    data: []const u8,
-) !void {
-    const sink = options.sink;
-    const inbound = try state.acceptInboundData(offset, data);
-    if (inbound.new_data.len != 0 and sink.fd < 0) return error.StreamSinkClosed;
-    if (inbound.new_data.len != 0) try deliverInboundData(options, sink.fd, inbound.new_data);
-    sendAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
-        error.WriteFailed => return error.StreamTransportWriteFailed,
-        else => return err,
-    };
+fn handleInboundData(context: InboundProxyDataContext) !void {
+    const sink = context.options.sink;
+    const queued = try context.active_client.state.queueInboundData(context.offset, context.data);
+    if (queued != 0 and sink.fd < 0) return error.StreamSinkClosed;
+    _ = try context.active_client.drainSinkWrites();
 }
 
 fn handleInboundEof(
-    state: *StreamState,
-    transport_write_fd: c.fd_t,
-    options: *const StreamAttachedClientOptions,
+    active_client: *StreamActiveClient,
     final_offset: u64,
 ) !void {
+    const state = active_client.state;
     try state.markInboundEof(final_offset);
-    const sink = options.sink;
-    if (sink.shutdown_on_eof and sink.fd >= 0) _ = c.shutdown(sink.fd, c.SHUT.WR);
-    if (sink.close_fd_on_eof) |sink_fd_ptr| {
-        if (sink_fd_ptr.* >= 0) {
-            _ = c.close(sink_fd_ptr.*);
-            sink_fd_ptr.* = -1;
+    _ = try active_client.drainSinkWrites();
+}
+
+const test_frames = if (builtin.is_test) struct {
+    // Test helpers use blocking writes only to build pipe fixtures. Production
+    // proxy-stream output goes through StreamActiveClient's FrameWriteQueue so a
+    // stalled transport cannot block the worker state machine.
+    const SendDataRequest = struct {
+        state: *StreamState,
+        fd: c.fd_t,
+        payload: ProxyDataPayload,
+    };
+
+    fn sendData(request: SendDataRequest) !void {
+        try sendMuxStreamFrame(request.state.allocator, request.fd, muxProxyDataFrame(request.payload));
+    }
+
+    fn sendEof(state: *StreamState, fd: c.fd_t, offset: u64) !void {
+        try sendMuxStreamFrame(state.allocator, fd, .{
+            .stream_id = proxy_mux_stream_id,
+            .message = .{ .eof = .{ .final_offset = offset } },
+        });
+    }
+
+    fn sendReset(state: *StreamState, fd: c.fd_t, info: protocol.ErrorInfo) !void {
+        try protocol_test_helpers.sendMuxStreamResetFrameBlocking(.{
+            .allocator = state.allocator,
+            .fd = fd,
+            .stream_id = proxy_mux_stream_id,
+            .code = info.code,
+            .message = info.message,
+        });
+    }
+
+    fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
+        if (!state.peer_ready) return;
+        const outbound = &state.outbound;
+        if (outbound.peer_recv < outbound.outbound_base or
+            outbound.peer_recv > outbound.outboundNext())
+        {
+            return error.StreamAckOutOfRange;
+        }
+        if (outbound.outbound_sent_next < outbound.outbound_base or
+            outbound.outbound_sent_next > outbound.outboundNext())
+        {
+            return error.StreamAckOutOfRange;
+        }
+        // ACKs tell us what the peer has durably received. Separately remember
+        // how far this transport has already been sent so appending new source
+        // bytes does not cause an overlapping resend on the same still-live
+        // transport. On a replacement transport, the resume frame resets
+        // outbound_sent_next to the peer's reported receive offset, which is
+        // when retransmission is needed.
+        var index: usize = @intCast(outbound.outbound_sent_next - outbound.outbound_base);
+        while (index < outbound.outbound.items.len) {
+            const len = @min(max_chunk_bytes, outbound.outbound.items.len - index);
+            const offset = outbound.outbound_base + index;
+            try sendData(.{
+                .state = state,
+                .fd = transport_write_fd,
+                .payload = .{
+                    .offset = offset,
+                    .data = outbound.outbound.items[index .. index + len],
+                },
+            });
+            index += len;
+            outbound.outbound_sent_next = offset + len;
+        }
+        if (outbound.outbound_eof and !outbound.outbound_eof_acked and !outbound.outbound_eof_sent) {
+            try sendEof(state, transport_write_fd, outbound.outboundNext());
+            outbound.outbound_eof_sent = true;
         }
     }
-    if (options.close_outbound_on_inbound_eof and state.inbound.inbound_eof) {
-        state.completeOutboundAfterInboundEof();
+
+    fn sendMuxStreamFrame(
+        allocator: std.mem.Allocator,
+        fd: c.fd_t,
+        message: pb.DaemonTunnelItem.MuxStreamFrame,
+    ) !void {
+        try protocol_test_helpers.sendMuxStreamFrameBlocking(allocator, fd, message);
     }
-    sendAck(state, transport_write_fd, state.inbound.recv_next_offset) catch |err| switch (err) {
-        error.WriteFailed => return error.StreamTransportWriteFailed,
-        else => return err,
-    };
-}
-
-fn deliverInboundData(options: *const StreamAttachedClientOptions, sink_fd: c.fd_t, bytes: []const u8) !void {
-    if (options.reconnect_status) |status| status.observeInbound(bytes);
-    try io.writeAll(sink_fd, bytes);
-}
-
-fn sendResumeMessage(state: *StreamState, fd: c.fd_t, send_proxy_open: bool) !void {
-    try sendMuxStreamFrame(state.allocator, fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .open = .{
-            .recv_next_offset = state.inbound.recv_next_offset,
-        } },
-    });
-    if (!send_proxy_open) return;
-    try sendMuxStreamFrame(state.allocator, fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .payload = .{
-            .offset = 0,
-            .item = .{ .proxy = .{ .payload = .{ .open = .{
-                .proxy_guid = state.guid,
-                .proxy_host = state.proxy_host,
-                .proxy_port = state.proxy_port,
-            } } } },
-        } },
-    });
-}
-
-fn sendOpenOk(state: *StreamState, fd: c.fd_t) !void {
-    try sendMuxStreamFrame(state.allocator, fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .open_ok = .{
-            .recv_next_offset = state.inbound.recv_next_offset,
-        } },
-    });
-}
-
-fn sendAck(state: *StreamState, fd: c.fd_t, offset: u64) !void {
-    try sendMuxStreamFrame(state.allocator, fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .ack = .{
-            .recv_next_offset = offset,
-        } },
-    });
-}
-
-fn sendData(
-    state: *StreamState,
-    fd: c.fd_t,
-    offset: u64,
-    data: []const u8,
-) !void {
-    try sendMuxStreamFrame(state.allocator, fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .payload = .{
-            .offset = offset,
-            .item = .{ .proxy = .{ .payload = .{ .data = data } } },
-        } },
-    });
-}
-
-fn sendEof(state: *StreamState, fd: c.fd_t, offset: u64) !void {
-    try sendMuxStreamFrame(state.allocator, fd, .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .eof = .{ .final_offset = offset } },
-    });
-}
-
-fn sendReset(state: *StreamState, fd: c.fd_t, code: []const u8, message: []const u8) !void {
-    try protocol.sendMuxStreamResetFrame(state.allocator, fd, proxy_mux_stream_id, code, message);
-}
-
-fn sendPending(state: *StreamState, transport_write_fd: c.fd_t) !void {
-    if (!state.peer_ready) return;
-    const outbound = &state.outbound;
-    if (outbound.peer_recv < outbound.outbound_base or
-        outbound.peer_recv > outbound.outboundNext())
-    {
-        return error.StreamAckOutOfRange;
-    }
-    if (outbound.outbound_sent_next < outbound.outbound_base or
-        outbound.outbound_sent_next > outbound.outboundNext())
-    {
-        return error.StreamAckOutOfRange;
-    }
-    // ACKs tell us what the peer has durably received. Separately remember
-    // how far this transport has already been sent so appending new source
-    // bytes does not cause an overlapping resend on the same still-live
-    // transport. On a replacement transport, the resume frame resets
-    // outbound_sent_next to the peer's reported receive offset, which is
-    // when retransmission is needed.
-    var index: usize = @intCast(outbound.outbound_sent_next - outbound.outbound_base);
-    while (index < outbound.outbound.items.len) {
-        const len = @min(max_chunk_bytes, outbound.outbound.items.len - index);
-        const offset = outbound.outbound_base + index;
-        try sendData(state, transport_write_fd, offset, outbound.outbound.items[index .. index + len]);
-        index += len;
-        outbound.outbound_sent_next = offset + len;
-    }
-    if (outbound.outbound_eof and !outbound.outbound_eof_acked and !outbound.outbound_eof_sent) {
-        try sendEof(state, transport_write_fd, outbound.outboundNext());
-        outbound.outbound_eof_sent = true;
-    }
-}
-
-fn sendMuxStreamFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    message: pb.DaemonTunnelItem.MuxStreamFrame,
-) !void {
-    try protocol.sendMuxStreamFrame(allocator, fd, message);
-}
+} else struct {};
 
 fn abortTransport(transport: anytype) void {
     const Transport = @TypeOf(transport.*);
@@ -1358,37 +1311,8 @@ fn abortTransport(transport: anytype) void {
     }
 }
 
-const ReadSomeResult = union(enum) {
-    bytes: []const u8,
-    would_block,
-    eof,
-};
-
-fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
-    while (true) {
-        const n = c.read(fd, buf.ptr, buf.len);
-        if (n > 0) return .{ .bytes = buf[0..@intCast(n)] };
-        if (n == 0) return .eof;
-        switch (posix.errno(n)) {
-            .AGAIN => return .would_block,
-            .INTR => continue,
-            else => return error.StreamReadFailed,
-        }
-    }
-}
-
-fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
-    var flags_guard = core_fds.StatusFlagsGuard.setNonBlocking(fd) catch return error.StreamReadFailed;
-    defer flags_guard.restore();
-    return readSome(fd, buf);
-}
-
 pub fn requestProxyRemoteCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
     return proxy_remote.requestCleanup(allocator, guid);
-}
-
-pub fn forgetProxyRemote(guid: []const u8) void {
-    proxy_remote.forget(guid);
 }
 
 pub fn activeProxyRemoteProcessCount() usize {
@@ -1396,11 +1320,20 @@ pub fn activeProxyRemoteProcessCount() usize {
 }
 
 fn nowMillis() u64 {
-    return @intCast(std.time.milliTimestamp());
+    return non_suspending_timer.nowMs() catch {
+        const ms = std.time.milliTimestamp();
+        if (ms < 0) return 0;
+        return @intCast(ms);
+    };
 }
 
 fn elapsedMs(start_ms: u64, end_ms: u64) u64 {
     return if (end_ms >= start_ms) end_ms - start_ms else 0;
+}
+
+fn remainingDelayMs(deadline_ms: u64, now_ms: u64) ?u64 {
+    if (now_ms >= deadline_ms) return null;
+    return deadline_ms - now_ms;
 }
 
 const ProxyReconnectControlContext = struct {
@@ -1443,8 +1376,8 @@ fn waitBeforeReconnect(
     delay_ms: u64,
     control: *ProxyReconnectControlContext,
 ) StreamControlAction {
-    var remaining_ms = delay_ms;
-    while (remaining_ms > 0) {
+    const deadline_ms = nowMillis() +| delay_ms;
+    while (remainingDelayMs(deadline_ms, nowMillis())) |remaining_ms| {
         status.showRetry(remaining_ms);
         control.input_control.status_visible = true;
         const step_ms = @min(remaining_ms, 1_000);
@@ -1454,7 +1387,6 @@ fn waitBeforeReconnect(
             continue;
         }
         if (action != .none) return action;
-        remaining_ms -= step_ms;
         status.flushDiagnostics();
     }
     const action = control.input_control.consumeAction();
@@ -1475,128 +1407,86 @@ fn pollReconnectInput(
     return poll.result;
 }
 
+// PROCESS_EVENT_LOOP: foreground proxy reconnect UI wait. It observes local
+// control input and diagnostics while the process is between transport
+// attempts, outside sesshd's daemon Dispatcher.
 const ReconnectInputDispatcherPoll = struct {
-    poll_dispatcher: dispatcher.Dispatcher,
     control: *ProxyReconnectControlContext,
-    interrupt_watch_id: ?dispatcher.FdWatchId = null,
-    input_watch_id: ?dispatcher.FdWatchId = null,
-    reconnect_input_watch_id: ?dispatcher.FdWatchId = null,
-    control_watch_id: ?dispatcher.FdWatchId = null,
-    timer_watch_id: ?dispatcher.TimerWatchId = null,
     result: StreamControlAction = .none,
     done: bool = false,
 
     fn init(control: *ProxyReconnectControlContext) !ReconnectInputDispatcherPoll {
         return .{
-            .poll_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
             .control = control,
             .result = control.input_control.consumeAction(),
         };
     }
 
-    fn deinit(self: *ReconnectInputDispatcherPoll) void {
-        self.poll_dispatcher.deinit();
-    }
+    fn deinit(_: *ReconnectInputDispatcherPoll) void {}
 
     fn run(self: *ReconnectInputDispatcherPoll, timeout_ms: i32) !void {
-        var has_watch = false;
+        var poll_set = ReconnectInputPollSet{};
         if (self.control.interrupt) |local_interrupt| {
             if (local_interrupt.read_fd >= 0) {
-                self.interrupt_watch_id = try self.poll_dispatcher.watchFd(local_interrupt.read_fd, .{ .readable = true }, .{
-                    .ctx = self,
-                    .callback = handleReconnectInputDispatcherPollEvent,
-                });
-                has_watch = true;
+                poll_set.add(local_interrupt.read_fd, posix.POLL.IN, .interrupt);
             }
         }
         if (self.control.source_fd >= 0 and reconnectInputPollEnabled(self.control.input_control)) {
-            self.input_watch_id = try self.poll_dispatcher.watchFd(self.control.source_fd, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleReconnectInputDispatcherPollEvent,
-            });
-            has_watch = true;
+            poll_set.add(self.control.source_fd, source_poll_events, .input);
         }
         if (self.control.reconnect_input_fd >= 0 and reconnectInputPollEnabled(self.control.input_control)) {
-            self.reconnect_input_watch_id = try self.poll_dispatcher.watchFd(self.control.reconnect_input_fd, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleReconnectInputDispatcherPollEvent,
-            });
-            has_watch = true;
+            poll_set.add(self.control.reconnect_input_fd, posix.POLL.IN, .reconnect_input);
         }
         if (self.control.control_fd.* >= 0) {
-            self.control_watch_id = try self.poll_dispatcher.watchFd(self.control.control_fd.*, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleReconnectInputDispatcherPollEvent,
-            });
-            has_watch = true;
+            poll_set.add(self.control.control_fd.*, posix.POLL.IN, .control);
         }
-        if (timeout_ms >= 0) {
-            self.timer_watch_id = try self.poll_dispatcher.watchTimerAfter(@intCast(timeout_ms), .{
-                .ctx = self,
-                .callback = handleReconnectInputDispatcherPollEvent,
-            });
-            has_watch = true;
+        if (poll_set.count == 0 and timeout_ms < 0) return;
+        const ready = try posix.poll(poll_set.fdSlice(), timeout_ms);
+        if (ready == 0) {
+            self.finish(self.control.input_control.consumeAction());
+            return;
         }
-        if (has_watch) try self.poll_dispatcher.run();
+        for (poll_set.fdSlice(), poll_set.kindSlice()) |pollfd, kind| {
+            if (self.done) break;
+            if (pollfd.revents == 0) continue;
+            const fd_event = fdEventFromRevents(pollfd.fd, pollfd.revents);
+            if (!fd_event.readable and !fd_event.hangup and !fd_event.error_event and !fd_event.invalid) continue;
+            self.handleFdEvent(kind);
+        }
     }
 
     fn finish(self: *ReconnectInputDispatcherPoll, result: StreamControlAction) void {
         self.result = result;
         self.done = true;
-        self.poll_dispatcher.stop();
+    }
+
+    fn handleFdEvent(self: *ReconnectInputDispatcherPoll, kind: ReconnectInputPollKind) void {
+        switch (kind) {
+            .interrupt => {
+                if (self.control.interrupt) |local_interrupt| local_interrupt.consume();
+                self.finish(.interrupt);
+            },
+            .input => self.finish(readReconnectInput(self.control.state, self.control.source_fd, self.control.input_control)),
+            .reconnect_input => {
+                readReconnectControlInput(self.control.reconnect_input_fd, self.control.input_control);
+                self.finish(self.control.input_control.consumeAction());
+            },
+            .control => {
+                if (!readControlInput(self.control.control_fd.*, self.control.input_control, &self.control.control_reader)) self.control.control_fd.* = -1;
+                self.finish(self.control.input_control.consumeAction());
+            },
+        }
     }
 };
 
-fn reconnectInputPollWatchMatches(id: dispatcher.WatchId, expected: ?dispatcher.FdWatchId) bool {
-    const expected_id = expected orelse return false;
-    const fd_id = switch (id) {
-        .fd => |fd| fd,
-        .timer => return false,
-    };
-    return fd_id.index == expected_id.index and fd_id.generation == expected_id.generation;
-}
+const ReconnectInputPollKind = enum {
+    interrupt,
+    input,
+    reconnect_input,
+    control,
+};
 
-fn reconnectInputPollTimerMatches(id: dispatcher.WatchId, expected: ?dispatcher.TimerWatchId) bool {
-    const expected_id = expected orelse return false;
-    const timer_id = switch (id) {
-        .timer => |timer| timer,
-        .fd => return false,
-    };
-    return timer_id.index == expected_id.index and timer_id.generation == expected_id.generation;
-}
-
-fn handleReconnectInputDispatcherPollEvent(
-    ctx: *anyopaque,
-    _: *dispatcher.Dispatcher,
-    id: dispatcher.WatchId,
-    event: dispatcher.Event,
-) !void {
-    const poll: *ReconnectInputDispatcherPoll = @ptrCast(@alignCast(ctx));
-    if (poll.done) return;
-    switch (event) {
-        .fd => |fd_event| {
-            if (!fd_event.readable and !fd_event.hangup and !fd_event.error_event and !fd_event.invalid) return;
-            if (reconnectInputPollWatchMatches(id, poll.interrupt_watch_id)) {
-                if (poll.control.interrupt) |local_interrupt| local_interrupt.consume();
-                poll.finish(.interrupt);
-            } else if (reconnectInputPollWatchMatches(id, poll.input_watch_id)) {
-                poll.finish(readReconnectInput(poll.control.state, poll.control.source_fd, poll.control.input_control));
-            } else if (reconnectInputPollWatchMatches(id, poll.reconnect_input_watch_id)) {
-                readReconnectControlInput(poll.control.reconnect_input_fd, poll.control.input_control);
-                poll.finish(poll.control.input_control.consumeAction());
-            } else if (reconnectInputPollWatchMatches(id, poll.control_watch_id)) {
-                if (!readControlInput(poll.control.control_fd.*, poll.control.input_control, &poll.control.control_reader)) poll.control.control_fd.* = -1;
-                poll.finish(poll.control.input_control.consumeAction());
-            }
-        },
-        .timer => {
-            if (reconnectInputPollTimerMatches(id, poll.timer_watch_id)) {
-                poll.timer_watch_id = null;
-                poll.finish(poll.control.input_control.consumeAction());
-            }
-        },
-    }
-}
+const ReconnectInputPollSet = poll_sets.PollSet(ReconnectInputPollKind, 4);
 
 fn reconnectInputPollEnabled(input_control: *const StreamInputControl) bool {
     return (input_control.enabled or input_control.escape_enabled) and input_control.status_visible;
@@ -1647,14 +1537,18 @@ fn readControlInput(control_fd: c.fd_t, input_control: *StreamInputControl, read
     }
 }
 
-fn encodeMuxProxyDataPayload(allocator: std.mem.Allocator, offset: u64, data: []const u8) ![]u8 {
-    return protocol.encodeMuxStreamFramePayload(allocator, .{
+fn muxProxyDataFrame(payload: ProxyDataPayload) pb.DaemonTunnelItem.MuxStreamFrame {
+    return .{
         .stream_id = proxy_mux_stream_id,
         .message = .{ .payload = .{
-            .offset = offset,
-            .item = .{ .proxy = .{ .payload = .{ .data = data } } },
+            .offset = payload.offset,
+            .item = .{ .proxy = .{ .payload = .{ .data = payload.data } } },
         } },
-    });
+    };
+}
+
+fn encodeMuxProxyDataPayload(allocator: std.mem.Allocator, payload: ProxyDataPayload) ![]u8 {
+    return protocol.encodeMuxStreamFramePayload(allocator, muxProxyDataFrame(payload));
 }
 
 fn encodeMuxProxyEofPayload(allocator: std.mem.Allocator, offset: u64) ![]u8 {
@@ -1673,78 +1567,140 @@ fn encodeMuxAckPayload(allocator: std.mem.Allocator, recv_next_offset: u64) ![]u
     });
 }
 
-fn expectMuxStreamFrame(fd: c.fd_t) !pb.DaemonTunnelItem.MuxStreamFrame {
-    var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, fd);
-    defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.daemon_tunnel, frame.message_type);
-    var mux = try protocol.decodeDaemonMuxStreamFrame(std.testing.allocator, frame.payload);
-    errdefer mux.deinit(std.testing.allocator);
-    try std.testing.expectEqual(proxy_mux_stream_id, mux.stream_id);
-    return mux;
-}
+const test_support = if (builtin.is_test) struct {
+    fn expectMuxStreamFrame(fd: c.fd_t) !pb.DaemonTunnelItem.MuxStreamFrame {
+        var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, fd);
+        defer frame.deinit(std.testing.allocator);
+        try std.testing.expectEqual(protocol.MessageType.daemon_tunnel, frame.message_type);
+        var mux = try protocol.decodeDaemonMuxStreamFrame(std.testing.allocator, frame.payload);
+        errdefer mux.deinit(std.testing.allocator);
+        try std.testing.expectEqual(proxy_mux_stream_id, mux.stream_id);
+        return mux;
+    }
 
-fn expectProxyDataFrame(fd: c.fd_t, expected_offset: u64, expected_data: []const u8) !void {
-    var mux = try expectMuxStreamFrame(fd);
-    defer mux.deinit(std.testing.allocator);
-    const message = mux.message orelse return error.UnexpectedMuxFrame;
-    switch (message) {
-        .payload => |payload| {
-            try std.testing.expectEqual(expected_offset, payload.offset);
-            const item = payload.item orelse return error.UnexpectedMuxFrame;
-            switch (item) {
-                .proxy => |proxy_item| {
-                    const proxy_payload = proxy_item.payload orelse return error.UnexpectedMuxFrame;
-                    switch (proxy_payload) {
-                        .data => |data| try std.testing.expectEqualStrings(expected_data, data),
-                        else => return error.UnexpectedMuxFrame,
-                    }
-                },
-                else => return error.UnexpectedMuxFrame,
+    fn expectProxyDataFrame(fd: c.fd_t, expected_offset: u64, expected_data: []const u8) !void {
+        var mux = try expectMuxStreamFrame(fd);
+        defer mux.deinit(std.testing.allocator);
+        const message = mux.message orelse return error.UnexpectedMuxFrame;
+        switch (message) {
+            .payload => |payload| {
+                try std.testing.expectEqual(expected_offset, payload.offset);
+                const item = payload.item orelse return error.UnexpectedMuxFrame;
+                switch (item) {
+                    .proxy => |proxy_item| {
+                        const proxy_payload = proxy_item.payload orelse return error.UnexpectedMuxFrame;
+                        switch (proxy_payload) {
+                            .data => |data| try std.testing.expectEqualStrings(expected_data, data),
+                            else => return error.UnexpectedMuxFrame,
+                        }
+                    },
+                    else => return error.UnexpectedMuxFrame,
+                }
+            },
+            else => return error.UnexpectedMuxFrame,
+        }
+    }
+
+    fn expectProxyEofFrame(fd: c.fd_t, expected_offset: u64) !void {
+        var mux = try expectMuxStreamFrame(fd);
+        defer mux.deinit(std.testing.allocator);
+        const message = mux.message orelse return error.UnexpectedMuxFrame;
+        switch (message) {
+            .eof => |eof| try std.testing.expectEqual(expected_offset, eof.final_offset),
+            else => return error.UnexpectedMuxFrame,
+        }
+    }
+
+    fn expectAckFrame(fd: c.fd_t, expected_offset: u64) !void {
+        var mux = try expectMuxStreamFrame(fd);
+        defer mux.deinit(std.testing.allocator);
+        const message = mux.message orelse return error.UnexpectedMuxFrame;
+        switch (message) {
+            .ack => |ack| try std.testing.expectEqual(expected_offset, ack.recv_next_offset),
+            else => return error.UnexpectedMuxFrame,
+        }
+    }
+
+    fn expectResetFrame(fd: c.fd_t, expected_code: []const u8) !void {
+        var mux = try expectMuxStreamFrame(fd);
+        defer mux.deinit(std.testing.allocator);
+        const message = mux.message orelse return error.UnexpectedMuxFrame;
+        switch (message) {
+            .reset => |reset| try std.testing.expectEqualStrings(expected_code, reset.code),
+            else => return error.UnexpectedMuxFrame,
+        }
+    }
+
+    fn activeClient(
+        state: *StreamState,
+        transport_write_fd: c.fd_t,
+        options: StreamActiveClientOptions,
+    ) !StreamActiveClient {
+        if (transport_write_fd >= 0) try core_fds.setNonBlocking(transport_write_fd);
+        return .{
+            .state = state,
+            .transport_fds = .{
+                .read = -1,
+                .write = transport_write_fd,
+            },
+            .transport_reader = protocol.FrameReader.init(std.testing.allocator),
+            .transport_writer = frame_write_queue.FrameWriteQueue.init(std.testing.allocator),
+            .transport_writer_initialized = true,
+            .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
+            .options = options,
+            .liveness = StreamLiveness.init(1_000),
+        };
+    }
+
+    fn drainActiveClient(active_client: *StreamActiveClient) !void {
+        try std.testing.expectEqual(frame_write_queue.WriteQueueStatus.drained, try active_client.drainTransportWrites());
+    }
+
+    fn fillPipe(write_fd: c.fd_t) !void {
+        try core_fds.setNonBlocking(write_fd);
+        const bytes = [_]u8{'x'} ** 4096;
+        while (true) {
+            const n = c.write(write_fd, &bytes, bytes.len);
+            if (n > 0) continue;
+            if (n == 0) return error.WriteFailed;
+            switch (posix.errno(n)) {
+                .AGAIN => return,
+                .INTR => continue,
+                else => return error.WriteFailed,
             }
-        },
-        else => return error.UnexpectedMuxFrame,
+        }
     }
-}
 
-fn expectProxyEofFrame(fd: c.fd_t, expected_offset: u64) !void {
-    var mux = try expectMuxStreamFrame(fd);
-    defer mux.deinit(std.testing.allocator);
-    const message = mux.message orelse return error.UnexpectedMuxFrame;
-    switch (message) {
-        .eof => |eof| try std.testing.expectEqual(expected_offset, eof.final_offset),
-        else => return error.UnexpectedMuxFrame,
+    fn expectNoReadable(fd: c.fd_t) !void {
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pollfds, 0));
     }
-}
 
-fn expectAckFrame(fd: c.fd_t, expected_offset: u64) !void {
-    var mux = try expectMuxStreamFrame(fd);
-    defer mux.deinit(std.testing.allocator);
-    const message = mux.message orelse return error.UnexpectedMuxFrame;
-    switch (message) {
-        .ack => |ack| try std.testing.expectEqual(expected_offset, ack.recv_next_offset),
-        else => return error.UnexpectedMuxFrame,
+    fn streamState() StreamState {
+        return StreamState.init(.{
+            .allocator = std.testing.allocator,
+            .guid = "p-550e8400-e29b-41d4-a716-446655440000",
+        });
     }
-}
-
-fn expectResetFrame(fd: c.fd_t, expected_code: []const u8) !void {
-    var mux = try expectMuxStreamFrame(fd);
-    defer mux.deinit(std.testing.allocator);
-    const message = mux.message orelse return error.UnexpectedMuxFrame;
-    switch (message) {
-        .reset => |reset| try std.testing.expectEqualStrings(expected_code, reset.code),
-        else => return error.UnexpectedMuxFrame,
-    }
-}
+} else struct {};
 
 test "stream frames round trip through a pipe" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
-    try sendData(&state, fds[1], 42, "hello");
-    try expectProxyDataFrame(fds[0], 42, "hello");
+    try test_frames.sendData(.{
+        .state = &state,
+        .fd = fds[1],
+        .payload = .{ .offset = 42, .data = "hello" },
+    });
+    try test_support.expectProxyDataFrame(fds[0], 42, "hello");
 }
 
 test "stream ping receives pong without changing offsets" {
@@ -1752,14 +1708,18 @@ test "stream ping receives pong without changing offsets" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
     const payload = try protocol.encodeDaemonTunnelPayload(std.testing.allocator, .{ .ping = .{} });
-    const options = StreamAttachedClientOptions{};
-    try handleFrame(&state, fds[1], &options, .{
+    const options = StreamActiveClientOptions{};
+    var active_client = try test_support.activeClient(&state, fds[1], options);
+    defer active_client.deinit();
+
+    try handleTransportFrame(&active_client, &options, .{
         .message_type = .daemon_tunnel,
         .payload = payload,
     });
+    try test_support.drainActiveClient(&active_client);
 
     var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);
@@ -1768,22 +1728,28 @@ test "stream ping receives pong without changing offsets" {
     try std.testing.expectEqual(@as(u64, 0), state.outbound.outboundNext());
 }
 
+test "proxy reconnect delay helper expires at deadline" {
+    try std.testing.expectEqual(@as(?u64, 500), remainingDelayMs(1_500, 1_000));
+    try std.testing.expectEqual(@as(?u64, null), remainingDelayMs(1_500, 1_500));
+    try std.testing.expectEqual(@as(?u64, null), remainingDelayMs(1_500, 1_501));
+}
+
 test "stream sender sends only newly appended bytes on a live transport" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
     state.peer_ready = true;
 
     try state.appendOutbound("first");
-    try sendPending(&state, fds[1]);
-    try expectProxyDataFrame(fds[0], 0, "first");
+    try test_frames.sendPending(&state, fds[1]);
+    try test_support.expectProxyDataFrame(fds[0], 0, "first");
 
     try state.appendOutbound("second");
-    try sendPending(&state, fds[1]);
-    try expectProxyDataFrame(fds[0], 5, "second");
+    try test_frames.sendPending(&state, fds[1]);
+    try test_support.expectProxyDataFrame(fds[0], 5, "second");
 }
 
 test "stream receiver keeps suffix from overlapping data frame" {
@@ -1794,23 +1760,68 @@ test "stream receiver keeps suffix from overlapping data frame" {
     defer posix.close(ack[0]);
     defer posix.close(ack[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
     state.inbound.recv_next_offset = 5;
 
-    const payload = try encodeMuxProxyDataPayload(std.testing.allocator, 0, "firstsecond");
-    var options = StreamAttachedClientOptions{};
+    const payload = try encodeMuxProxyDataPayload(std.testing.allocator, .{
+        .offset = 0,
+        .data = "firstsecond",
+    });
+    var options = StreamActiveClientOptions{};
     options.sink = .{ .fd = sink[1] };
-    try handleFrame(&state, ack[1], &options, .{
+    var active_client = try test_support.activeClient(&state, ack[1], options);
+    defer active_client.deinit();
+    try handleTransportFrame(&active_client, &options, .{
         .message_type = .daemon_tunnel,
         .payload = payload,
     });
+    try test_support.drainActiveClient(&active_client);
 
     var delivered: [6]u8 = undefined;
     try io.readExact(sink[0], &delivered);
     try std.testing.expectEqualStrings("second", delivered[0..]);
 
-    try expectAckFrame(ack[0], 11);
+    try test_support.expectAckFrame(ack[0], 11);
+}
+
+test "stream receiver ACK waits for blocked sink delivery" {
+    const sink = try posix.pipe();
+    defer posix.close(sink[0]);
+    defer posix.close(sink[1]);
+    const ack = try posix.pipe();
+    defer posix.close(ack[0]);
+    defer posix.close(ack[1]);
+
+    try test_support.fillPipe(sink[1]);
+
+    var state = test_support.streamState();
+    defer state.deinit();
+
+    const payload = try encodeMuxProxyDataPayload(std.testing.allocator, .{
+        .offset = 0,
+        .data = "hello",
+    });
+    var options = StreamActiveClientOptions{};
+    options.sink = .{ .fd = sink[1] };
+    var active_client = try test_support.activeClient(&state, ack[1], options);
+    defer active_client.deinit();
+    try handleTransportFrame(&active_client, &options, .{
+        .message_type = .daemon_tunnel,
+        .payload = payload,
+    });
+
+    try std.testing.expectEqual(@as(u64, 0), state.inbound.recv_next_offset);
+    try std.testing.expectEqualStrings("hello", state.pendingInboundData());
+    try test_support.expectNoReadable(ack[0]);
+
+    var drain: [8192]u8 = undefined;
+    _ = c.read(sink[0], &drain, drain.len);
+    try std.testing.expect(try active_client.drainSinkWrites());
+    try test_support.drainActiveClient(&active_client);
+    try std.testing.expectEqual(@as(u64, 5), state.inbound.recv_next_offset);
+    try std.testing.expectEqual(@as(usize, 0), state.pendingInboundData().len);
+    try test_support.expectAckFrame(ack[0], 5);
 }
 
 test "stream inbound eof can complete without generated outbound eof ack" {
@@ -1821,18 +1832,20 @@ test "stream inbound eof can complete without generated outbound eof ack" {
     defer posix.close(transport_out[0]);
     defer posix.close(transport_out[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
     state.peer_ready = true;
 
     const payload = try encodeMuxProxyEofPayload(std.testing.allocator, 0);
     defer std.testing.allocator.free(payload);
-    try protocol.sendFrame(transport_in[1], .daemon_tunnel, payload);
+    try protocol_test_helpers.sendFrameBlocking(transport_in[1], .daemon_tunnel, payload);
 
-    var attached_client = StreamAttachedClient{
+    var active_client = StreamActiveClient{
         .state = &state,
-        .transport_read_fd = transport_in[0],
-        .transport_write_fd = transport_out[1],
+        .transport_fds = .{
+            .read = transport_in[0],
+            .write = transport_out[1],
+        },
         .transport_reader = protocol.FrameReader.init(std.testing.allocator),
         .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
         .options = .{
@@ -1840,11 +1853,11 @@ test "stream inbound eof can complete without generated outbound eof ack" {
         },
         .liveness = StreamLiveness.init(1_000),
     };
-    defer attached_client.deinit();
+    defer active_client.deinit();
 
-    try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
+    try std.testing.expectEqual(StreamStepOutcome.complete, try active_client.step(1_000));
 
-    try expectAckFrame(transport_out[0], 0);
+    try test_support.expectAckFrame(transport_out[0], 0);
 
     var pollfds = [_]posix.pollfd{.{
         .fd = transport_out[0],
@@ -1866,14 +1879,16 @@ test "stream source eof can reset proxy stream" {
     defer posix.close(transport_out[0]);
     defer posix.close(transport_out[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
     state.peer_ready = true;
 
-    var attached_client = StreamAttachedClient{
+    var active_client = StreamActiveClient{
         .state = &state,
-        .transport_read_fd = transport_in[0],
-        .transport_write_fd = transport_out[1],
+        .transport_fds = .{
+            .read = transport_in[0],
+            .write = transport_out[1],
+        },
         .transport_reader = protocol.FrameReader.init(std.testing.allocator),
         .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
         .options = .{
@@ -1882,10 +1897,10 @@ test "stream source eof can reset proxy stream" {
         },
         .liveness = StreamLiveness.init(1_000),
     };
-    defer attached_client.deinit();
+    defer active_client.deinit();
 
-    try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
-    try expectResetFrame(transport_out[0], "SOURCE_CLOSED");
+    try std.testing.expectEqual(StreamStepOutcome.complete, try active_client.step(1_000));
+    try test_support.expectResetFrame(transport_out[0], "SOURCE_CLOSED");
 }
 
 test "disconnected proxy stream notices source eof before retry" {
@@ -1893,7 +1908,7 @@ test "disconnected proxy stream notices source eof before retry" {
     defer posix.close(source[0]);
     posix.close(source[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
     var input_control = StreamInputControl{ .enabled = false };
 
@@ -1910,136 +1925,79 @@ test "stream reset completes proxy stream" {
     defer posix.close(transport_out[0]);
     defer posix.close(transport_out[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
     state.peer_ready = true;
 
-    try sendReset(&state, transport_in[1], "CLIENT_DISCONNECT", "test reset");
+    try test_frames.sendReset(&state, transport_in[1], .{
+        .code = "CLIENT_DISCONNECT",
+        .message = "test reset",
+    });
 
-    var attached_client = StreamAttachedClient{
+    var active_client = StreamActiveClient{
         .state = &state,
-        .transport_read_fd = transport_in[0],
-        .transport_write_fd = transport_out[1],
+        .transport_fds = .{
+            .read = transport_in[0],
+            .write = transport_out[1],
+        },
         .transport_reader = protocol.FrameReader.init(std.testing.allocator),
         .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
         .options = .{},
         .liveness = StreamLiveness.init(1_000),
     };
-    defer attached_client.deinit();
+    defer active_client.deinit();
 
-    try std.testing.expectEqual(StreamStepOutcome.complete, try attached_client.step(1_000));
+    try std.testing.expectEqual(StreamStepOutcome.complete, try active_client.step(1_000));
 }
 
-test "proxy mux close resets unrecorded remote process startup" {
+test "proxy mux close queues startup reset through dispatcher" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    closeProxyMuxStream(std.testing.allocator, .{
-        .stream_id = 42,
-        .endpoint = .{ .fd = fds[1] },
-        .open = .{},
-        .cleanup_recorded = false,
-    }, true, null);
+    var d = try dispatcher.Dispatcher.init(std.testing.allocator);
+    defer d.deinit();
 
-    try expectResetFrame(fds[0], "STARTUP_FAILED");
+    closeProxyMuxStream(.{
+        .allocator = std.testing.allocator,
+        .stream = .{
+            .stream_id = 42,
+            .endpoint = .{ .fd = fds[1] },
+            .open = .{},
+            .cleanup_recorded = false,
+        },
+        .send_startup_failed = true,
+        .daemon_dispatcher = &d,
+    });
+    try d.run();
+
+    try test_support.expectResetFrame(fds[0], "STARTUP_FAILED");
 }
 
 test "proxy mux close after cleanup record sends no startup reset" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    closeProxyMuxStream(std.testing.allocator, .{
-        .stream_id = 42,
-        .endpoint = .{ .fd = fds[1] },
-        .open = .{},
-        .cleanup_recorded = true,
-    }, true, null);
+    var d = try dispatcher.Dispatcher.init(std.testing.allocator);
+    defer d.deinit();
+
+    closeProxyMuxStream(.{
+        .allocator = std.testing.allocator,
+        .stream = .{
+            .stream_id = 42,
+            .endpoint = .{ .fd = fds[1] },
+            .open = .{},
+            .cleanup_recorded = true,
+        },
+        .send_startup_failed = true,
+        .daemon_dispatcher = &d,
+    });
 
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(isize, 0), c.read(fds[0], &byte, byte.len));
 }
 
-test "stream liveness schedules probes before declaring unresponsive" {
-    var liveness = StreamLiveness.init(1_000);
-    try std.testing.expectEqual(@as(i32, 1_000), liveness.pollTimeoutMs(1_000, -1));
-    try std.testing.expect(liveness.pingDue(2_000));
-    try std.testing.expect(!liveness.timedOut(2_000));
-    liveness.notePingSent(2_000);
-    try std.testing.expectEqual(@as(i32, 1_000), liveness.pollTimeoutMs(2_000, -1));
-    try std.testing.expect(liveness.timedOut(11_000));
-    try std.testing.expectEqual(@as(i32, 50), liveness.pollTimeoutMs(11_000, 50));
-    liveness.noteIncoming(11_000);
-    try std.testing.expect(!liveness.timedOut(11_000));
-    try std.testing.expectEqual(@as(i32, 1_000), liveness.pollTimeoutMs(11_000, -1));
-}
-
-test "stream input control intercepts only reconnect UI controls" {
-    var control = StreamInputControl{
-        .enabled = true,
-        .status_visible = true,
-    };
-    var out: [16]u8 = undefined;
-
-    try std.testing.expectEqualStrings("ab", control.filter("a\x12b", &out));
-    try std.testing.expectEqual(StreamControlAction.reconnect, control.consumeAction());
-
-    try std.testing.expectEqualStrings("\x03", control.filter("\x03", &out));
-    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
-
-    control.status_visible = false;
-    try std.testing.expectEqualStrings("\x12", control.filter("\x12", &out));
-    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
-}
-
-test "stream control-only input never forwards bytes" {
-    var control = StreamInputControl{
-        .enabled = true,
-        .status_visible = true,
-    };
-
-    control.observeControlOnly("a\x12b");
-    try std.testing.expectEqual(StreamControlAction.reconnect, control.consumeAction());
-
-    control.observeControlOnly("abc");
-    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
-
-    control.status_visible = false;
-    control.observeControlOnly("\x12");
-    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
-}
-
-test "stream input control uses ssh disconnect escape for proxy streams" {
-    var control = StreamInputControl{
-        .enabled = true,
-        .escape_enabled = true,
-        .status_visible = true,
-    };
-    var out: [16]u8 = undefined;
-
-    try std.testing.expectEqualStrings("", control.filter("~.", &out));
-    try std.testing.expectEqual(StreamControlAction.disconnect, control.consumeAction());
-
-    try std.testing.expectEqualStrings("~k", control.filter("~k", &out));
-    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
-}
-
-test "stream input control supports ssh help and doubled tilde escapes" {
-    var control = StreamInputControl{
-        .enabled = true,
-        .escape_enabled = true,
-        .status_visible = true,
-    };
-    var out: [16]u8 = undefined;
-
-    try std.testing.expectEqualStrings("", control.filter("~?", &out));
-    try std.testing.expectEqual(StreamControlAction.help, control.consumeAction());
-
-    try std.testing.expectEqualStrings("~hello", control.filter("~~hello", &out));
-    try std.testing.expectEqual(StreamControlAction.none, control.consumeAction());
-}
-
 test "stream completion waits for eof acknowledgement" {
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
     state.outbound.outbound_eof = true;
     state.outbound.outbound_eof_sent = true;
@@ -2048,8 +2006,10 @@ test "stream completion waits for eof acknowledgement" {
     try std.testing.expect(!state.complete());
 
     const payload = try encodeMuxAckPayload(std.testing.allocator, 0);
-    const options = StreamAttachedClientOptions{};
-    try handleFrame(&state, -1, &options, .{
+    const options = StreamActiveClientOptions{};
+    var active_client = try test_support.activeClient(&state, -1, options);
+    defer active_client.deinit();
+    try handleTransportFrame(&active_client, &options, .{
         .message_type = .daemon_tunnel,
         .payload = payload,
     });
@@ -2064,19 +2024,22 @@ test "stream inbound eof can complete outbound when caller closes outbound on in
     defer posix.close(ack[0]);
     defer posix.close(ack[1]);
 
-    var state = StreamState.init(std.testing.allocator, "p-550e8400-e29b-41d4-a716-446655440000", "", 0);
+    var state = test_support.streamState();
     defer state.deinit();
     try state.appendOutbound("unsent local input");
 
     const payload = try encodeMuxProxyEofPayload(std.testing.allocator, 0);
-    const options = StreamAttachedClientOptions{
+    const options = StreamActiveClientOptions{
         .sink = .{ .fd = sink[1] },
         .close_outbound_on_inbound_eof = true,
     };
-    try handleFrame(&state, ack[1], &options, .{
+    var active_client = try test_support.activeClient(&state, ack[1], options);
+    defer active_client.deinit();
+    try handleTransportFrame(&active_client, &options, .{
         .message_type = .daemon_tunnel,
         .payload = payload,
     });
+    try test_support.drainActiveClient(&active_client);
 
     try std.testing.expect(state.complete());
     try std.testing.expectEqual(@as(usize, 0), state.outbound.outbound.items.len);

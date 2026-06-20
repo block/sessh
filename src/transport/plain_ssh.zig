@@ -4,10 +4,12 @@ const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
 const core_fds = @import("../core/fds.zig");
-const dispatcher = @import("../core/dispatcher.zig");
+const fixed_buffer = @import("../core/fixed_buffer.zig");
 const io = @import("../core/io.zig");
 const local_boot_time = @import("../core/local_boot_time.zig");
+const poll_sets = @import("../core/poll_set.zig");
 const process_exit = @import("../core/process_exit.zig");
+const process_wait = @import("../core/waitpid.zig");
 const user_error = @import("../core/user_error.zig");
 const proxy_diagnostics = @import("../stream/proxy_diagnostics_channel.zig");
 const protocol = @import("../protocol/mod.zig");
@@ -19,42 +21,44 @@ const proxy_worker = @import("../stream/proxy_worker.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
 
-// POSIX WNOHANG. Zig exposes this through platform-specific constants, but the
-// numeric value is stable on our supported Unix targets and keeps the C
-// waitpid(2) call auditable here.
-const wait_nohang: c_int = 1;
-const child_wait_poll_ms: u64 = 100;
+const ssh_process_wait_poll_ms: u64 = 100;
 
 const ProxyClientControl = struct {
     const max_title_bytes = 128;
     const max_status_bytes = 192;
     const max_cleanup_title_bytes = 512;
+    const Title = fixed_buffer.FixedBuffer(max_title_bytes);
+    const StatusLine = fixed_buffer.FixedBuffer(max_status_bytes);
+    const CleanupTitle = fixed_buffer.FixedBuffer(max_cleanup_title_bytes);
 
     control_fd: c.fd_t = -1,
     control_reader: proxy_diagnostics.Reader,
     title_tracker: status_output.TerminalTitleTracker = .{},
-    pending_title: [max_title_bytes]u8 = undefined,
-    pending_title_len: usize = 0,
-    status_line: [max_status_bytes]u8 = undefined,
-    status_line_len: usize = 0,
-    cleanup_title: [max_cleanup_title_bytes]u8 = [_]u8{0} ** max_cleanup_title_bytes,
-    cleanup_title_len: usize = 0,
+    pending_title: Title = .{},
+    status_line: StatusLine = .{},
+    cleanup_title: CleanupTitle = .{},
     title_visible: bool = false,
     status_visible: bool = false,
     intercept_requested: bool = false,
     ctrl_r_allowed: bool = false,
     onscreen_status: bool = false,
 
-    fn init(allocator: std.mem.Allocator, ctrl_r_allowed: bool, onscreen_status: bool) ProxyClientControl {
+    const InitOptions = struct {
+        allocator: std.mem.Allocator,
+        ctrl_r_allowed: bool = false,
+        onscreen_status: bool = false,
+    };
+
+    fn init(options: InitOptions) ProxyClientControl {
         var diagnostics = ProxyClientControl{
-            .control_reader = proxy_diagnostics.Reader.init(allocator),
-            .ctrl_r_allowed = ctrl_r_allowed,
-            .onscreen_status = onscreen_status,
+            .control_reader = proxy_diagnostics.Reader.init(options.allocator),
+            .ctrl_r_allowed = options.ctrl_r_allowed,
+            .onscreen_status = options.onscreen_status,
         };
-        const cwd = std.process.getCwdAlloc(allocator) catch null;
+        const cwd = std.process.getCwdAlloc(options.allocator) catch null;
         if (cwd) |title| {
-            defer allocator.free(title);
-            diagnostics.cleanup_title_len = copyBytes(&diagnostics.cleanup_title, title);
+            defer options.allocator.free(title);
+            diagnostics.cleanup_title.setTruncate(title);
         }
         return diagnostics;
     }
@@ -144,7 +148,7 @@ const ProxyClientControl = struct {
 
     fn sendCtrlR(self: *ProxyClientControl) void {
         if (self.control_fd < 0) return;
-        proxy_diagnostics.writeRetryNow(self.control_fd) catch {};
+        proxy_diagnostics.writeRetryNowForeground(self.control_fd) catch {};
     }
 
     fn showUpdate(self: *ProxyClientControl, line: []const u8) void {
@@ -153,7 +157,7 @@ const ProxyClientControl = struct {
     }
 
     fn showStatus(self: *ProxyClientControl, line: []const u8) void {
-        self.status_line_len = copyBytes(&self.status_line, line);
+        self.status_line.setTruncate(line);
         if (!self.onscreen_status) return;
         self.status_visible = true;
         self.redrawStatusLine();
@@ -161,23 +165,23 @@ const ProxyClientControl = struct {
 
     fn showDiagnostic(self: *ProxyClientControl, line: []const u8) void {
         if (!self.onscreen_status) return;
-        if (self.status_visible) io.writeAll(2, "\r\x1b[K") catch {};
-        io.writeAll(2, line) catch {};
-        io.writeAll(2, "\r\n") catch {};
+        if (self.status_visible) io.writeAll(posix.STDERR_FILENO, "\r\x1b[K") catch {};
+        io.writeAll(posix.STDERR_FILENO, line) catch {};
+        io.writeAll(posix.STDERR_FILENO, "\r\n") catch {};
         if (self.status_visible) self.redrawStatusLine();
     }
 
     fn showTitle(self: *ProxyClientControl, title: []const u8) void {
-        self.pending_title_len = copyBytes(&self.pending_title, title);
+        self.pending_title.setTruncate(title);
         self.flushPendingTitle();
     }
 
     fn flushPendingTitle(self: *ProxyClientControl) void {
-        if (self.pending_title_len == 0) return;
+        if (self.pending_title.isEmpty()) return;
         if (!self.title_tracker.safeForLocalTitle()) return;
-        reconnect_title.writeTitle(1, self.pending_title[0..self.pending_title_len]) catch return;
+        reconnect_title.writeTitle(posix.STDOUT_FILENO, self.pending_title.slice()) catch return;
         self.title_visible = true;
-        self.pending_title_len = 0;
+        self.pending_title.clear();
     }
 
     fn clear(self: *ProxyClientControl) void {
@@ -186,9 +190,9 @@ const ProxyClientControl = struct {
     }
 
     fn clearUpdate(self: *ProxyClientControl) void {
-        self.pending_title_len = 0;
+        self.pending_title.clear();
         if (self.onscreen_status and self.status_visible) {
-            io.writeAll(2, "\r\x1b[K") catch {};
+            io.writeAll(posix.STDERR_FILENO, "\r\x1b[K") catch {};
             self.status_visible = false;
         }
         self.restoreTitle();
@@ -199,15 +203,15 @@ const ProxyClientControl = struct {
         const title = if (self.title_tracker.titlePresent())
             self.title_tracker.titleSlice()
         else
-            self.cleanup_title[0..self.cleanup_title_len];
-        reconnect_title.writeTitle(1, title) catch {};
+            self.cleanup_title.slice();
+        reconnect_title.writeTitle(posix.STDOUT_FILENO, title) catch {};
         self.title_visible = false;
     }
 
     fn redrawStatusLine(self: *ProxyClientControl) void {
         if (!self.status_visible) return;
-        io.writeAll(2, "\r\x1b[K") catch {};
-        io.writeAll(2, self.status_line[0..self.status_line_len]) catch {};
+        io.writeAll(posix.STDERR_FILENO, "\r\x1b[K") catch {};
+        io.writeAll(posix.STDERR_FILENO, self.status_line.slice()) catch {};
     }
 };
 
@@ -217,146 +221,114 @@ fn retryDelayFromLocalBootDeadline(deadline_ms: ?u64) u64 {
     return deadline -| now;
 }
 
-fn copyBytes(dest: []u8, source: []const u8) usize {
-    const len = @min(dest.len, source.len);
-    @memcpy(dest[0..len], source[0..len]);
-    return len;
-}
-
-pub fn runArgvWithDiagnostics(
+pub const RunArgvWithDiagnosticsOptions = struct {
     allocator: std.mem.Allocator,
     ssh_args: []const []const u8,
     control_fd: c.fd_t,
     diagnostic_name: []const u8,
-) !noreturn {
+};
+
+pub fn runArgvWithDiagnostics(options: RunArgvWithDiagnosticsOptions) !noreturn {
+    const allocator = options.allocator;
+    const ssh_args = options.ssh_args;
     const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
     @memcpy(ssh_argv[1..], ssh_args);
 
-    var child = std.process.Child.init(ssh_argv, allocator);
-    child.expand_arg0 = .expand;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
+    var ssh_process = std.process.Child.init(ssh_argv, allocator);
+    ssh_process.expand_arg0 = .expand;
+    ssh_process.stdin_behavior = .Inherit;
+    ssh_process.stdout_behavior = .Inherit;
+    ssh_process.stderr_behavior = .Inherit;
+    try ssh_process.spawn();
 
-    var diagnostics = ProxyClientControl.init(allocator, false, true);
-    if (control_fd >= 0) diagnostics.setControlFd(control_fd);
+    var diagnostics = ProxyClientControl.init(.{
+        .allocator = allocator,
+        .onscreen_status = true,
+    });
+    if (options.control_fd >= 0) diagnostics.setControlFd(options.control_fd);
     defer {
         diagnostics.clear();
         diagnostics.deinit();
     }
 
-    const child_pid: c.pid_t = @intCast(child.id);
-    const term = waitForChildAndDiagnostics(child_pid, &diagnostics);
-    return exitAfterTerm(term, diagnostic_name);
+    const ssh_pid: c.pid_t = @intCast(ssh_process.id);
+    const term = waitForSshProcessAndDiagnostics(ssh_pid, &diagnostics);
+    return exitAfterTerm(term, options.diagnostic_name);
 }
 
-fn waitForChildAndDiagnostics(pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
-    var context = ChildDiagnosticsWait.init(pid, diagnostics) catch return .{ .Unknown = 0 };
+fn waitForSshProcessAndDiagnostics(pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
+    var context = SshProcessDiagnosticsWait.init(pid, diagnostics);
     defer context.deinit();
     context.run() catch return .{ .Unknown = 0 };
     return context.term orelse .{ .Unknown = 0 };
 }
 
-const ChildDiagnosticsWait = struct {
-    wait_dispatcher: dispatcher.Dispatcher,
+const PlainSshFdEvent = struct {
+    fd: c.fd_t,
+    readable: bool = false,
+    writable: bool = false,
+    hangup: bool = false,
+    error_event: bool = false,
+    invalid: bool = false,
+};
+
+fn plainSshFdEventFromRevents(fd: c.fd_t, revents: i16) PlainSshFdEvent {
+    return .{
+        .fd = fd,
+        .readable = (revents & posix.POLL.IN) != 0,
+        .writable = (revents & posix.POLL.OUT) != 0,
+        .hangup = (revents & posix.POLL.HUP) != 0,
+        .error_event = (revents & posix.POLL.ERR) != 0,
+        .invalid = (revents & posix.POLL.NVAL) != 0,
+    };
+}
+
+const SshProcessDiagnosticsWait = struct {
     pid: c.pid_t,
     diagnostics: *ProxyClientControl,
-    control_watch_id: ?dispatcher.FdWatchId = null,
-    timer_watch_id: ?dispatcher.TimerWatchId = null,
     term: ?std.process.Child.Term = null,
 
-    fn init(pid: c.pid_t, diagnostics: *ProxyClientControl) !ChildDiagnosticsWait {
+    fn init(pid: c.pid_t, diagnostics: *ProxyClientControl) SshProcessDiagnosticsWait {
         return .{
-            .wait_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
             .pid = pid,
             .diagnostics = diagnostics,
         };
     }
 
-    fn deinit(self: *ChildDiagnosticsWait) void {
-        self.wait_dispatcher.deinit();
-    }
+    fn deinit(_: *SshProcessDiagnosticsWait) void {}
 
-    fn run(self: *ChildDiagnosticsWait) !void {
-        if (checkChildExit(self.pid)) |term| {
-            self.term = term;
-            return;
+    fn run(self: *SshProcessDiagnosticsWait) !void {
+        // PROCESS_EVENT_LOOP: foreground plain-ssh fallback wait. The loop owns
+        // only the ssh process status timer and optional diagnostics fd; it
+        // does not run inside sesshd or a pooled transport.
+        while (true) {
+            if (checkSshProcessExit(self.pid)) |term| {
+                self.term = term;
+                return;
+            }
+            var pollfds = [_]posix.pollfd{.{
+                .fd = self.diagnostics.control_fd,
+                .events = if (self.diagnostics.control_fd >= 0) posix.POLL.IN else 0,
+                .revents = 0,
+            }};
+            _ = try posix.poll(pollfds[0..], ssh_process_wait_poll_ms);
+            if (pollfds[0].revents != 0) {
+                const event = plainSshFdEventFromRevents(pollfds[0].fd, pollfds[0].revents);
+                if (event.readable or event.hangup or event.error_event or event.invalid) {
+                    self.diagnostics.readControl();
+                }
+            }
         }
-        if (self.diagnostics.control_fd >= 0) {
-            self.control_watch_id = try self.wait_dispatcher.watchFd(self.diagnostics.control_fd, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleChildDiagnosticsWaitEvent,
-            });
-        }
-        try self.armTimer();
-        try self.wait_dispatcher.run();
-    }
-
-    fn armTimer(self: *ChildDiagnosticsWait) !void {
-        self.timer_watch_id = try self.wait_dispatcher.watchTimerAfter(child_wait_poll_ms, .{
-            .ctx = self,
-            .callback = handleChildDiagnosticsWaitEvent,
-        });
     }
 };
 
-fn handleChildDiagnosticsWaitEvent(
-    ctx: *anyopaque,
-    d: *dispatcher.Dispatcher,
-    id: dispatcher.WatchId,
-    event: dispatcher.Event,
-) !void {
-    const wait: *ChildDiagnosticsWait = @ptrCast(@alignCast(ctx));
-    switch (event) {
-        .fd => |fd_event| {
-            if (!plainSshFdWatchMatches(id, wait.control_watch_id)) return;
-            if (fd_event.readable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-                wait.diagnostics.readControl();
-                if (wait.diagnostics.control_fd < 0) {
-                    if (wait.control_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-                    wait.control_watch_id = null;
-                }
-            }
-        },
-        .timer => {
-            if (!plainSshTimerWatchMatches(id, wait.timer_watch_id)) return;
-            wait.timer_watch_id = null;
-            if (checkChildExit(wait.pid)) |term| {
-                wait.term = term;
-                wait.wait_dispatcher.stop();
-            } else {
-                try wait.armTimer();
-            }
-        },
-    }
-}
-
-fn plainSshFdWatchMatches(id: dispatcher.WatchId, expected: ?dispatcher.FdWatchId) bool {
-    const expected_id = expected orelse return false;
-    const fd_id = switch (id) {
-        .fd => |fd| fd,
-        .timer => return false,
-    };
-    return fd_id.index == expected_id.index and fd_id.generation == expected_id.generation;
-}
-
-fn plainSshTimerWatchMatches(id: dispatcher.WatchId, expected: ?dispatcher.TimerWatchId) bool {
-    const expected_id = expected orelse return false;
-    const timer_id = switch (id) {
-        .timer => |timer| timer,
-        .fd => return false,
-    };
-    return timer_id.index == expected_id.index and timer_id.generation == expected_id.generation;
-}
-
-fn checkChildExit(pid: c.pid_t) ?std.process.Child.Term {
+fn checkSshProcessExit(pid: c.pid_t) ?std.process.Child.Term {
     while (true) {
         var status: c_int = 0;
-        const result = c.waitpid(pid, &status, wait_nohang);
-        if (result == pid) return pty_process.waitStatusToTerm(@bitCast(status));
+        const result = c.waitpid(pid, &status, process_wait.nohang);
+        if (result == pid) return process_wait.termFromStatus(@bitCast(status));
         if (result == 0) return null;
         if (result < 0) switch (posix.errno(result)) {
             .INTR => continue,
@@ -365,73 +337,93 @@ fn checkChildExit(pid: c.pid_t) ?std.process.Child.Term {
     }
 }
 
-pub fn runArgvUnderLocalPty(
+pub const LocalPtyArgvOptions = struct {
     allocator: std.mem.Allocator,
     ssh_args: []const []const u8,
     control_fd: c.fd_t,
     client_ctrl_r: bool,
     diagnostic_name: []const u8,
-) !noreturn {
+};
+
+// Run ssh under a local PTY when sessh needs to preserve tty-shaped ssh
+// behavior while still filtering diagnostics. This process owns the visible
+// terminal, so it can block in its foreground relay loop without starving any
+// daemon-owned work.
+pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
+    const allocator = options.allocator;
+    const ssh_args = options.ssh_args;
     const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
     @memcpy(ssh_argv[1..], ssh_args);
 
     var size = terminal.currentWindowSize();
-    var captured_tty_settings: ?tty_settings.Settings = try tty_settings.capture(allocator, posix.STDIN_FILENO, .{});
+    var captured_tty_settings: ?tty_settings.Settings = try tty_settings.capture(allocator, posix.STDIN_FILENO, .include);
     defer if (captured_tty_settings) |*settings| settings.deinit(allocator);
 
-    var child = try pty_process.spawn(allocator, .{
-        .rows = size.rows,
-        .cols = size.cols,
+    var local_pty = try pty_process.spawn(allocator, .{
+        .size = size,
         .command_argv = ssh_argv,
         .tty_settings = if (captured_tty_settings) |settings| settings else null,
     });
-    defer child.terminate();
+    defer local_pty.terminate();
 
     var mode_guard = try terminal.TerminalModeGuard.enable(posix.STDIN_FILENO);
     defer mode_guard.restore();
 
     var stdin_flags_guard = try core_fds.StatusFlagsGuard.setNonBlocking(posix.STDIN_FILENO);
     defer stdin_flags_guard.restore();
-    core_fds.setNonBlocking(child.master_fd) catch {};
+    var presentation_state = LocalPtyPresentationState{
+        .mode_guard = &mode_guard,
+        .stdin_flags_guard = &stdin_flags_guard,
+    };
+    core_fds.setNonBlocking(local_pty.master_fd) catch {};
 
-    var diagnostics = ProxyClientControl.init(allocator, client_ctrl_r, false);
-    if (control_fd >= 0) diagnostics.setControlFd(control_fd);
+    var diagnostics = ProxyClientControl.init(.{
+        .allocator = allocator,
+        .ctrl_r_allowed = options.client_ctrl_r,
+    });
+    if (options.control_fd >= 0) diagnostics.setControlFd(options.control_fd);
     defer {
         diagnostics.clear();
         diagnostics.deinit();
     }
 
+    // PROCESS_EVENT_LOOP: this foreground process is only relaying the local
+    // PTY, user input, and diagnostics for one visible ssh invocation.
     while (true) {
-        refreshLocalPtySize(child.master_fd, &size);
-        var poll = LocalPtyRelayPoll.init(child.master_fd, diagnostics.control_fd) catch continue;
+        refreshLocalPtySize(local_pty.master_fd, &size);
+        var poll = LocalPtyRelayPoll.init(local_pty.master_fd, diagnostics.control_fd);
         defer poll.deinit();
         poll.run() catch continue;
-        refreshLocalPtySize(child.master_fd, &size);
+        refreshLocalPtySize(local_pty.master_fd, &size);
 
         if (if (poll.pty_event) |event| event.readable else false) {
             var buf: [8192]u8 = undefined;
-            switch (try pty_process.readMaster(child.master_fd, &buf)) {
+            switch (try pty_process.readMaster(local_pty.master_fd, &buf)) {
                 .bytes => |bytes| {
                     diagnostics.observeOutput(bytes);
                     try io.writeAll(posix.STDOUT_FILENO, bytes);
                 },
                 .would_block => {},
                 .eof => {
-                    const term = child.wait();
-                    child.closeMaster();
+                    // BLOCKING_WAIT: foreground local-PTY relay exit. The PTY
+                    // has closed and this process is only collecting ssh status.
+                    const term = local_pty.wait();
+                    local_pty.closeMaster();
                     diagnostics.clear();
-                    return exitAfterLocalPtyTerm(term, diagnostic_name, &mode_guard, &stdin_flags_guard);
+                    return exitAfterLocalPtyTerm(term, options.diagnostic_name, &presentation_state);
                 },
             }
         }
         if (poll.pty_event) |event| {
             if ((event.hangup or event.error_event or event.invalid) and !event.readable) {
-                const term = child.wait();
-                child.closeMaster();
+                // BLOCKING_WAIT: foreground local-PTY relay exit. The PTY has
+                // closed and this process is only collecting ssh status.
+                const term = local_pty.wait();
+                local_pty.closeMaster();
                 diagnostics.clear();
-                return exitAfterLocalPtyTerm(term, diagnostic_name, &mode_guard, &stdin_flags_guard);
+                return exitAfterLocalPtyTerm(term, options.diagnostic_name, &presentation_state);
             }
         }
 
@@ -440,7 +432,7 @@ pub fn runArgvUnderLocalPty(
             const n = c.read(posix.STDIN_FILENO, &input, input.len);
             if (n > 0) {
                 const bytes = input[0..@intCast(n)];
-                try writePtyInput(child.master_fd, bytes, &diagnostics);
+                try writePtyInput(local_pty.master_fd, bytes, &diagnostics);
             }
         }
 
@@ -451,88 +443,74 @@ pub fn runArgvUnderLocalPty(
 }
 
 const LocalPtyRelayPoll = struct {
-    relay_dispatcher: dispatcher.Dispatcher,
     pty_fd: c.fd_t,
     control_fd: c.fd_t,
-    pty_watch_id: ?dispatcher.FdWatchId = null,
-    stdin_watch_id: ?dispatcher.FdWatchId = null,
-    control_watch_id: ?dispatcher.FdWatchId = null,
-    pty_event: ?dispatcher.FdEvent = null,
-    stdin_event: ?dispatcher.FdEvent = null,
-    control_event: ?dispatcher.FdEvent = null,
+    pty_event: ?PlainSshFdEvent = null,
+    stdin_event: ?PlainSshFdEvent = null,
+    control_event: ?PlainSshFdEvent = null,
 
-    fn init(pty_fd: c.fd_t, control_fd: c.fd_t) !LocalPtyRelayPoll {
+    fn init(pty_fd: c.fd_t, control_fd: c.fd_t) LocalPtyRelayPoll {
         return .{
-            .relay_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator()),
             .pty_fd = pty_fd,
             .control_fd = control_fd,
         };
     }
 
-    fn deinit(self: *LocalPtyRelayPoll) void {
-        self.relay_dispatcher.deinit();
-    }
+    fn deinit(_: *LocalPtyRelayPoll) void {}
 
     fn run(self: *LocalPtyRelayPoll) !void {
-        self.pty_watch_id = try self.relay_dispatcher.watchFd(self.pty_fd, .{ .readable = true }, .{
-            .ctx = self,
-            .callback = handleLocalPtyRelayPollEvent,
-        });
-        self.stdin_watch_id = try self.relay_dispatcher.watchFd(posix.STDIN_FILENO, .{ .readable = true }, .{
-            .ctx = self,
-            .callback = handleLocalPtyRelayPollEvent,
-        });
+        // PROCESS_EVENT_LOOP: foreground local-PTY relay; no daemon work is
+        // serviced by this process while this loop is running.
+        var poll_set = LocalPtyRelayPollSet{};
+        poll_set.add(self.pty_fd, posix.POLL.IN, .pty);
+        poll_set.add(posix.STDIN_FILENO, posix.POLL.IN, .stdin);
         if (self.control_fd >= 0) {
-            self.control_watch_id = try self.relay_dispatcher.watchFd(self.control_fd, .{ .readable = true }, .{
-                .ctx = self,
-                .callback = handleLocalPtyRelayPollEvent,
-            });
+            poll_set.add(self.control_fd, posix.POLL.IN, .control);
         }
-        try self.relay_dispatcher.run();
-    }
-
-    fn noteFdEvent(self: *LocalPtyRelayPoll, id: dispatcher.WatchId, event: dispatcher.FdEvent) void {
-        if (plainSshFdWatchMatches(id, self.pty_watch_id)) {
-            self.pty_event = event;
-        } else if (plainSshFdWatchMatches(id, self.stdin_watch_id)) {
-            self.stdin_event = event;
-        } else if (plainSshFdWatchMatches(id, self.control_watch_id)) {
-            self.control_event = event;
+        _ = try posix.poll(poll_set.fdSlice(), -1);
+        for (poll_set.fdSlice(), poll_set.kindSlice()) |pollfd, kind| {
+            if (pollfd.revents == 0) continue;
+            const event = plainSshFdEventFromRevents(pollfd.fd, pollfd.revents);
+            switch (kind) {
+                .pty => self.pty_event = event,
+                .stdin => self.stdin_event = event,
+                .control => self.control_event = event,
+            }
         }
     }
 };
 
-fn handleLocalPtyRelayPollEvent(
-    ctx: *anyopaque,
-    _: *dispatcher.Dispatcher,
-    id: dispatcher.WatchId,
-    event: dispatcher.Event,
-) !void {
-    const poll: *LocalPtyRelayPoll = @ptrCast(@alignCast(ctx));
-    switch (event) {
-        .fd => |fd_event| {
-            poll.noteFdEvent(id, fd_event);
-            poll.relay_dispatcher.stop();
-        },
-        .timer => {},
+const LocalPtyRelayPollKind = enum {
+    pty,
+    stdin,
+    control,
+};
+
+const LocalPtyRelayPollSet = poll_sets.PollSet(LocalPtyRelayPollKind, 3);
+
+const LocalPtyPresentationState = struct {
+    mode_guard: *terminal.TerminalModeGuard,
+    stdin_flags_guard: *core_fds.StatusFlagsGuard,
+
+    fn restore(self: LocalPtyPresentationState) void {
+        self.stdin_flags_guard.restore();
+        self.mode_guard.restore();
     }
-}
+};
 
 fn exitAfterLocalPtyTerm(
     term: std.process.Child.Term,
     diagnostic_name: []const u8,
-    mode_guard: *terminal.TerminalModeGuard,
-    stdin_flags_guard: *core_fds.StatusFlagsGuard,
+    presentation_state: *LocalPtyPresentationState,
 ) !noreturn {
-    stdin_flags_guard.restore();
-    mode_guard.restore();
+    presentation_state.restore();
     return exitAfterTerm(term, diagnostic_name);
 }
 
 fn refreshLocalPtySize(pty_fd: c.fd_t, size: *terminal.WindowSize) void {
     const current_size = terminal.currentWindowSize();
-    if (current_size.rows == size.rows and current_size.cols == size.cols) return;
-    _ = terminal.setPtySize(pty_fd, current_size.rows, current_size.cols);
+    if (current_size.eql(size.*)) return;
+    _ = terminal.setPtySize(pty_fd, current_size);
     size.* = current_size;
 }
 
@@ -571,13 +549,16 @@ pub fn runArgv(allocator: std.mem.Allocator, ssh_args: []const []const u8, diagn
     ssh_argv[0] = "ssh";
     @memcpy(ssh_argv[1..], ssh_args);
 
-    var child = std.process.Child.init(ssh_argv, allocator);
-    child.expand_arg0 = .expand;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
+    var ssh_process = std.process.Child.init(ssh_argv, allocator);
+    ssh_process.expand_arg0 = .expand;
+    ssh_process.stdin_behavior = .Inherit;
+    ssh_process.stdout_behavior = .Inherit;
+    ssh_process.stderr_behavior = .Inherit;
+    try ssh_process.spawn();
 
-    const term = try child.wait();
+    // BLOCKING_WAIT: foreground plain-ssh path. At this point the spawned
+    // `ssh` process owns the user-visible session and there is no sessh daemon
+    // workload in this process to keep responsive.
+    const term = try ssh_process.wait();
     return exitAfterTerm(term, diagnostic_name);
 }

@@ -14,8 +14,16 @@ pub fn delayMs(attempt: usize) u64 {
     return if (attempt < delays_ms.len) delays_ms[attempt] else delays_ms[delays_ms.len - 1];
 }
 
-pub fn nextAttempt(attempt: usize, reset: bool) usize {
-    return if (reset) 0 else attempt + 1;
+pub const NextAttemptAction = enum {
+    increment,
+    reset,
+};
+
+pub fn nextAttempt(attempt: usize, action: NextAttemptAction) usize {
+    return switch (action) {
+        .increment => attempt + 1,
+        .reset => 0,
+    };
 }
 
 test "delayMs follows the documented backoff schedule" {
@@ -30,6 +38,6 @@ test "delayMs follows the documented backoff schedule" {
 }
 
 test "nextAttempt can reset after explicit reconnect acknowledgement" {
-    try std.testing.expectEqual(@as(usize, 0), nextAttempt(4, true));
-    try std.testing.expectEqual(@as(usize, 5), nextAttempt(4, false));
+    try std.testing.expectEqual(@as(usize, 0), nextAttempt(4, .reset));
+    try std.testing.expectEqual(@as(usize, 5), nextAttempt(4, .increment));
 }

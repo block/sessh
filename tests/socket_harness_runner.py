@@ -169,7 +169,7 @@ def main():
             run_default_colors_protocol_test(env)
             run_seeded_default_color_query_protocol_test(env)
             run_complex_ui_query_protocol_test(env)
-            run_scrollback_attach_draw_protocol_test(env)
+            run_scrollback_open_draw_protocol_test(env)
             run_scrollback_clear_protocol_test(env)
             run_reconnect_scrollback_gap_protocol_test(env)
             run_resize_epoch_does_not_clear_reconnect_scrollback_test(env)

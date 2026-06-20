@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 
+const fixed_buffer = @import("fixed_buffer.zig");
 const io = @import("io.zig");
 
 const max_entries = 256;
@@ -8,6 +10,7 @@ const max_entry_bytes = 1024;
 const max_user_diagnostics = 256;
 pub const max_user_diagnostic_display_bytes = max_entry_bytes + 96;
 const truncated_suffix = "... [truncated]";
+const LogMessage = fixed_buffer.FixedBuffer(max_entry_bytes);
 
 pub const Level = enum(u8) {
     verbose = 10,
@@ -21,8 +24,7 @@ pub const Level = enum(u8) {
 const Entry = struct {
     ts_ms: u64,
     level: Level,
-    bytes: [max_entry_bytes]u8,
-    len: usize,
+    message: LogMessage,
     flushed: bool,
 };
 
@@ -43,8 +45,7 @@ const UserDiagnostic = struct {
     ts_ms: u64,
     level: Level,
     tag: DiagnosticTag,
-    bytes: [max_entry_bytes]u8,
-    len: usize,
+    message: LogMessage,
 };
 
 pub const UserDiagnosticLine = struct {
@@ -52,14 +53,17 @@ pub const UserDiagnosticLine = struct {
     ts_ms: u64 = 0,
     level: Level = .warn,
     tag: DiagnosticTag = .sessh,
-    bytes: [max_entry_bytes]u8 = undefined,
-    len: usize = 0,
+    message: LogMessage = .{},
 
     pub fn slice(self: *const UserDiagnosticLine) []const u8 {
-        return self.bytes[0..self.len];
+        return self.message.slice();
     }
 };
 
+// PROCESS_GLOBAL_REGISTRY: diagnostics are produced by transport, reconnect,
+// and visible-client code in the same single-threaded process. This module is
+// their rendezvous point, so callers do not thread a log object through every
+// protocol/UI callback.
 var configured_level: Level = .warn;
 var entries: [max_entries]Entry = undefined;
 var next_entry: usize = 0;
@@ -85,35 +89,8 @@ pub fn parseLevel(value: []const u8) !Level {
     return error.InvalidClientLogLevel;
 }
 
-pub fn levelName(level: Level) []const u8 {
-    return switch (level) {
-        .verbose => "verbose",
-        .debug => "debug",
-        .info => "info",
-        .warn => "warn",
-        .err => "error",
-        .quiet => "quiet",
-    };
-}
-
-pub fn err(comptime fmt: []const u8, args: anytype) void {
-    append(.err, fmt, args);
-}
-
-pub fn warn(comptime fmt: []const u8, args: anytype) void {
-    append(.warn, fmt, args);
-}
-
-pub fn info(comptime fmt: []const u8, args: anytype) void {
-    append(.info, fmt, args);
-}
-
 pub fn debug(comptime fmt: []const u8, args: anytype) void {
     append(.debug, fmt, args);
-}
-
-pub fn verbose(comptime fmt: []const u8, args: anytype) void {
-    append(.verbose, fmt, args);
 }
 
 fn append(level: Level, comptime fmt: []const u8, args: anytype) void {
@@ -121,28 +98,23 @@ fn append(level: Level, comptime fmt: []const u8, args: anytype) void {
     var body_buf: [max_entry_bytes]u8 = undefined;
     const body = std.fmt.bufPrint(&body_buf, fmt, args) catch return;
 
-    appendMessageLocked(level, body);
+    appendMessage(level, body);
 }
 
 pub fn appendSshStderr(bytes: []const u8) void {
-
     var line_start: usize = 0;
     while (line_start < bytes.len) {
         const line_end = std.mem.indexOfScalarPos(u8, bytes, line_start, '\n') orelse bytes.len;
         var line = bytes[line_start..line_end];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        appendUserDiagnosticLocked(.warn, .ssh, line);
+        appendUserDiagnostic(.warn, .ssh, line);
         line_start = if (line_end < bytes.len) line_end + 1 else line_end;
     }
 }
 
 pub fn flush(fd: c.fd_t) void {
-    flushUserDiagnosticsLocked(fd, true) catch {};
-    flushLocked(fd) catch {};
-}
-
-pub fn userDiagnostic(comptime fmt: []const u8, args: anytype) void {
-    userDiagnosticLevel(.warn, fmt, args);
+    flushUserDiagnostics(fd) catch {};
+    flushEntries(fd) catch {};
 }
 
 pub fn userDiagnosticInfo(comptime fmt: []const u8, args: anytype) void {
@@ -153,7 +125,7 @@ fn userDiagnosticLevel(level: Level, comptime fmt: []const u8, args: anytype) vo
     var body_buf: [max_entry_bytes]u8 = undefined;
     const body = std.fmt.bufPrint(&body_buf, fmt, args) catch return;
 
-    appendUserDiagnosticLocked(level, .sessh, body);
+    appendUserDiagnostic(level, .sessh, body);
 }
 
 pub fn currentUserDiagnosticSeq() u64 {
@@ -169,7 +141,6 @@ pub fn markUserDiagnosticsDisplayedThrough(seq: u64) void {
 }
 
 pub fn copyUserDiagnosticsSince(since_seq: u64, out: []UserDiagnosticLine) u64 {
-
     var count: usize = 0;
     const oldest = oldestDiagnosticIndex();
     var offset: usize = 0;
@@ -188,22 +159,21 @@ pub fn copyUserDiagnosticsSince(since_seq: u64, out: []UserDiagnosticLine) u64 {
         out[count].ts_ms = diagnostic.ts_ms;
         out[count].level = diagnostic.level;
         out[count].tag = diagnostic.tag;
-        @memcpy(out[count].bytes[0..diagnostic.len], diagnostic.bytes[0..diagnostic.len]);
-        out[count].len = diagnostic.len;
+        out[count].message = diagnostic.message;
         count += 1;
     }
     return next_diagnostic_seq;
 }
 
-pub fn registerUserDiagnosticNotifier(fd: c.fd_t) void {
+pub fn registerNonBlockingUserDiagnosticNotifier(fd: c.fd_t) void {
     diagnostic_notify_fd = fd;
 }
 
-pub fn unregisterUserDiagnosticNotifier(fd: c.fd_t) void {
+pub fn unregisterNonBlockingUserDiagnosticNotifier(fd: c.fd_t) void {
     if (diagnostic_notify_fd == fd) diagnostic_notify_fd = -1;
 }
 
-fn appendUserDiagnosticLocked(level: Level, tag: DiagnosticTag, message: []const u8) void {
+fn appendUserDiagnostic(level: Level, tag: DiagnosticTag, message: []const u8) void {
     next_diagnostic_seq +%= 1;
     if (next_diagnostic_seq == 0) next_diagnostic_seq = 1;
 
@@ -212,35 +182,56 @@ fn appendUserDiagnosticLocked(level: Level, tag: DiagnosticTag, message: []const
     diagnostics[idx].ts_ms = nowUnixMs();
     diagnostics[idx].level = level;
     diagnostics[idx].tag = tag;
-    diagnostics[idx].len = copySanitizedMessage(&diagnostics[idx].bytes, message);
+    setSanitizedMessage(&diagnostics[idx].message, message);
 
     next_diagnostic = (next_diagnostic + 1) % max_user_diagnostics;
     if (diagnostic_count < max_user_diagnostics) diagnostic_count += 1;
-    notifyUserDiagnosticLocked();
+    notifyUserDiagnostic();
 }
 
-fn notifyUserDiagnosticLocked() void {
+fn notifyUserDiagnostic() void {
     const fd = diagnostic_notify_fd;
     if (fd < 0) return;
+    // The notifier is only a wakeup edge for the visible-client event loop; the
+    // ring buffer above is the durable state. The fd is registered as
+    // nonblocking, so a full pipe can drop this byte without losing diagnostics.
     var byte = [_]u8{1};
     const n = c.write(fd, &byte, byte.len);
     if (n <= 0) return;
 }
 
-fn copySanitizedMessage(out: *[max_entry_bytes]u8, message: []const u8) usize {
-    const max_plain_bytes = if (message.len > max_entry_bytes and max_entry_bytes > truncated_suffix.len)
-        max_entry_bytes - truncated_suffix.len
+fn truncatedPlainByteLimit(capacity: usize, source_len: usize) usize {
+    return if (source_len > capacity and capacity > truncated_suffix.len)
+        capacity - truncated_suffix.len
     else
-        max_entry_bytes;
+        capacity;
+}
+
+fn appendTruncatedSuffix(out: *LogMessage) void {
+    const storage = out.storageSlice();
+    if (out.len + truncated_suffix.len > storage.len) return;
+    @memcpy(storage[out.len .. out.len + truncated_suffix.len], truncated_suffix);
+    out.assumeLen(out.len + truncated_suffix.len);
+}
+
+fn setSanitizedMessage(out: *LogMessage, message: []const u8) void {
+    const storage = out.storageSlice();
+    const max_plain_bytes = truncatedPlainByteLimit(storage.len, message.len);
     var len: usize = 0;
     while (len < max_plain_bytes and len < message.len) : (len += 1) {
-        out[len] = printableLogByte(message[len]);
+        storage[len] = printableLogByte(message[len]);
     }
-    if (message.len > len and len + truncated_suffix.len <= max_entry_bytes) {
-        @memcpy(out[len .. len + truncated_suffix.len], truncated_suffix);
-        len += truncated_suffix.len;
-    }
-    return len;
+    out.assumeLen(len);
+    if (message.len > len) appendTruncatedSuffix(out);
+}
+
+fn setLogMessage(out: *LogMessage, message: []const u8) void {
+    const storage = out.storageSlice();
+    const max_plain_bytes = truncatedPlainByteLimit(storage.len, message.len);
+    const copy_len = @min(message.len, max_plain_bytes);
+    @memcpy(storage[0..copy_len], message[0..copy_len]);
+    out.assumeLen(copy_len);
+    if (message.len > copy_len) appendTruncatedSuffix(out);
 }
 
 fn printableLogByte(byte: u8) u8 {
@@ -250,34 +241,19 @@ fn printableLogByte(byte: u8) u8 {
     };
 }
 
-fn appendMessageLocked(level: Level, message: []const u8) void {
-    appendMessageLockedWithFlushed(level, message, false);
-}
-
-fn appendMessageLockedWithFlushed(level: Level, message: []const u8, flushed: bool) void {
+fn appendMessage(level: Level, message: []const u8) void {
     std.debug.assert(level != .quiet);
     const idx = next_entry;
     entries[idx].ts_ms = nowUnixMs();
     entries[idx].level = level;
-    entries[idx].flushed = flushed;
-
-    const max_plain_bytes = if (message.len > max_entry_bytes and max_entry_bytes > truncated_suffix.len)
-        max_entry_bytes - truncated_suffix.len
-    else
-        max_entry_bytes;
-    const copy_len = @min(message.len, max_plain_bytes);
-    @memcpy(entries[idx].bytes[0..copy_len], message[0..copy_len]);
-    entries[idx].len = copy_len;
-    if (message.len > copy_len and entries[idx].len + truncated_suffix.len <= max_entry_bytes) {
-        @memcpy(entries[idx].bytes[entries[idx].len .. entries[idx].len + truncated_suffix.len], truncated_suffix);
-        entries[idx].len += truncated_suffix.len;
-    }
+    entries[idx].flushed = false;
+    setLogMessage(&entries[idx].message, message);
 
     next_entry = (next_entry + 1) % max_entries;
     if (entry_count < max_entries) entry_count += 1;
 }
 
-fn flushLocked(fd: c.fd_t) !void {
+fn flushEntries(fd: c.fd_t) !void {
     const oldest = oldestEntryIndex();
     var offset: usize = 0;
     while (offset < entry_count) : (offset += 1) {
@@ -302,7 +278,7 @@ fn shouldDisplay(level: Level) bool {
     return @intFromEnum(level) >= @intFromEnum(configured_level);
 }
 
-fn flushUserDiagnosticsLocked(fd: c.fd_t, delayed: bool) !void {
+fn flushUserDiagnostics(fd: c.fd_t) !void {
     const oldest = oldestDiagnosticIndex();
     var offset: usize = 0;
     var displayed = displayed_diagnostic_seq;
@@ -310,20 +286,19 @@ fn flushUserDiagnosticsLocked(fd: c.fd_t, delayed: bool) !void {
         const idx = (oldest + offset) % max_user_diagnostics;
         const diagnostic = &diagnostics[idx];
         if (diagnostic.seq <= displayed_diagnostic_seq) continue;
-        if (shouldDisplay(diagnostic.level)) try writeUserDiagnostic(fd, diagnostic, delayed);
+        if (shouldDisplay(diagnostic.level)) {
+            try writeDelayedUserDiagnostic(fd, diagnostic);
+        }
         displayed = @max(displayed, diagnostic.seq);
     }
     displayed_diagnostic_seq = displayed;
 }
 
-fn writeUserDiagnostic(fd: c.fd_t, diagnostic: *const UserDiagnostic, delayed: bool) !void {
+fn writeDelayedUserDiagnostic(fd: c.fd_t, diagnostic: *const UserDiagnostic) !void {
     var prefix_buf: [96]u8 = undefined;
-    const prefix = if (delayed)
-        try std.fmt.bufPrint(&prefix_buf, "{s} ts_ms={}: ", .{ diagnostic.tag.label(), diagnostic.ts_ms })
-    else
-        try std.fmt.bufPrint(&prefix_buf, "{s}: ", .{diagnostic.tag.label()});
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "{s} ts_ms={}: ", .{ diagnostic.tag.label(), diagnostic.ts_ms });
     try io.writeAll(fd, prefix);
-    try io.writeAll(fd, diagnostic.bytes[0..diagnostic.len]);
+    try io.writeAll(fd, diagnostic.message.slice());
     try io.writeAll(fd, "\r\n");
 }
 
@@ -335,7 +310,7 @@ fn writeEntry(fd: c.fd_t, entry: *const Entry) !void {
         .{entry.ts_ms},
     );
     try io.writeAll(fd, prefix);
-    try io.writeAll(fd, entry.bytes[0..entry.len]);
+    try io.writeAll(fd, entry.message.slice());
     try io.writeAll(fd, "\r\n");
 }
 
@@ -362,19 +337,34 @@ test "level ordering follows conventional severity order" {
     try std.testing.expect(@intFromEnum(Level.warn) < @intFromEnum(Level.err));
 }
 
-fn resetForTest() void {
-    configured_level = .warn;
-    next_entry = 0;
-    entry_count = 0;
-    next_diagnostic = 0;
-    diagnostic_count = 0;
-    next_diagnostic_seq = 0;
-    displayed_diagnostic_seq = 0;
-    diagnostic_notify_fd = -1;
+test "log message helpers truncate with suffix and sanitize diagnostics" {
+    var oversized = [_]u8{'x'} ** (max_entry_bytes + 1);
+
+    var log_message = LogMessage{};
+    setLogMessage(&log_message, oversized[0..]);
+    try std.testing.expectEqual(@as(usize, max_entry_bytes), log_message.slice().len);
+    try std.testing.expect(std.mem.endsWith(u8, log_message.slice(), truncated_suffix));
+
+    var diagnostic_message = LogMessage{};
+    setSanitizedMessage(&diagnostic_message, "\x1b[31m");
+    try std.testing.expectEqualStrings("?[31m", diagnostic_message.slice());
 }
 
+const testing = if (builtin.is_test) struct {
+    fn reset() void {
+        configured_level = .warn;
+        next_entry = 0;
+        entry_count = 0;
+        next_diagnostic = 0;
+        diagnostic_count = 0;
+        next_diagnostic_seq = 0;
+        displayed_diagnostic_seq = 0;
+        diagnostic_notify_fd = -1;
+    }
+} else struct {};
+
 test "user diagnostics are sanitized and limited" {
-    resetForTest();
+    testing.reset();
     appendSshStderr("one\nbad\x1b[31m\nthree\nfour");
 
     var lines: [3]UserDiagnosticLine = undefined;
@@ -388,7 +378,7 @@ test "user diagnostics are sanitized and limited" {
 }
 
 test "info user diagnostics are hidden by default" {
-    resetForTest();
+    testing.reset();
     userDiagnosticInfo("hidden reconnect failure", .{});
 
     var hidden_lines = [_]UserDiagnosticLine{.{}} ** 1;
@@ -396,7 +386,7 @@ test "info user diagnostics are hidden by default" {
     try std.testing.expectEqual(@as(u64, 1), hidden_seq);
     try std.testing.expectEqual(@as(u64, 0), hidden_lines[0].seq);
 
-    resetForTest();
+    testing.reset();
     setLevel(.info);
     userDiagnosticInfo("visible reconnect failure", .{});
 

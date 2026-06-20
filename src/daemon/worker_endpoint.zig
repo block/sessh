@@ -36,6 +36,24 @@ pub const Endpoint = struct {
         }
     }
 
+    pub fn takeFd(self: *Endpoint, daemon_dispatcher: ?*dispatcher.Dispatcher) c.fd_t {
+        if (daemon_dispatcher) |d| {
+            if (self.watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
+        }
+        self.watch_id = null;
+        if (self.reader_initialized) {
+            self.reader.deinit();
+            self.reader_initialized = false;
+        }
+        if (self.writer_initialized) {
+            self.writer.deinit();
+            self.writer_initialized = false;
+        }
+        const fd = self.fd;
+        self.fd = -1;
+        return fd;
+    }
+
     pub fn initWriter(self: *Endpoint, allocator: std.mem.Allocator) void {
         self.writer = frame_write_queue.FrameWriteQueue.init(allocator);
         self.writer_initialized = true;
@@ -63,9 +81,13 @@ pub const Endpoint = struct {
         daemon_dispatcher: *dispatcher.Dispatcher,
         handler: dispatcher.Handler,
     ) !void {
-        self.watch_id = try daemon_dispatcher.watchFd(self.fd, self.watchEvents(), .{
-            .ctx = handler.ctx,
-            .callback = handler.callback,
+        self.watch_id = try daemon_dispatcher.watchFd(.{
+            .fd = self.fd,
+            .events = self.watchEvents(),
+            .handler = .{
+                .ctx = handler.ctx,
+                .callback = handler.callback,
+            },
         });
     }
 

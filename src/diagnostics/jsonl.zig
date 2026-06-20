@@ -40,13 +40,13 @@ pub const Event = enum {
     }
 };
 
-pub fn writeEvent(fd: c.fd_t, event: Event) !void {
+fn writeEvent(fd: c.fd_t, event: Event) !void {
     try io.writeAll(fd, "{\"event\":");
     try writeString(fd, event.label());
     try io.writeAll(fd, "}\n");
 }
 
-pub fn writeMessage(fd: c.fd_t, event: Event, message: []const u8) !void {
+fn writeMessage(fd: c.fd_t, event: Event, message: []const u8) !void {
     try io.writeAll(fd, "{\"event\":");
     try writeString(fd, event.label());
     try io.writeAll(fd, ",\"message\":");
@@ -64,7 +64,7 @@ pub fn writeRetryScheduled(fd: c.fd_t, retry_at_unix_ms: u64) !void {
     try io.writeAll(fd, line);
 }
 
-pub fn writeRetryNow(fd: c.fd_t) !void {
+fn writeRetryNow(fd: c.fd_t) !void {
     try writeEvent(fd, .retry_now);
 }
 
@@ -89,11 +89,11 @@ pub fn writeStatus(fd: c.fd_t, message: []const u8) !void {
     try writeMessage(fd, .status, message);
 }
 
-pub fn writeFinalFailure(fd: c.fd_t, message: []const u8) !void {
+fn writeFinalFailure(fd: c.fd_t, message: []const u8) !void {
     try writeMessage(fd, .final_failure, message);
 }
 
-pub fn writeString(fd: c.fd_t, value: []const u8) !void {
+fn writeString(fd: c.fd_t, value: []const u8) !void {
     try io.writeAll(fd, "\"");
     for (value) |byte| switch (byte) {
         '"' => try io.writeAll(fd, "\\\""),

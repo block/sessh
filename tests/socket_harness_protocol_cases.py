@@ -77,12 +77,12 @@ def run_live_draw_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
                 draw, draws = recv_draw_until(conn, b"PATCH_LINK")
@@ -130,12 +130,12 @@ def run_synchronized_output_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
                 try:
@@ -173,12 +173,12 @@ def run_input_ack_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 send_frame(conn, INPUT, pack_input(b"go\n", input_seq=7))
                 response = recv_until_message(conn, INPUT_ACK)
@@ -214,11 +214,11 @@ def run_session_ended_payload_protocol_test(base_env):
             conn.connect(str(socket_path(env)))
             send_hello(conn)
             send_resize(conn)
-            create_and_attach_session(conn, shell)
+            create_and_open_session(conn, shell)
             message_kind, payload = recv_frame(conn)
-            if message_kind != SESSION_ATTACHED:
-                raise AssertionError(f"expected SESSION_ATTACHED, got {message_kind}")
-            assert_session_attached(payload)
+            if message_kind != SESSION_READY:
+                raise AssertionError(f"expected SESSION_READY, got {message_kind}")
+            assert_session_ready(payload)
             recv_draw_until(conn, b"EXIT_READY")
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
 
@@ -302,12 +302,12 @@ def run_plain_scroll_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, rows=10, cols=80)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 recv_draw_until(conn, b"SCROLL_READY$ ")
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
@@ -353,12 +353,12 @@ def run_plain_screen_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, rows=24, cols=80)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 recv_draw_until(conn, b"SCREEN_READY$ ")
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
@@ -400,12 +400,12 @@ def run_split_escape_tail_is_not_replayed_as_text_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, rows=24, cols=80)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 recv_draw_until(conn, b"SPLIT_READY$ ")
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
@@ -445,12 +445,12 @@ def run_active_screen_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
                 draw, draws = recv_draw_until(conn, b"ALT_SCREEN")
@@ -459,7 +459,7 @@ def run_active_screen_protocol_test(base_env):
                     raise AssertionError(f"DRAW should enter outer alternate screen: {draws!r}")
                 if b"\x1b[?1049l" in output:
                     raise AssertionError(f"DRAW should not leave outer alternate screen immediately: {draws!r}")
-                restore = draw["attached_client_end_restore_bytes"]
+                restore = draw["visible_client_end_restore_bytes"]
                 if restore is None or b"\x1b[?1049l" not in restore:
                     raise AssertionError(f"DRAW should include alternate-screen cleanup: {draw!r}")
             finally:
@@ -492,12 +492,12 @@ def run_active_screen_barrier_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 recv_draw_until(conn, b"BARRIER_READY$ ")
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
@@ -539,12 +539,12 @@ def run_terminal_modes_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
                 draw, draws = recv_draw_until(conn, b"MODES_READY")
@@ -599,12 +599,12 @@ def run_cursor_shape_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 recv_draw_until(conn, b"\x1b]2;cursor-shape-ready\x1b\\")
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
@@ -727,12 +727,12 @@ def run_complete_display_clear_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
                 recv_draw_until(conn, b"READY$ ")
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
@@ -769,12 +769,12 @@ def run_title_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
                 recv_draw_until(conn, b"\x1b]2;sessh-title-live\x1b\\")
@@ -814,12 +814,12 @@ def run_default_colors_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"set\n"))
                 draw, _ = recv_draw_until(conn, b"COLOR_READY")
@@ -870,12 +870,12 @@ def run_seeded_default_color_query_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell, fg=0x010A0B0C, bg=0x010D0E0F)
+                create_and_open_session(conn, shell, fg=0x010A0B0C, bg=0x010D0E0F)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 draw, _ = recv_draw_until(conn, b"SEEDED_DEFAULT_QUERY_", timeout=5.0)
                 if b"SEEDED_DEFAULT_QUERY_BAD" in draw["draw_bytes"]:
@@ -937,12 +937,12 @@ def run_complex_ui_query_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 draw, _ = recv_draw_until(conn, b"COMPLEX_UI_QUERY_", timeout=5.0)
                 if b"COMPLEX_UI_QUERY_BAD" in draw["draw_bytes"]:
@@ -955,7 +955,7 @@ def run_complex_ui_query_protocol_test(base_env):
             cleanup_runtime(env)
 
 
-def run_scrollback_attach_draw_protocol_test(base_env):
+def run_scrollback_open_draw_protocol_test(base_env):
     with tempfile.TemporaryDirectory(prefix="sessh-scrollback-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
         env["SHELL"] = "/bin/sh"
@@ -983,12 +983,12 @@ def run_scrollback_attach_draw_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, 3, 40)
-                create_and_attach_session(conn, shell, scrollback=20)
+                create_and_open_session(conn, shell, scrollback=20)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
                 _, draws = recv_draw_until(conn, b"AFTER$")
@@ -1058,12 +1058,12 @@ def run_scrollback_clear_protocol_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, 3, 40)
-                create_and_attach_session(conn, shell, scrollback=20)
+                create_and_open_session(conn, shell, scrollback=20)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
                 _, draws = recv_draw_until(conn, b"AFTER_CLEAR$")
@@ -1073,31 +1073,31 @@ def run_scrollback_clear_protocol_test(base_env):
             finally:
                 conn.close()
 
-            attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            attach.settimeout(5.0)
+            reopened = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            reopened.settimeout(5.0)
             try:
-                attach.connect(str(socket_path(env)))
-                send_hello(attach)
-                send_resize(attach, 3, 40)
+                reopened.connect(str(socket_path(env)))
+                send_hello(reopened)
+                send_resize(reopened, 3, 40)
                 send_frame(
-                    attach,
-                    SESSION_ATTACH,
-                    pack_session_attach(
+                    reopened,
+                    SESSION_OPEN,
+                    pack_session_open(
                         session_guid=test_session_guid(1),
                     ),
                 )
 
-                message_type, _ = recv_frame(attach)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                message_type, _ = recv_frame(reopened)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
 
-                draw = recv_draw(attach)
+                draw = recv_draw(reopened)
                 if draw["scrollback_cursor"] != 0:
-                    raise AssertionError(f"cleared retained history returned in attach DRAW: {draw!r}")
+                    raise AssertionError(f"cleared retained history returned in open DRAW: {draw!r}")
                 if b"AFTER_CLEAR$" not in draw["draw_bytes"]:
-                    raise AssertionError(f"attach DRAW did not include current screen after clear: {draw!r}")
+                    raise AssertionError(f"open DRAW did not include current screen after clear: {draw!r}")
             finally:
-                attach.close()
+                reopened.close()
         finally:
             cleanup_runtime(env)
 

@@ -6,14 +6,13 @@ const posix = std.posix;
 const io = @import("../core/io.zig");
 const terminal = @import("../tty/terminal.zig");
 
-pub const CursorStyle = enum(u8) {
-    default = 0,
-    blinking_block = 1,
-    steady_block = 2,
-    blinking_underline = 3,
-    steady_underline = 4,
-    blinking_bar = 5,
-    steady_bar = 6,
+const PrivateModeState = enum {
+    enabled,
+    disabled,
+
+    fn fromBool(enabled: bool) PrivateModeState {
+        return if (enabled) .enabled else .disabled;
+    }
 };
 
 pub const Color = union(enum) {
@@ -22,11 +21,7 @@ pub const Color = union(enum) {
     rgb: Rgb,
 };
 
-pub const Rgb = struct {
-    r: u8,
-    g: u8,
-    b: u8,
-};
+pub const Rgb = terminal.Rgb;
 
 pub const CellAttrs = struct {
     bold: bool = false,
@@ -52,26 +47,7 @@ pub const UnderlineStyle = enum(u8) {
     dashed = 5,
 };
 
-pub const TerminalModes = struct {
-    mode_flags: u32 = 0,
-    mouse_tracking: MouseTracking = .disabled,
-    mouse_sgr: bool = false,
-    kitty_keyboard_flags: u5 = 0,
-
-    pub const insert_mode: u32 = 1 << 0;
-    pub const origin_mode: u32 = 1 << 1;
-    pub const auto_wrap: u32 = 1 << 2;
-    pub const application_cursor_keys: u32 = 1 << 3;
-    pub const focus_reporting: u32 = 1 << 4;
-    pub const bracketed_paste: u32 = 1 << 5;
-
-    pub fn eql(self: TerminalModes, other: TerminalModes) bool {
-        return self.mode_flags == other.mode_flags and
-            self.mouse_tracking == other.mouse_tracking and
-            self.mouse_sgr == other.mouse_sgr and
-            self.kitty_keyboard_flags == other.kitty_keyboard_flags;
-    }
-};
+pub const TerminalModes = terminal.TerminalModes;
 
 pub const DefaultColors = struct {
     foreground: Color = .default,
@@ -88,12 +64,7 @@ pub const DefaultColors = struct {
     }
 };
 
-pub const MouseTracking = enum(u8) {
-    disabled = 0,
-    normal = 1,
-    button = 2,
-    any = 3,
-};
+pub const MouseTracking = terminal.MouseTracking;
 
 pub const Cell = struct {
     text: []const u8,
@@ -106,16 +77,11 @@ pub const Row = struct {
     cells: []const Cell,
 };
 
-pub const Snapshot = struct {
-    rows: []const Row,
-    cursor_row: u16,
-    cursor_col: u16,
-    cursor_visible: bool = true,
-    cursor_style: CursorStyle = .default,
-};
-
 pub const Capabilities = struct {
     kind: Kind,
+
+    pub const xterm_compatible: Capabilities = .{ .kind = .xterm_compatible };
+    pub const dumb: Capabilities = .{ .kind = .dumb };
 
     pub const Kind = enum {
         xterm_compatible,
@@ -128,9 +94,9 @@ pub const Capabilities = struct {
     /// should stay behind this boundary so a real terminfo-backed resolver can
     /// replace this later without changing session logic.
     pub fn detect(term: ?[]const u8) Capabilities {
-        const value = term orelse return .{ .kind = .dumb };
-        if (value.len == 0 or std.mem.eql(u8, value, "dumb")) return .{ .kind = .dumb };
-        return .{ .kind = .xterm_compatible };
+        const value = term orelse return dumb;
+        if (value.len == 0 or std.mem.eql(u8, value, "dumb")) return dumb;
+        return xterm_compatible;
     }
 
     pub fn detectFromEnv() Capabilities {
@@ -164,11 +130,22 @@ pub const Renderer = struct {
         return .{ .output = .{ .buffer = buffer }, .caps = caps };
     }
 
+    pub fn bufferedXtermCompatible(buffer: *std.ArrayList(u8)) Renderer {
+        return buffered(buffer, Capabilities.xterm_compatible);
+    }
+
+    pub fn outputFd(self: Renderer) ?c.fd_t {
+        return switch (self.output) {
+            .fd => |fd| fd,
+            .buffer => null,
+        };
+    }
+
     pub fn restorePresentation(self: Renderer, kitty_keyboard_flags: u5) !void {
         if (!self.caps.supportsRendering()) return;
         try self.restoreOverlayPresentation();
         try self.disableMouseTracking();
-        try self.setPrivateMode(1, false);
+        try self.setPrivateMode(1, .disabled);
         try self.write("\x1b[?1004l");
         try self.write("\x1b[?2004l");
         try self.setKittyKeyboardFlags(kitty_keyboard_flags);
@@ -195,7 +172,7 @@ pub const Renderer = struct {
     pub fn clearVisible(self: Renderer) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
         try self.write("\x1b[2J");
-        try self.moveCursor(0, 0);
+        try self.moveCursor(terminal.top_left_position);
     }
 
     pub fn enterAlternateScreen(self: Renderer) !void {
@@ -206,54 +183,6 @@ pub const Renderer = struct {
     pub fn leaveAlternateScreen(self: Renderer) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
         try self.write("\x1b[?1049l");
-    }
-
-    pub fn repaintSnapshot(self: Renderer, snapshot: Snapshot) !void {
-        if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
-        try self.write("\x1b[?25l");
-        try self.clearForReplace();
-        for (snapshot.rows, 0..) |row, row_index| {
-            if (row_index > 0) try self.write("\r\n");
-            try self.renderRow(row);
-        }
-        try self.write("\x1b[0m");
-        try self.moveCursor(snapshot.cursor_row, snapshot.cursor_col);
-        if (snapshot.cursor_visible) {
-            try self.write("\x1b[?25h");
-        } else {
-            try self.write("\x1b[?25l");
-        }
-        try self.setCursorStyle(snapshot.cursor_style);
-    }
-
-    pub fn repaintPlainText(
-        self: Renderer,
-        text: []const u8,
-        cursor_row: u16,
-        cursor_col: u16,
-        cursor_visible: bool,
-        cursor_style: CursorStyle,
-    ) !void {
-        if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
-        try self.write("\x1b[?25l");
-        try self.clearForReplace();
-
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        var first = true;
-        while (lines.next()) |line| {
-            if (!first) try self.write("\r\n");
-            first = false;
-            try self.write(line);
-        }
-
-        try self.write("\x1b[0m");
-        try self.moveCursor(cursor_row, cursor_col);
-        if (cursor_visible) {
-            try self.write("\x1b[?25h");
-        } else {
-            try self.write("\x1b[?25l");
-        }
-        try self.setCursorStyle(cursor_style);
     }
 
     pub fn appendPlainText(self: Renderer, text: []const u8) !void {
@@ -327,9 +256,12 @@ pub const Renderer = struct {
         try self.write(seq);
     }
 
-    pub fn setCursorVisible(self: Renderer, visible: bool) !void {
+    pub fn setCursorVisibility(self: Renderer, visibility: terminal.CursorVisibility) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
-        try self.write(if (visible) "\x1b[?25h" else "\x1b[?25l");
+        try self.write(switch (visibility) {
+            .visible => "\x1b[?25h",
+            .hidden => "\x1b[?25l",
+        });
     }
 
     pub fn writeRaw(self: Renderer, bytes: []const u8) !void {
@@ -365,14 +297,14 @@ pub const Renderer = struct {
         try self.write("\x1b[0m");
     }
 
-    pub fn moveCursor(self: Renderer, row: u16, col: u16) !void {
+    pub fn moveCursor(self: Renderer, position: terminal.CursorPosition) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
         var buf: [32]u8 = undefined;
-        const seq = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ row + 1, col + 1 });
+        const seq = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ position.row + 1, position.col + 1 });
         try self.write(seq);
     }
 
-    pub fn setCursorStyle(self: Renderer, style: CursorStyle) !void {
+    pub fn setCursorStyle(self: Renderer, style: terminal.CursorStyle) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
         var buf: [16]u8 = undefined;
         const seq = try std.fmt.bufPrint(&buf, "\x1b[{} q", .{@intFromEnum(style)});
@@ -395,19 +327,19 @@ pub const Renderer = struct {
     pub fn applyTerminalModes(self: Renderer, modes: TerminalModes) !void {
         if (!self.caps.supportsRendering()) return error.UnsupportedTerminal;
 
-        try self.setPrivateMode(1000, false);
-        try self.setPrivateMode(1002, false);
-        try self.setPrivateMode(1003, false);
+        try self.setPrivateMode(1000, .disabled);
+        try self.setPrivateMode(1002, .disabled);
+        try self.setPrivateMode(1003, .disabled);
         switch (modes.mouse_tracking) {
             .disabled => {},
-            .normal => try self.setPrivateMode(1000, true),
-            .button => try self.setPrivateMode(1002, true),
-            .any => try self.setPrivateMode(1003, true),
+            .normal => try self.setPrivateMode(1000, .enabled),
+            .button => try self.setPrivateMode(1002, .enabled),
+            .any => try self.setPrivateMode(1003, .enabled),
         }
-        try self.setPrivateMode(1006, modes.mouse_sgr);
-        try self.setPrivateMode(1, (modes.mode_flags & TerminalModes.application_cursor_keys) != 0);
-        try self.setPrivateMode(1004, (modes.mode_flags & TerminalModes.focus_reporting) != 0);
-        try self.setPrivateMode(2004, (modes.mode_flags & TerminalModes.bracketed_paste) != 0);
+        try self.setPrivateMode(1006, .fromBool(modes.mouse_sgr));
+        try self.setPrivateMode(1, .fromBool((modes.mode_flags & TerminalModes.application_cursor_keys) != 0));
+        try self.setPrivateMode(1004, .fromBool((modes.mode_flags & TerminalModes.focus_reporting) != 0));
+        try self.setPrivateMode(2004, .fromBool((modes.mode_flags & TerminalModes.bracketed_paste) != 0));
         try self.setKittyKeyboardFlags(modes.kitty_keyboard_flags);
     }
 
@@ -419,9 +351,15 @@ pub const Renderer = struct {
         try self.write("\x1b[?1015l");
     }
 
-    fn setPrivateMode(self: Renderer, mode: u16, enabled: bool) !void {
+    fn setPrivateMode(self: Renderer, mode: u16, state: PrivateModeState) !void {
         var buf: [32]u8 = undefined;
-        const seq = try std.fmt.bufPrint(&buf, "\x1b[?{}{s}", .{ mode, if (enabled) "h" else "l" });
+        const seq = try std.fmt.bufPrint(&buf, "\x1b[?{}{s}", .{
+            mode,
+            switch (state) {
+                .enabled => "h",
+                .disabled => "l",
+            },
+        });
         try self.write(seq);
     }
 
@@ -467,8 +405,7 @@ pub const Renderer = struct {
         var buf: [256]u8 = undefined;
         var len: usize = 0;
         for (value) |byte| {
-            const safe_byte: u8 = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
-            buf[len] = safe_byte;
+            buf[len] = terminal.sanitizedOscTextByte(byte);
             len += 1;
             if (len == buf.len) {
                 try self.write(buf[0..len]);
@@ -605,7 +542,7 @@ test "render row emits style and color sequences" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     const cells = [_]Cell{.{
         .text = "X",
         .attrs = .{
@@ -629,7 +566,7 @@ test "render row wraps hyperlink cells in OSC 8" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     const cells = [_]Cell{.{
         .text = "link",
         .hyperlink = "https://example.test/",
@@ -648,7 +585,7 @@ test "set title emits an OSC title sequence" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     try renderer.setTitle("/tmp/sessh-title");
     posix.close(fds[1]);
 
@@ -661,7 +598,7 @@ test "default colors emit OSC 10 and OSC 11 sequences" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     try renderer.applyDefaultColors(.{
         .foreground = .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } },
         .background = .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } },
@@ -681,7 +618,7 @@ test "clear scrollback emits only retained scrollback clear" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     try renderer.clearScrollback();
     posix.close(fds[1]);
 
@@ -695,7 +632,7 @@ test "restore presentation does not clear or swap the screen" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     try renderer.restorePresentation(0);
 
     var buf: [512]u8 = undefined;
@@ -711,7 +648,7 @@ test "restore presentation resets every modeled local terminal side effect" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     try renderer.restorePresentation(0);
 
     var buf: [512]u8 = undefined;
@@ -737,7 +674,7 @@ test "restore presentation restores initial kitty keyboard flags" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     try renderer.restorePresentation(7);
 
     var buf: [512]u8 = undefined;
@@ -752,7 +689,7 @@ test "restore state presentation preserves input and event modes" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     try renderer.restoreOverlayPresentation();
 
     var buf: [512]u8 = undefined;
@@ -774,7 +711,7 @@ test "apply terminal modes enables input and event modes" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     try renderer.applyTerminalModes(.{
         .mode_flags = TerminalModes.application_cursor_keys |
             TerminalModes.focus_reporting |
@@ -800,7 +737,7 @@ test "apply terminal modes disables input and event modes" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
     try renderer.applyTerminalModes(.{});
     posix.close(fds[1]);
 

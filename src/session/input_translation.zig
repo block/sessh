@@ -1,24 +1,17 @@
 const std = @import("std");
 
-const client_renderer = @import("renderer.zig");
-const attached_client_presentation = @import("attached_client_presentation.zig");
+const fixed_buffer = @import("../core/fixed_buffer.zig");
+const terminal = @import("../tty/terminal.zig");
 
-const TerminalOrigin = attached_client_presentation.TerminalOrigin;
+const TerminalModes = terminal.TerminalModes;
+const WindowSize = terminal.WindowSize;
 
-pub const PendingInput = struct {
-    bytes: [128]u8 = [_]u8{0} ** 128,
-    len: usize = 0,
-};
+pub const PendingInput = fixed_buffer.FixedBuffer(128);
 
 pub const ModeState = struct {
-    origin: ?TerminalOrigin = null,
-    terminal_modes: client_renderer.TerminalModes = .{},
+    origin: ?terminal.Position = null,
+    terminal_modes: TerminalModes = .{},
     terminal_modes_initialized: bool = false,
-};
-
-pub const SessionSize = struct {
-    rows: u16,
-    cols: u16,
 };
 
 const SgrMouseReport = struct {
@@ -47,18 +40,31 @@ const XtermModifiedKeyParse = union(enum) {
     complete: XtermModifiedKey,
 };
 
-pub fn translate(
-    allocator: std.mem.Allocator,
+pub const TranslateOptions = struct {
     pending: *PendingInput,
     mode: ModeState,
-    session_size: SessionSize,
+    session_size: WindowSize,
     bytes: []const u8,
     out: *std.ArrayList(u8),
+};
+
+// Translate local terminal input from outer-terminal coordinates into the
+// remote PTY's coordinate space. Most bytes pass through unchanged; mouse
+// reports are held until complete because partial escape sequences cannot be
+// safely rewritten or forwarded as text.
+pub fn translate(
+    allocator: std.mem.Allocator,
+    options: TranslateOptions,
 ) !void {
+    const pending = options.pending;
+    const mode = options.mode;
+    const session_size = options.session_size;
+    const bytes = options.bytes;
+    const out = options.out;
     if (!localInputParserActive(mode)) {
-        if (pending.len > 0) {
-            try out.appendSlice(allocator, pending.bytes[0..pending.len]);
-            pending.len = 0;
+        if (!pending.isEmpty()) {
+            try out.appendSlice(allocator, pending.slice());
+            pending.clear();
         }
         try out.appendSlice(allocator, bytes);
         return;
@@ -66,9 +72,9 @@ pub fn translate(
 
     var input = std.ArrayList(u8).empty;
     defer input.deinit(allocator);
-    if (pending.len > 0) {
-        try input.appendSlice(allocator, pending.bytes[0..pending.len]);
-        pending.len = 0;
+    if (!pending.isEmpty()) {
+        try input.appendSlice(allocator, pending.slice());
+        pending.clear();
     }
     try input.appendSlice(allocator, bytes);
 
@@ -84,14 +90,25 @@ pub fn translate(
             switch (parseSgrMouseReport(input.items, index)) {
                 .complete => |report| {
                     if (sgrMouseActive(mode)) {
-                        try appendTranslatedSgrMouseReport(allocator, mode, session_size, report, out);
+                        try appendTranslatedSgrMouseReport(.{
+                            .allocator = allocator,
+                            .mode = mode,
+                            .session_size = session_size,
+                            .report = report,
+                            .out = out,
+                        });
                     }
                     index = report.end;
                     continue;
                 },
                 .incomplete => {
                     if (sgrMouseActive(mode)) {
-                        try savePendingInput(allocator, pending, input.items[index..], out);
+                        try savePendingInput(.{
+                            .allocator = allocator,
+                            .pending_input = pending,
+                            .pending_bytes = input.items[index..],
+                            .out = out,
+                        });
                         return;
                     }
                 },
@@ -109,7 +126,12 @@ pub fn translate(
             },
             .incomplete => {
                 if (focusReportingActive(mode)) {
-                    try savePendingInput(allocator, pending, input.items[index..], out);
+                    try savePendingInput(.{
+                        .allocator = allocator,
+                        .pending_input = pending,
+                        .pending_bytes = input.items[index..],
+                        .out = out,
+                    });
                     return;
                 }
             },
@@ -124,7 +146,12 @@ pub fn translate(
                     continue;
                 },
                 .incomplete => {
-                    try savePendingInput(allocator, pending, input.items[index..], out);
+                    try savePendingInput(.{
+                        .allocator = allocator,
+                        .pending_input = pending,
+                        .pending_bytes = input.items[index..],
+                        .out = out,
+                    });
                     return;
                 },
                 .not_modified => {},
@@ -136,18 +163,21 @@ pub fn translate(
     }
 }
 
-fn savePendingInput(
+const SavePendingInputOptions = struct {
     allocator: std.mem.Allocator,
     pending_input: *PendingInput,
-    pending: []const u8,
+    pending_bytes: []const u8,
     out: *std.ArrayList(u8),
-) !void {
-    if (pending.len <= pending_input.bytes.len) {
-        @memcpy(pending_input.bytes[0..pending.len], pending);
-        pending_input.len = pending.len;
-    } else {
-        try out.appendSlice(allocator, pending);
-    }
+};
+
+fn savePendingInput(options: SavePendingInputOptions) !void {
+    const allocator = options.allocator;
+    const pending_input = options.pending_input;
+    const pending = options.pending_bytes;
+    const out = options.out;
+    pending_input.set(pending) catch |err| switch (err) {
+        error.FixedBufferTooLarge => try out.appendSlice(allocator, pending),
+    };
 }
 
 fn localInputParserActive(mode: ModeState) bool {
@@ -167,7 +197,7 @@ fn kittyKeyboardActive(mode: ModeState) bool {
 
 fn focusReportingActive(mode: ModeState) bool {
     return mode.terminal_modes_initialized and
-        (mode.terminal_modes.mode_flags & client_renderer.TerminalModes.focus_reporting) != 0;
+        (mode.terminal_modes.mode_flags & TerminalModes.focus_reporting) != 0;
 }
 
 const FocusReport = struct {
@@ -288,13 +318,20 @@ fn parseSgrMouseNumber(input: []const u8, index: *usize) ?u32 {
     return value;
 }
 
-fn appendTranslatedSgrMouseReport(
+const TranslatedSgrMouseReportOptions = struct {
     allocator: std.mem.Allocator,
     mode: ModeState,
-    session_size: SessionSize,
+    session_size: WindowSize,
     report: SgrMouseReport,
     out: *std.ArrayList(u8),
-) !void {
+};
+
+fn appendTranslatedSgrMouseReport(options: TranslatedSgrMouseReportOptions) !void {
+    const allocator = options.allocator;
+    const mode = options.mode;
+    const session_size = options.session_size;
+    const report = options.report;
+    const out = options.out;
     const origin = mode.origin orelse return;
     if (report.row <= origin.row or report.col <= origin.col) return;
 
@@ -315,48 +352,78 @@ fn appendTranslatedSgrMouseReport(
 test "SGR mouse input is translated from outer to inner coordinates" {
     var pending = PendingInput{};
     const mode = ModeState{
-        .origin = .{ .row = 4, .col = 0 },
+        .origin = terminal.top_left_position.withRow(4),
         .terminal_modes = .{ .mouse_tracking = .normal, .mouse_sgr = true },
         .terminal_modes_initialized = true,
     };
-    const session = SessionSize{ .rows = 24, .cols = 80 };
+    const session = WindowSize{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b[<0;12;5M", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b[<0;12;5M",
+        .out = &out,
+    });
     try std.testing.expectEqualStrings("\x1b[<0;12;1M", out.items);
 
     out.clearRetainingCapacity();
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b[<0;12;3M", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b[<0;12;3M",
+        .out = &out,
+    });
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "SGR mouse input is dropped when mouse reporting is inactive" {
     var pending = PendingInput{};
     const mode = ModeState{
-        .origin = .{ .row = 4, .col = 0 },
+        .origin = terminal.top_left_position.withRow(4),
         .terminal_modes_initialized = true,
     };
-    const session = SessionSize{ .rows = 24, .cols = 80 };
+    const session = WindowSize{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b[<0;12;5M", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b[<0;12;5M",
+        .out = &out,
+    });
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "focus reports are forwarded only while focus reporting is active" {
     var pending = PendingInput{};
     var mode = ModeState{ .terminal_modes_initialized = true };
-    const session = SessionSize{ .rows = 24, .cols = 80 };
+    const session = WindowSize{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b[I", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b[I",
+        .out = &out,
+    });
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 
-    mode.terminal_modes.mode_flags = client_renderer.TerminalModes.focus_reporting;
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b[O", &out);
+    mode.terminal_modes.mode_flags = TerminalModes.focus_reporting;
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b[O",
+        .out = &out,
+    });
     try std.testing.expectEqualStrings("\x1b[O", out.items);
 }
 
@@ -366,11 +433,17 @@ test "xterm modified key input is translated to kitty when kitty keyboard is act
         .terminal_modes = .{ .kitty_keyboard_flags = 7 },
         .terminal_modes_initialized = true,
     };
-    const session = SessionSize{ .rows = 24, .cols = 80 };
+    const session = WindowSize{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b[27;2;13~", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b[27;2;13~",
+        .out = &out,
+    });
     try std.testing.expectEqualStrings("\x1b[13;2u", out.items);
 }
 
@@ -380,26 +453,44 @@ test "split xterm modified key input is held and translated after completion" {
         .terminal_modes = .{ .kitty_keyboard_flags = 7 },
         .terminal_modes_initialized = true,
     };
-    const session = SessionSize{ .rows = 24, .cols = 80 };
+    const session = WindowSize{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b[27;2;", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b[27;2;",
+        .out = &out,
+    });
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
-    try std.testing.expect(pending.len > 0);
+    try std.testing.expect(!pending.isEmpty());
 
-    try translate(std.testing.allocator, &pending, mode, session, "13~", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "13~",
+        .out = &out,
+    });
     try std.testing.expectEqualStrings("\x1b[13;2u", out.items);
 }
 
 test "xterm modified key input passes through when kitty keyboard is inactive" {
     var pending = PendingInput{};
     const mode = ModeState{};
-    const session = SessionSize{ .rows = 24, .cols = 80 };
+    const session = WindowSize{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b[27;2;13~", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b[27;2;13~",
+        .out = &out,
+    });
     try std.testing.expectEqualStrings("\x1b[27;2;13~", out.items);
 }
 
@@ -409,11 +500,17 @@ test "non-xterm CSI input passes through when kitty keyboard is active" {
         .terminal_modes = .{ .kitty_keyboard_flags = 7 },
         .terminal_modes_initialized = true,
     };
-    const session = SessionSize{ .rows = 24, .cols = 80 };
+    const session = WindowSize{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b[A", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b[A",
+        .out = &out,
+    });
     try std.testing.expectEqualStrings("\x1b[A", out.items);
 }
 
@@ -423,11 +520,17 @@ test "plain enter input is not synthesized as kitty when kitty keyboard is activ
         .terminal_modes = .{ .kitty_keyboard_flags = 7 },
         .terminal_modes_initialized = true,
     };
-    const session = SessionSize{ .rows = 24, .cols = 80 };
+    const session = WindowSize{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    try translate(std.testing.allocator, &pending, mode, session, "\r", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\r",
+        .out = &out,
+    });
     try std.testing.expectEqualStrings("\r", out.items);
 }
 
@@ -437,11 +540,17 @@ test "bare escape is not held by kitty keyboard translation" {
         .terminal_modes = .{ .kitty_keyboard_flags = 7 },
         .terminal_modes_initialized = true,
     };
-    const session = SessionSize{ .rows = 24, .cols = 80 };
+    const session = WindowSize{ .rows = 24, .cols = 80 };
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    try translate(std.testing.allocator, &pending, mode, session, "\x1b", &out);
+    try translate(std.testing.allocator, .{
+        .pending = &pending,
+        .mode = mode,
+        .session_size = session,
+        .bytes = "\x1b",
+        .out = &out,
+    });
     try std.testing.expectEqualStrings("\x1b", out.items);
-    try std.testing.expectEqual(@as(usize, 0), pending.len);
+    try std.testing.expect(pending.isEmpty());
 }

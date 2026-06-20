@@ -26,15 +26,19 @@ pub const ConnectionMonitor = struct {
         }
     }
 
-    pub fn noteInputAckProgress(self: *ConnectionMonitor, still_pending: bool) void {
+    pub const InputAckProgress = struct {
+        still_pending: bool,
+    };
+
+    pub fn noteInputAckProgress(self: *ConnectionMonitor, progress: InputAckProgress) void {
         if (self.any_response_wait_started_ms) |started| {
             const now = self.nowMs();
             const rtt_ms = @max(now - started, 0);
             self.updateRtt(rtt_ms);
-            self.any_response_wait_started_ms = if (still_pending) now else null;
+            self.any_response_wait_started_ms = if (progress.still_pending) now else null;
             return;
         }
-        self.any_response_wait_started_ms = if (still_pending) self.nowMs() else null;
+        self.any_response_wait_started_ms = if (progress.still_pending) self.nowMs() else null;
     }
 
     fn updateRtt(self: *ConnectionMonitor, rtt_ms: i64) void {
@@ -104,6 +108,6 @@ test "connection monitor clears responsiveness wait after input ack progress" {
     monitor.afterInputAt(1_000);
     try std.testing.expectEqual(@as(?i64, 1_000), monitor.any_response_wait_started_ms);
 
-    monitor.noteInputAckProgress(false);
+    monitor.noteInputAckProgress(.{ .still_pending = false });
     try std.testing.expectEqual(@as(?i64, null), monitor.any_response_wait_started_ms);
 }

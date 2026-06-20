@@ -182,7 +182,7 @@ message ClientDaemonItem {
 
   // Visible client request to receive/send control messages for a proxy stream.
   // The ProxyCommand process does not send this: its normal ProxyStreamItem.Open
-  // already carries the same p-guid, so sesshd can attach this control channel
+  // already carries the same p-guid, so sesshd can associate this control channel
   // to the in-memory proxy stream.
   message ProxyDiagnosticsOpen {
     string proxy_guid = 1;
@@ -222,9 +222,8 @@ message ClientRemoteItem {
 }
 
 message DaemonTunnelItem {
-  // Transport control frame used to check whether the peer is still responsive.
-  // Ping/Pong live outside all logical streams, so handling them must not
-  // advance stream offsets or mutate terminal contents.
+  // Tunnel liveness probe. Ping/Pong live outside all logical streams, so
+  // handling them must not advance stream offsets or mutate terminal contents.
   message Ping {
   }
 
@@ -367,7 +366,7 @@ message TerminalEmulatorItem {
     string session_guid = 1;
     // Initial terminal size and repaint request for this client view.
     Resize resize = 2;
-    // When true, the remote terminal process sends raw inner PTY transcript
+    // When true, the terminal worker sends raw inner PTY transcript
     // chunks for this client view. The client still owns archive creation and
     // storage.
     bool capture_tty_transcript = 3;
@@ -381,8 +380,9 @@ message TerminalEmulatorItem {
   // connection.
   message SessionCreate {
     // Portable PTY settings captured from the client-side tty before sessh puts
-    // it into raw mode. This follows SSH's pty-req model: do not send a native
-    // termios struct, because those layouts and flag values are OS-specific.
+    // it into an unhygienic relay state. This follows SSH's pty-req model: do
+    // not send a native termios struct, because those layouts and flag values
+    // are OS-specific.
     message TtySettings {
       message Mode {
         // SSH terminal-mode opcode. Opcodes 1-159 have uint32 values; 128/129
@@ -391,12 +391,11 @@ message TerminalEmulatorItem {
         uint32 value = 2;
       }
 
-      // TERM value from the client environment. This is only present when the
-      // remote PTY exposes the client's real terminal, such as
-      // no-terminal-emulator mode.
-      // Normal sessh sessions leave this absent so the remote advertises
-      // sessh's terminal-emulator TERM instead. Empty is meaningful when the
-      // client had TERM set to an empty string.
+      // TERM value from the client environment. This is present when the
+      // remote PTY should behave like the client's real terminal, such as
+      // filter-level=hygienic. Emulated sessions leave this absent so the
+      // remote advertises sessh's terminal-emulator TERM instead. Empty is
+      // meaningful when the client had TERM set to an empty string.
       optional string term = 1;
       // SSH/RFC 4254 terminal-mode opcode/value pairs. Unknown opcodes are
       // ignored by the receiver, matching SSH server behavior.
@@ -428,13 +427,13 @@ message TerminalEmulatorItem {
     uint32 scrollback_row_limit = 2;
     // Environment entries to apply to the PTY child. Entries already present in
     // the request take precedence over environment inherited by the remote
-    // broker/daemon.
+    // worker process.
     repeated EnvironmentEntry environment = 3;
-    // Colors the remote terminal process may use to answer early OSC 10/11
+    // Colors the terminal worker may use to answer early OSC 10/11
     // queries.
     DefaultColors query_default_colors = 4;
     // At most one command form may be present. When command is unset, the
-    // remote terminal process starts the user's interactive login shell. The shell_command
+    // terminal worker starts the user's interactive login shell. The shell_command
     // variant mirrors ssh's `ssh HOST cmd args...` behavior after the local argv
     // has been joined into a command string for the remote shell.
     oneof command {
@@ -444,7 +443,7 @@ message TerminalEmulatorItem {
     // Portable local tty settings to apply to the newly created remote PTY.
     TtySettings tty_settings = 10;
     // Maximum time the session may remain disconnected before the remote
-    // terminal process ends it. Zero means disabled.
+    // terminal worker ends it. Zero means disabled.
     uint64 reap_ms = 11;
   }
 
@@ -452,42 +451,42 @@ message TerminalEmulatorItem {
   message Input {
     // Raw bytes read from the local terminal.
     bytes data = 1;
-    // Client-assigned input sequence. The remote terminal process acknowledges
+    // Client-assigned input sequence. The terminal worker acknowledges
     // nonzero sequence numbers after receiving the input frame.
     uint64 input_seq = 2;
   }
 
-  // Confirms that the remote terminal process received an Input frame.
+  // Confirms that the terminal worker received an Input frame.
   message InputAck {
     uint64 input_seq = 1;
   }
 
-  // Current terminal size for this attached client.
+  // Current terminal size for this visible client connection.
   message Resize {
-    // Rows visible in the local terminal. The remote terminal process bounds
+    // Rows visible in the local terminal. The terminal worker bounds
     // this to u16.
     uint32 terminal_rows = 1;
-    // Columns visible in the local terminal. The remote terminal process bounds
+    // Columns visible in the local terminal. The terminal worker bounds
     // this to u16.
     uint32 terminal_cols = 2;
-    // Present for resize frames that need a redraw. The remote terminal process
+    // Present for resize frames that need a redraw. The terminal worker
     // applies the new size, then answers this request with a RepaintResponse.
     optional RepaintRequest repaint_request = 3;
     // Rows between the outer terminal viewport top and the sessh viewport top.
     // Omitted means the viewports are aligned. -1 means the client no longer
     // knows the offset, typically after SIGWINCH resized an unaligned viewport;
-    // the remote terminal process must align the viewports in its repaint
+    // the terminal worker must align the viewports in its repaint
     // response.
     optional sint32 viewport_offset = 4;
   }
 
-  // Requests that the remote terminal process redraw terminal state for this
-  // attached client.
+  // Requests that the terminal worker redraw terminal state for this
+  // visible client connection.
   message RepaintRequest {
     // Client-local repaint request sequence copied into RepaintResponse. While
     // this repaint is outstanding, the client ignores framed Draw messages and
     // resumes applying draws only after receiving the matching RepaintResponse.
-    // If multiple RepaintRequests are in flight, the remote terminal process may
+    // If multiple RepaintRequests are in flight, the terminal worker may
     // ignore all but the last one.
     uint64 repaint_request_seq = 1;
     // Opaque scrollback cursor. Absent means assume the client has current
@@ -498,15 +497,15 @@ message TerminalEmulatorItem {
   }
 
   // Confirms the session selected for this connection.
-  message SessionAttached {
+  message SessionReady {
     // Canonical session GUID in s-prefixed hyphenated UUID form.
     string session_guid = 1;
   }
 
-  // Debug-only request that severs all attached client connections.
+  // Debug-only request that severs all visible client connections.
   message SessionClientDebugSeverConnectionRequest {}
 
-  // Debug-only request that makes all attached client connections stop
+  // Debug-only request that makes all visible client connections stop
   // responding for a bounded duration. Omitted or zero seconds asks the
   // receiver to use its default debug-unresponsive duration.
   message SessionClientDebugUnresponsiveConnectionRequest {
@@ -520,7 +519,7 @@ message TerminalEmulatorItem {
   // daemon when its local visible-client socket closes.
   message SessionHangupRequest {}
 
-  // Tells an attached client that the session has ended.
+  // Tells a visible client connection that the session has ended.
   message SessionEnded {
     enum Reason {
       REASON_UNSPECIFIED = 0;
@@ -544,14 +543,14 @@ message TerminalEmulatorItem {
     }
 
     Reason reason = 1;
-    // Absent means the remote terminal process did not observe a wait status,
+    // Absent means the terminal worker did not observe a wait status,
     // for example because it is shutting down and synthesized the end
     // notification.
     optional ExitStatus exit_status = 2;
     optional uint64 ended_at_unix_ms = 3;
   }
 
-  // Remote-terminal-generated terminal bytes for the attached session.
+  // Remote-terminal-generated terminal bytes for the visible session view.
   message Draw {
     // Opaque cursor representing the client scrollback state after applying
     // this draw. Clients must store and pass this back without interpreting it.
@@ -567,13 +566,13 @@ message TerminalEmulatorItem {
     // session view. Transport loss starts reconnect, so the client keeps this
     // payload active; client close or session-end writes it. Present empty
     // clears a previous restore.
-    optional bytes attached_client_end_restore_bytes = 4;
+    optional bytes visible_client_end_restore_bytes = 4;
     // Present when this draw includes the current screen title state. True means
     // the remote app has set a terminal title, even if that title is the empty
     // string. False means no app title is known. The client needs this bit so a
     // temporary local title such as reconnect status can be restored correctly:
     // use the app title when present, otherwise use a client-local fallback. Do
-    // not send that fallback to the remote terminal process. It may contain the
+    // not send that fallback to the terminal worker. It may contain the
     // user's local ssh alias or other client-private naming for the remote host,
     // which ssh does not normally reveal to the remote side.
     optional bool app_title_present = 5;
@@ -604,7 +603,7 @@ message TerminalEmulatorItem {
     InputAck input_ack = 3;
     Resize resize = 4;
     RepaintRequest repaint_request = 5;
-    SessionAttached session_attached = 6;
+    SessionReady session_ready = 6;
     SessionEnded session_ended = 7;
     Draw draw = 8;
     RepaintResponse repaint_response = 9;

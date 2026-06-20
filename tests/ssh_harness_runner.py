@@ -101,8 +101,8 @@ def main(argv=None):
             test_ssh_clean_remote_exit_preserves_status,
         ),
         (
-            "ssh pre-attach stderr forwards immediately",
-            test_ssh_pre_attach_stderr_forwards_immediately,
+            "ssh pre-session-ready stderr forwards immediately",
+            test_ssh_pre_session_ready_stderr_forwards_immediately,
         ),
         (
             "ssh transport pins ipqos to interactive config value",
@@ -209,12 +209,12 @@ def main(argv=None):
             test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t,
         ),
         (
-            "ssh terminal-emulator tty preserves exit status",
-            test_ssh_terminal_emulator_tty_preserves_exit_status,
+            "ssh filter-level emulated tty preserves exit status",
+            test_ssh_filter_level_emulated_tty_preserves_exit_status,
         ),
         (
-            "ssh terminal-emulator tty propagates resize",
-            test_ssh_terminal_emulator_tty_propagates_resize,
+            "ssh filter-level emulated tty propagates resize",
+            test_ssh_filter_level_emulated_tty_propagates_resize,
         ),
         (
             "ssh filter-level hygienic remote command uses proxy stream",
@@ -261,12 +261,12 @@ def main(argv=None):
             test_ssh_filter_level_hygienic_tty_uses_proxy_with_hygienic_diagnostics,
         ),
         (
-            "ssh terminal-emulator tty escape doubled tilde",
-            test_ssh_terminal_emulator_tty_escape_doubled_tilde,
+            "ssh filter-level emulated tty escape doubled tilde",
+            test_ssh_filter_level_emulated_tty_escape_doubled_tilde,
         ),
         (
-            "ssh terminal-emulator tty escape help modal repaints",
-            test_ssh_terminal_emulator_tty_escape_help_modal_repaints,
+            "ssh filter-level emulated tty escape help modal repaints",
+            test_ssh_filter_level_emulated_tty_escape_help_modal_repaints,
         ),
         (
             "ssh tty uses emulated TERM not outer TERM",
@@ -297,8 +297,8 @@ def main(argv=None):
             test_ssh_filter_level_hygienic_release_artifact_restores_local_tty_on_exit,
         ),
         (
-            "ssh terminal-emulator release artifact restores local tty on exit",
-            test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit,
+            "ssh filter-level emulated release artifact restores local tty on exit",
+            test_ssh_filter_level_emulated_release_artifact_restores_local_tty_on_exit,
         ),
         (
             "ssh requested tty with piped stdout does not emit local cleanup",
@@ -373,8 +373,8 @@ def main(argv=None):
             test_ssh_log_level_quiet_suppresses_buffered_stderr_display,
         ),
         (
-            "ssh session buffers and displays stderr after attach",
-            test_ssh_session_buffers_and_displays_stderr_after_attach,
+            "ssh session buffers and displays stderr after session ready",
+            test_ssh_session_buffers_and_displays_stderr_after_session_ready,
         ),
         (
             "ssh reconnect does not apply active screen cleanup",

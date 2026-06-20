@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = std.c;
+const posix = std.posix;
 
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
@@ -43,11 +44,11 @@ pub const Recorder = struct {
     }
 
     pub fn warnEnabled(self: *const Recorder) !void {
-        try io.writeAll(2, "sessh: WARNING: tty transcript capture is enabled.\r\n");
-        try io.writeAll(2, "sessh: WARNING: captured data may include passwords, tokens, pasted text, private keys, terminal output, and command history.\r\n");
-        try io.writeAll(2, "sessh: WARNING: transcript bytes are buffered in memory and written only on clean exit to: ");
-        try io.writeAll(2, self.path);
-        try io.writeAll(2, "\r\n");
+        try io.writeAll(posix.STDERR_FILENO, "sessh: WARNING: tty transcript capture is enabled.\r\n");
+        try io.writeAll(posix.STDERR_FILENO, "sessh: WARNING: captured data may include passwords, tokens, pasted text, private keys, terminal output, and command history.\r\n");
+        try io.writeAll(posix.STDERR_FILENO, "sessh: WARNING: transcript bytes are buffered in memory and written only on clean exit to: ");
+        try io.writeAll(posix.STDERR_FILENO, self.path);
+        try io.writeAll(posix.STDERR_FILENO, "\r\n");
     }
 
     pub fn record(self: *Recorder, stream: Stream, bytes: []const u8) void {
@@ -90,19 +91,40 @@ pub const Recorder = struct {
         errdefer out.deinit(self.allocator);
 
         try out.appendSlice(self.allocator, "{\n");
-        try appendJsonNumber(&out, self.allocator, "format_version", 1, true);
-        try appendJsonNumber(&out, self.allocator, "started_at_unix_ms", self.started_at_unix_ms, true);
-        try appendJsonStringField(&out, self.allocator, "sessh_version", config.version, true);
-        try appendJsonNumber(&out, self.allocator, "protocol_major", config.protocol_major, true);
-        try appendJsonNumber(&out, self.allocator, "protocol_minor", config.protocol_minor, true);
+        const json = JsonManifestWriter{ .out = &out, .allocator = self.allocator };
+        try json.appendNumber(.{ .key = "format_version", .value = 1, .trailing_comma = true });
+        try json.appendNumber(.{ .key = "started_at_unix_ms", .value = self.started_at_unix_ms, .trailing_comma = true });
+        try json.appendString(.{ .key = "sessh_version", .value = config.version, .trailing_comma = true });
+        try json.appendNumber(.{ .key = "protocol_major", .value = config.protocol_major, .trailing_comma = true });
+        try json.appendNumber(.{ .key = "protocol_minor", .value = config.protocol_minor, .trailing_comma = true });
         if (self.session_guid.items.len > 0) {
-            try appendJsonStringField(&out, self.allocator, "session_guid", self.session_guid.items, true);
+            try json.appendString(.{ .key = "session_guid", .value = self.session_guid.items, .trailing_comma = true });
         }
         try out.appendSlice(self.allocator, "  \"streams\": {\n");
-        try appendStreamManifest(&out, self.allocator, "outer.in.bin", "outer-to-client", self.outer_in.items.len, true);
-        try appendStreamManifest(&out, self.allocator, "outer.out.bin", "client-to-outer", self.outer_out.items.len, true);
-        try appendStreamManifest(&out, self.allocator, "inner.in.bin", "worker-to-pty", self.inner_in.items.len, true);
-        try appendStreamManifest(&out, self.allocator, "inner.out.bin", "pty-to-worker", self.inner_out.items.len, false);
+        try appendStreamManifest(&out, self.allocator, .{
+            .filename = "outer.in.bin",
+            .direction = "outer-to-client",
+            .byte_count = self.outer_in.items.len,
+            .comma = true,
+        });
+        try appendStreamManifest(&out, self.allocator, .{
+            .filename = "outer.out.bin",
+            .direction = "client-to-outer",
+            .byte_count = self.outer_out.items.len,
+            .comma = true,
+        });
+        try appendStreamManifest(&out, self.allocator, .{
+            .filename = "inner.in.bin",
+            .direction = "worker-to-pty",
+            .byte_count = self.inner_in.items.len,
+            .comma = true,
+        });
+        try appendStreamManifest(&out, self.allocator, .{
+            .filename = "inner.out.bin",
+            .direction = "pty-to-worker",
+            .byte_count = self.inner_out.items.len,
+            .comma = false,
+        });
         try out.appendSlice(self.allocator, "  }\n");
         try out.appendSlice(self.allocator, "}\n");
         return out.toOwnedSlice(self.allocator);
@@ -149,7 +171,7 @@ pub fn enabled() bool {
     return active_recorder != null;
 }
 
-pub fn recordOuterIn(bytes: []const u8) void {
+fn recordOuterIn(bytes: []const u8) void {
     if (active_recorder) |recorder| recorder.record(.outer_in, bytes);
 }
 
@@ -165,7 +187,7 @@ pub fn setSessionGuid(guid: []const u8) void {
     if (active_recorder) |recorder| recorder.setSessionGuid(guid);
 }
 
-pub fn finishActive() !void {
+fn finishActive() !void {
     if (active_recorder) |recorder| try recorder.finish();
 }
 
@@ -186,49 +208,52 @@ fn recordWriteHook(fd: c.fd_t, bytes: []const u8) void {
     }
 }
 
-fn appendJsonNumber(
+const JsonManifestWriter = struct {
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
-    key: []const u8,
-    value: anytype,
-    comma: bool,
-) !void {
-    try out.appendSlice(allocator, "  ");
-    try appendJsonString(out, allocator, key);
-    try out.appendSlice(allocator, ": ");
-    try out.writer(allocator).print("{}", .{value});
-    try out.appendSlice(allocator, if (comma) ",\n" else "\n");
-}
 
-fn appendJsonStringField(
-    out: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    key: []const u8,
-    value: []const u8,
-    comma: bool,
-) !void {
-    try out.appendSlice(allocator, "  ");
-    try appendJsonString(out, allocator, key);
-    try out.appendSlice(allocator, ": ");
-    try appendJsonString(out, allocator, value);
-    try out.appendSlice(allocator, if (comma) ",\n" else "\n");
-}
+    fn appendNumber(self: JsonManifestWriter, options: anytype) !void {
+        try self.out.appendSlice(self.allocator, "  ");
+        try appendJsonString(self.out, self.allocator, options.key);
+        try self.out.appendSlice(self.allocator, ": ");
+        try self.out.writer(self.allocator).print("{}", .{options.value});
+        try self.out.appendSlice(self.allocator, if (options.trailing_comma) ",\n" else "\n");
+    }
 
-fn appendStreamManifest(
-    out: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
+    const StringField = struct {
+        key: []const u8,
+        value: []const u8,
+        trailing_comma: bool,
+    };
+
+    fn appendString(self: JsonManifestWriter, field: StringField) !void {
+        try self.out.appendSlice(self.allocator, "  ");
+        try appendJsonString(self.out, self.allocator, field.key);
+        try self.out.appendSlice(self.allocator, ": ");
+        try appendJsonString(self.out, self.allocator, field.value);
+        try self.out.appendSlice(self.allocator, if (field.trailing_comma) ",\n" else "\n");
+    }
+};
+
+const StreamManifestEntry = struct {
     filename: []const u8,
     direction: []const u8,
     byte_count: usize,
     comma: bool,
+};
+
+fn appendStreamManifest(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    entry: StreamManifestEntry,
 ) !void {
     try out.appendSlice(allocator, "    ");
-    try appendJsonString(out, allocator, filename);
+    try appendJsonString(out, allocator, entry.filename);
     try out.appendSlice(allocator, ": { \"direction\": ");
-    try appendJsonString(out, allocator, direction);
+    try appendJsonString(out, allocator, entry.direction);
     try out.appendSlice(allocator, ", \"bytes\": ");
-    try out.writer(allocator).print("{}", .{byte_count});
-    try out.appendSlice(allocator, if (comma) " },\n" else " }\n");
+    try out.writer(allocator).print("{}", .{entry.byte_count});
+    try out.appendSlice(allocator, if (entry.comma) " },\n" else " }\n");
 }
 
 fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {

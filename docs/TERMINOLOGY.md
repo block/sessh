@@ -13,9 +13,8 @@ translates terminal state into the terminal-emulator protocol. A proxy session
 is a session where sessh carries opaque bytes between OpenSSH and the remote
 sshd.
 
-Both kinds of session are one-to-one with a visible client. Sessh does not have
-the old sesshmux-style model where detached clients later attach to existing
-remote sessions.
+Both kinds of session are one-to-one with a visible client. The visible client
+that starts a session is the client that owns it.
 
 # Worker
 
@@ -69,16 +68,33 @@ callbacks. A daemon callback must not enter its own blocking wait, because that
 would stop unrelated clients, tunnels, cleanup work, and log subscribers from
 making progress.
 
+`PROCESS_DISPATCHER` marks the one dispatcher loop owned by a long-lived
+process. In `sesshd`, helpers receive that dispatcher when they need fd or
+timer events; they should not create nested dispatchers.
+
 `PROCESS_EVENT_LOOP` marks a direct `poll(2)` loop that is the whole foreground
 process. Examples include a visible terminal client, a raw proxy bridge, or a
 remote worker process that has no daemon dispatcher of its own. These loops are
 allowed to block because there is no broader daemon workload hidden behind
 them.
 
+`PROCESS_GLOBAL_REGISTRY` marks process-global state that is intentionally owned
+by one single-threaded process. These registries let dispatcher callbacks,
+cleanup, and idle shutdown observe the same live work without passing a large
+registry object through every callback.
+
 `BLOCKING_POLL` marks a short foreground wait helper. These helpers are allowed
 only when the current process has no dispatcher work to service or when the
 helper is part of an explicitly foreground UI wait.
 
-`BLOCKING_FRAME_READ` marks a synchronous frame read. Production uses should be
-rare, foreground-only, and documented at the call site. Daemon-owned protocol
-fds should use `FrameReader` from dispatcher callbacks instead.
+`BLOCKING_WAIT` marks a synchronous non-dispatcher wait, such as a process
+wait, an OpenSSH config query, or bounded foreground daemon-start lock
+contention. These waits are allowed only when the process has no daemon
+dispatcher work to service, when collecting the final status of a foreground
+process, or during cleanup after the fd that drives the foreground relay has
+already closed.
+
+Protocol frame IO should be dispatcher-owned or explicit foreground setup IO.
+Daemon-owned protocol fds use `FrameReader`, `FrameWriteState`, or a queue from
+fd callbacks. Blocking frame helpers belong in test support, not in the
+production protocol API.

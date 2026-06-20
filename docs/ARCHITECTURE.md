@@ -1,8 +1,8 @@
 # Processes and Threads
 
-Sessh processes are single-threaded with non-blocking IO. Zig coroutine support
-is still in flux, so we use explicit state machines to manage state in response
-to file descriptors becoming readable/writable.
+Sessh processes are single-threaded with non-blocking IO. Long-running work is
+modeled as explicit state machines that advance when file descriptors become
+readable or writable.
 
 The processes involved depend on your `filter-level` and `isolation-mode`
 settings, described below. The default settings are `filter-level=emulated` and
@@ -46,8 +46,8 @@ The diagram below shows the default `isolation-mode=process` layout.
 `sessh` will set up a connection to the local `sesshd` (creating it if
 necessary). `sesshd` will communicate over a pooled connection to
 `sessh-broker`, which is only a daemon-tunnel bridge over ssh stdin/stdout. It
-does not own sessions or proxy streams. The remote `sesshd` receives the tunnel
-frames and sets up the terminal process, which creates the actual requested
+does not own sessions or workers. The remote `sesshd` receives the tunnel
+frames and sets up the terminal worker, which creates the actual requested
 remote process (typically a shell).
 
 The local `sesshd` process serves two purposes:
@@ -136,10 +136,9 @@ The benefit of `unhygienic` is lower overhead. The lack of hygiene is not
 necessarily a problem. If it is, choose a less intrusive diagnostics level such
 as `--diagnostics-level=line`.
 
-If the requested `ssh` command doesn't use stdin (e.g. port forwarding) then we
-can potentially use stdin ourselves (assuming its a TTY), allowing us to show
-richer diagnostic information, such as prompting the user to type CTRL-R to
-attempt reconnection immediately.
+When diagnostics have a TTY available, sessh can use that side channel for
+richer feedback and reconnect input, such as prompting the user to type CTRL-R
+to attempt reconnection immediately.
 
 ## Isolation modes
 

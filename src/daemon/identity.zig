@@ -47,6 +47,9 @@ fn processStartTimeFromPs(allocator: std.mem.Allocator, pid: u64) ![]u8 {
     const pid_arg = try std.fmt.allocPrint(allocator, "{}", .{pid});
     defer allocator.free(pid_arg);
 
+    // BLOCKING_WAIT: this is the portability fallback when `/proc` cannot
+    // provide a stable process start token. Cleanup records compare the opaque
+    // string exactly; it does not need to match another machine's clock format.
     const result = try std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "ps", "-p", pid_arg, "-o", "lstart=" },

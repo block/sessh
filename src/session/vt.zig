@@ -1,9 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../core/config.zig");
+const tty = @import("../tty/terminal.zig");
 const ghostty_vt = @import("ghostty-vt");
 
 /// Boundary module for Ghostty's terminal emulator. Keep upstream API usage
-/// concentrated here as we learn which state the remote terminal process needs to serialize.
+/// concentrated here as we learn which state the terminal worker needs to serialize.
 pub const Terminal = ghostty_vt.Terminal;
 pub const RenderState = ghostty_vt.RenderState;
 const TerminalStream = ghostty_vt.Stream(ModelTrackingHandler);
@@ -22,12 +24,11 @@ pub const DisplayClearMode = enum(u8) {
 
 pub const DisplayClear = struct {
     mode: DisplayClearMode,
-    cursor_row: u16,
-    cursor_col: u16,
+    cursor_position: tty.CursorPosition,
     protected: bool,
 };
 
-// A render barrier is an ordered terminal transition that the remote terminal process
+// A render barrier is an ordered terminal transition that the terminal worker
 // must see before libghostty-vt mutates the model. The current use is
 // alternate-screen enter/exit: output before the transition belongs to one
 // screen buffer, and output after it belongs to another.
@@ -36,19 +37,42 @@ pub const RenderBarrier = enum {
     leave_alternate_screen,
 };
 
+const ModeTransition = enum {
+    set,
+    reset,
+};
+
+const ModeNamespace = enum {
+    ansi,
+    private,
+
+    fn fromAnsiFlag(ansi: bool) ModeNamespace {
+        return if (ansi) .ansi else .private;
+    }
+
+    fn prefix(self: ModeNamespace) []const u8 {
+        return switch (self) {
+            .ansi => "",
+            .private => "?",
+        };
+    }
+};
+
 pub const RenderBarrierCallback = *const fn (
     context: *anyopaque,
     terminal: *SessionTerminal,
     barrier: RenderBarrier,
 ) anyerror!void;
 
+pub const FeedWithRenderBarriersRequest = struct {
+    bytes: []const u8,
+    context: *anyopaque,
+    callback: RenderBarrierCallback,
+};
+
 pub const PlainSnapshot = struct {
-    rows: u16,
-    cols: u16,
-    cursor_row: u16,
-    cursor_col: u16,
-    cursor_visible: bool,
-    cursor_style: u8,
+    size: tty.WindowSize,
+    cursor: tty.CursorState,
     text: []const u8,
 };
 
@@ -93,26 +117,7 @@ pub const CellAttrs = struct {
     }
 };
 
-pub const TerminalModes = struct {
-    mode_flags: u32 = 0,
-    mouse_tracking: u8 = 0,
-    mouse_sgr: bool = false,
-    kitty_keyboard_flags: u5 = 0,
-
-    pub const insert_mode: u32 = 1 << 0;
-    pub const origin_mode: u32 = 1 << 1;
-    pub const auto_wrap: u32 = 1 << 2;
-    pub const application_cursor_keys: u32 = 1 << 3;
-    pub const focus_reporting: u32 = 1 << 4;
-    pub const bracketed_paste: u32 = 1 << 5;
-
-    pub fn eql(self: TerminalModes, other: TerminalModes) bool {
-        return self.mode_flags == other.mode_flags and
-            self.mouse_tracking == other.mouse_tracking and
-            self.mouse_sgr == other.mouse_sgr and
-            self.kitty_keyboard_flags == other.kitty_keyboard_flags;
-    }
-};
+pub const TerminalModes = tty.TerminalModes;
 
 pub const DefaultColors = struct {
     foreground_color: u32 = CellAttrs.default_color,
@@ -122,6 +127,12 @@ pub const DefaultColors = struct {
         return self.foreground_color == other.foreground_color and
             self.background_color == other.background_color;
     }
+};
+
+const DynamicColorReport = struct {
+    dynamic: ghostty_vt.color.Dynamic,
+    rgb: ghostty_vt.color.RGB,
+    terminator: ghostty_vt.osc.Terminator,
 };
 
 pub const RenderedScreen = struct {
@@ -134,10 +145,7 @@ pub const RenderedScreen = struct {
     default_colors: DefaultColors,
     default_colors_dirty: bool,
     retained_scrollback_clear_dirty: bool,
-    cursor_row: u16,
-    cursor_col: u16,
-    cursor_visible: bool,
-    cursor_style: u8,
+    cursor: tty.CursorState,
     modes: TerminalModes,
     dirty_state: DirtyState,
     active_screen_changed: bool,
@@ -176,10 +184,7 @@ pub const SessionTerminal = struct {
     pending_input_responses: std.ArrayList(u8) = .empty,
     rendered_row_count: u16 = 0,
     rendered_active_screen: u8 = 0,
-    rendered_cursor_row: u16 = 0,
-    rendered_cursor_col: u16 = 0,
-    rendered_cursor_visible: bool = true,
-    rendered_cursor_style: u8 = 0,
+    rendered_cursor: tty.CursorState = .{},
     rendered_modes: TerminalModes = .{},
     rendered_default_colors: DefaultColors = .{},
     query_default_colors: DefaultColors = .{},
@@ -193,25 +198,26 @@ pub const SessionTerminal = struct {
     render_barrier_callback: ?RenderBarrierCallback = null,
     render_barrier_seen: bool = false,
 
-    pub fn create(allocator: std.mem.Allocator, rows: u16, cols: u16, scrollback_rows: u32) !*SessionTerminal {
-        return createWithDefaultColors(allocator, rows, cols, scrollback_rows, .{});
-    }
-
-    pub fn createWithDefaultColors(
+    pub const CreateOptions = struct {
         allocator: std.mem.Allocator,
-        rows: u16,
-        cols: u16,
+        size: tty.WindowSize,
         scrollback_rows: u32,
-        query_default_colors: DefaultColors,
-    ) !*SessionTerminal {
+        query_default_colors: DefaultColors = .{},
+    };
+
+    pub fn create(options: CreateOptions) !*SessionTerminal {
+        const allocator = options.allocator;
+        const size = options.size;
+        const scrollback_rows = options.scrollback_rows;
+        const query_default_colors = options.query_default_colors;
         const self = try allocator.create(SessionTerminal);
         errdefer allocator.destroy(self);
 
         self.allocator = allocator;
         self.terminal = try .init(allocator, .{
-            .cols = cols,
-            .rows = rows,
-            .max_scrollback = scrollbackByteLimit(scrollback_rows, cols),
+            .cols = size.cols,
+            .rows = size.rows,
+            .max_scrollback = scrollbackByteLimit(scrollback_rows, size.cols),
             // Match Ghostty's Unicode grapheme-width default; bare
             // libghostty-vt leaves mode 2027 off unless the embedder enables it.
             .default_modes = .{ .grapheme_cluster = true },
@@ -232,10 +238,7 @@ pub const SessionTerminal = struct {
         self.pending_input_responses = .empty;
         self.rendered_row_count = 0;
         self.rendered_active_screen = 0;
-        self.rendered_cursor_row = 0;
-        self.rendered_cursor_col = 0;
-        self.rendered_cursor_visible = true;
-        self.rendered_cursor_style = 0;
+        self.rendered_cursor = .{};
         self.rendered_modes = .{};
         self.rendered_default_colors = .{};
         self.query_default_colors = query_default_colors;
@@ -269,22 +272,20 @@ pub const SessionTerminal = struct {
 
     pub fn feedWithRenderBarriers(
         self: *SessionTerminal,
-        bytes: []const u8,
-        context: *anyopaque,
-        callback: RenderBarrierCallback,
+        request: FeedWithRenderBarriersRequest,
     ) !bool {
         std.debug.assert(self.render_barrier_context == null);
         std.debug.assert(self.render_barrier_callback == null);
 
-        self.render_barrier_context = context;
-        self.render_barrier_callback = callback;
+        self.render_barrier_context = request.context;
+        self.render_barrier_callback = request.callback;
         self.render_barrier_seen = false;
         defer {
             self.render_barrier_context = null;
             self.render_barrier_callback = null;
         }
 
-        try self.stream.nextSlice(bytes);
+        try self.stream.nextSlice(request.bytes);
         return self.render_barrier_seen;
     }
 
@@ -295,7 +296,7 @@ pub const SessionTerminal = struct {
         try callback(context, self, barrier);
     }
 
-    fn renderBarrierForMode(self: *const SessionTerminal, mode: ghostty_vt.Mode, enabled: bool) ?RenderBarrier {
+    fn renderBarrierForMode(self: *const SessionTerminal, mode: ghostty_vt.Mode, transition: ModeTransition) ?RenderBarrier {
         switch (mode) {
             .alt_screen_legacy,
             .alt_screen,
@@ -304,9 +305,15 @@ pub const SessionTerminal = struct {
             else => return null,
         }
 
-        const target_active_screen: u8 = if (enabled) 1 else 0;
+        const target_active_screen: u8 = switch (transition) {
+            .set => 1,
+            .reset => 0,
+        };
         if (self.activeScreenId() == target_active_screen) return null;
-        return if (enabled) .enter_alternate_screen else .leave_alternate_screen;
+        return switch (transition) {
+            .set => .enter_alternate_screen,
+            .reset => .leave_alternate_screen,
+        };
     }
 
     pub fn isPlainTextParserBoundary(self: *const SessionTerminal) bool {
@@ -321,18 +328,18 @@ pub const SessionTerminal = struct {
         self.pending_input_responses.clearRetainingCapacity();
     }
 
-    pub fn resize(self: *SessionTerminal, rows: u16, cols: u16) !void {
-        try self.terminal.resize(self.allocator, cols, rows);
+    pub fn resize(self: *SessionTerminal, size: tty.WindowSize) !void {
+        try self.terminal.resize(self.allocator, size.cols, size.rows);
     }
 
     pub fn renderedScreen(self: *SessionTerminal, allocator: std.mem.Allocator) !RenderedScreen {
         try self.render_state.update(self.allocator, &self.terminal);
-        return try self.renderedScreenFromState(
-            allocator,
-            &self.render_state,
-            renderDirtyState(self.render_state.dirty),
-            self.rendered_active_screen != self.activeScreenId(),
-        );
+        return try self.renderedScreenFromState(.{
+            .allocator = allocator,
+            .state = &self.render_state,
+            .dirty_state = renderDirtyState(self.render_state.dirty),
+            .active_screen_changed = self.rendered_active_screen != self.activeScreenId(),
+        });
     }
 
     pub fn renderedPrimaryScreen(self: *SessionTerminal, allocator: std.mem.Allocator) !RenderedScreen {
@@ -343,16 +350,26 @@ pub const SessionTerminal = struct {
         var state: RenderState = .empty;
         defer state.deinit(self.allocator);
         try state.update(self.allocator, &self.terminal);
-        return try self.renderedScreenFromState(allocator, &state, .full, true);
+        return try self.renderedScreenFromState(.{
+            .allocator = allocator,
+            .state = &state,
+            .dirty_state = .full,
+            .active_screen_changed = true,
+        });
     }
 
-    fn renderedScreenFromState(
-        self: *SessionTerminal,
+    const RenderedScreenFromStateOptions = struct {
         allocator: std.mem.Allocator,
         state: *RenderState,
-        dirty_state_in: DirtyState,
+        dirty_state: DirtyState,
         active_screen_changed: bool,
-    ) !RenderedScreen {
+    };
+
+    fn renderedScreenFromState(self: *SessionTerminal, options: RenderedScreenFromStateOptions) !RenderedScreen {
+        const allocator = options.allocator;
+        const state = options.state;
+        const dirty_state_in = options.dirty_state;
+        const active_screen_changed = options.active_screen_changed;
         const row_data = state.row_data.slice();
         const row_pins = row_data.items(.pin);
         const row_rows = row_data.items(.raw);
@@ -379,65 +396,52 @@ pub const SessionTerminal = struct {
             };
         }
 
-        const active_screen = self.activeScreenId();
-        const cursor_row: u16 = @intCast(self.terminal.screens.active.cursor.y);
-        const cursor_col: u16 = @intCast(self.terminal.screens.active.cursor.x);
-        const cursor_visible = state.cursor.visible;
-        const cursor_style = cursorStyleValue(&self.terminal);
-        const modes = self.terminalModes();
+        const current_render_state = CurrentRenderState{
+            .active_screen = self.activeScreenId(),
+            .cursor = self.cursorState(state.cursor.visible),
+            .modes = self.terminalModes(),
+        };
 
         var dirty_state = dirty_state_in;
         if (row_count != self.rendered_row_count and dirty_state == .none) {
             dirty_state = .full;
         } else if (row_count < self.rendered_row_count and dirty_state == .partial) {
             dirty_state = .full;
-        } else if (dirty_state == .none and self.renderedStateChanged(
-            active_screen,
-            cursor_row,
-            cursor_col,
-            cursor_visible,
-            cursor_style,
-            modes,
-        )) {
+        } else if (dirty_state == .none and self.renderedStateChanged(current_render_state)) {
             dirty_state = .partial;
         }
 
         return .{
             .rows = rows,
             .cols = @intCast(self.render_state.cols),
-            .active_screen = active_screen,
+            .active_screen = current_render_state.active_screen,
             .title = self.titleSlice(),
             .title_present = self.title != null,
             .title_dirty = self.title_dirty,
             .default_colors = self.default_colors,
             .default_colors_dirty = self.default_colors_dirty,
             .retained_scrollback_clear_dirty = self.retained_scrollback_clear_dirty,
-            .cursor_row = cursor_row,
-            .cursor_col = cursor_col,
-            .cursor_visible = cursor_visible,
-            .cursor_style = cursor_style,
-            .modes = modes,
+            .cursor = current_render_state.cursor,
+            .modes = current_render_state.modes,
             .dirty_state = dirty_state,
             .active_screen_changed = active_screen_changed,
             .display_clear = self.display_clear,
         };
     }
 
+    const CurrentRenderState = struct {
+        active_screen: u8,
+        cursor: tty.CursorState,
+        modes: TerminalModes,
+    };
+
     fn renderedStateChanged(
         self: *const SessionTerminal,
-        active_screen: u8,
-        cursor_row: u16,
-        cursor_col: u16,
-        cursor_visible: bool,
-        cursor_style: u8,
-        modes: TerminalModes,
+        current: CurrentRenderState,
     ) bool {
-        return self.rendered_active_screen != active_screen or
-            self.rendered_cursor_row != cursor_row or
-            self.rendered_cursor_col != cursor_col or
-            self.rendered_cursor_visible != cursor_visible or
-            self.rendered_cursor_style != cursor_style or
-            !self.rendered_modes.eql(modes) or
+        return self.rendered_active_screen != current.active_screen or
+            !self.rendered_cursor.eql(current.cursor) or
+            !self.rendered_modes.eql(current.modes) or
             !self.rendered_default_colors.eql(self.default_colors);
     }
 
@@ -446,6 +450,26 @@ pub const SessionTerminal = struct {
             .primary => 0,
             .alternate => 1,
         };
+    }
+
+    fn cursorPosition(self: *const SessionTerminal) tty.CursorPosition {
+        return ghosttyCursorPosition(self.terminal.screens.active.cursor, tty.top_left_position);
+    }
+
+    fn cursorState(self: *const SessionTerminal, visible: bool) tty.CursorState {
+        return .{
+            .position = self.cursorPosition(),
+            .visibility = .fromBool(visible),
+            .style = cursorStyle(&self.terminal),
+        };
+    }
+
+    fn reportedCursorPosition(self: *const SessionTerminal) tty.CursorPosition {
+        if (!self.terminal.modes.get(.origin)) return self.cursorPosition();
+        return ghosttyCursorPosition(self.terminal.screens.active.cursor, .{
+            .row = self.terminal.scrolling_region.top,
+            .col = self.terminal.scrolling_region.left,
+        });
     }
 
     pub fn terminalModes(self: *const SessionTerminal) TerminalModes {
@@ -457,14 +481,14 @@ pub const SessionTerminal = struct {
         if (self.terminal.modes.get(.focus_event)) mode_flags |= TerminalModes.focus_reporting;
         if (self.terminal.modes.get(.bracketed_paste)) mode_flags |= TerminalModes.bracketed_paste;
 
-        const mouse_tracking: u8 = if (self.terminal.modes.get(.mouse_event_any))
-            3
+        const mouse_tracking: tty.MouseTracking = if (self.terminal.modes.get(.mouse_event_any))
+            .any
         else if (self.terminal.modes.get(.mouse_event_button))
-            2
+            .button
         else if (self.terminal.modes.get(.mouse_event_normal))
-            1
+            .normal
         else
-            0;
+            .disabled;
 
         return .{
             .mode_flags = mode_flags,
@@ -502,14 +526,8 @@ pub const SessionTerminal = struct {
         switch (req) {
             .operating_status => try self.queueInputResponse("\x1b[0n"),
             .cursor_position => {
-                const pos: struct { row: usize, col: usize } = if (self.terminal.modes.get(.origin)) .{
-                    .row = self.terminal.screens.active.cursor.y -| self.terminal.scrolling_region.top,
-                    .col = self.terminal.screens.active.cursor.x -| self.terminal.scrolling_region.left,
-                } else .{
-                    .row = self.terminal.screens.active.cursor.y,
-                    .col = self.terminal.screens.active.cursor.x,
-                };
-                try self.queueInputResponseFmt("\x1b[{};{}R", .{ pos.row + 1, pos.col + 1 });
+                const pos = self.reportedCursorPosition();
+                try self.queueInputResponseFmt("\x1b[{};{}R", .{ @as(usize, pos.row) + 1, @as(usize, pos.col) + 1 });
             },
             .color_scheme => {},
         }
@@ -519,15 +537,15 @@ pub const SessionTerminal = struct {
         const tag: ghostty_vt.modes.ModeTag = @bitCast(@intFromEnum(mode));
         const code: u8 = if (self.terminal.modes.get(mode)) 1 else 2;
         try self.queueInputResponseFmt("\x1b[{s}{};{}$y", .{
-            if (tag.ansi) "" else "?",
+            ModeNamespace.fromAnsiFlag(tag.ansi).prefix(),
             tag.value,
             code,
         });
     }
 
-    fn requestModeUnknown(self: *SessionTerminal, mode_raw: u16, ansi: bool) !void {
+    fn requestModeUnknown(self: *SessionTerminal, mode_raw: u16, namespace: ModeNamespace) !void {
         try self.queueInputResponseFmt("\x1b[{s}{};0$y", .{
-            if (ansi) "" else "?",
+            namespace.prefix(),
             mode_raw,
         });
     }
@@ -623,7 +641,7 @@ pub const SessionTerminal = struct {
                 stream.pos += buf.len;
                 try writer.writeByte('m');
             },
-            .decscusr => try writer.print("{} q", .{cursorStyleValue(&self.terminal)}),
+            .decscusr => try writer.print("{} q", .{@intFromEnum(cursorStyle(&self.terminal))}),
             .decstbm => try writer.print("{};{}r", .{
                 self.terminal.scrolling_region.top + 1,
                 self.terminal.scrolling_region.bottom + 1,
@@ -649,10 +667,7 @@ pub const SessionTerminal = struct {
         for (row_dirties) |*dirty| dirty.* = false;
         self.rendered_row_count = @intCast(row_count);
         self.rendered_active_screen = self.activeScreenId();
-        self.rendered_cursor_row = @intCast(self.terminal.screens.active.cursor.y);
-        self.rendered_cursor_col = @intCast(self.terminal.screens.active.cursor.x);
-        self.rendered_cursor_visible = self.render_state.cursor.visible;
-        self.rendered_cursor_style = cursorStyleValue(&self.terminal);
+        self.rendered_cursor = self.cursorState(self.render_state.cursor.visible);
         self.rendered_modes = self.terminalModes();
         self.rendered_default_colors = self.default_colors;
         self.default_colors_dirty = false;
@@ -777,12 +792,11 @@ pub const SessionTerminal = struct {
     pub fn plainSnapshot(self: *SessionTerminal, allocator: std.mem.Allocator) !PlainSnapshot {
         const text = try self.terminal.screens.active.dumpStringAlloc(allocator, .{ .active = .{} });
         return .{
-            .rows = @intCast(self.terminal.rows),
-            .cols = @intCast(self.terminal.cols),
-            .cursor_row = @intCast(self.terminal.screens.active.cursor.y),
-            .cursor_col = @intCast(self.terminal.screens.active.cursor.x),
-            .cursor_visible = self.terminal.modes.get(.cursor_visible),
-            .cursor_style = cursorStyleValue(&self.terminal),
+            .size = .{
+                .rows = @intCast(self.terminal.rows),
+                .cols = @intCast(self.terminal.cols),
+            },
+            .cursor = self.cursorState(self.terminal.modes.get(.cursor_visible)),
             .text = text,
         };
     }
@@ -880,7 +894,11 @@ pub const SessionTerminal = struct {
             else => return,
         };
         const rgb = terminalColorRgb(color) orelse ghostty_vt.color.default[7];
-        try self.queueDynamicColorReport(dynamic, rgb, terminator);
+        try self.queueDynamicColorReport(.{
+            .dynamic = dynamic,
+            .rgb = rgb,
+            .terminator = terminator,
+        });
     }
 
     fn paletteColorReport(self: *SessionTerminal, idx: u8, terminator: ghostty_vt.osc.Terminator) !void {
@@ -894,18 +912,13 @@ pub const SessionTerminal = struct {
         });
     }
 
-    fn queueDynamicColorReport(
-        self: *SessionTerminal,
-        dynamic: ghostty_vt.color.Dynamic,
-        rgb: ghostty_vt.color.RGB,
-        terminator: ghostty_vt.osc.Terminator,
-    ) !void {
+    fn queueDynamicColorReport(self: *SessionTerminal, report: DynamicColorReport) !void {
         try self.queueInputResponseFmt("\x1b]{};rgb:{x:0>2}/{x:0>2}/{x:0>2}{s}", .{
-            @intFromEnum(dynamic),
-            rgb.r,
-            rgb.g,
-            rgb.b,
-            oscTerminator(terminator),
+            @intFromEnum(report.dynamic),
+            report.rgb.r,
+            report.rgb.g,
+            report.rgb.b,
+            oscTerminator(report.terminator),
         });
     }
 
@@ -923,8 +936,7 @@ pub const SessionTerminal = struct {
         self.default_colors_dirty = true;
         self.display_clear = .{
             .mode = .complete,
-            .cursor_row = @intCast(self.terminal.screens.active.cursor.y),
-            .cursor_col = @intCast(self.terminal.screens.active.cursor.x),
+            .cursor_position = self.cursorPosition(),
             .protected = false,
         };
     }
@@ -938,17 +950,16 @@ pub const SessionTerminal = struct {
         }
         self.display_clear = .{
             .mode = mode,
-            .cursor_row = @intCast(self.terminal.screens.active.cursor.y),
-            .cursor_col = @intCast(self.terminal.screens.active.cursor.x),
+            .cursor_position = self.cursorPosition(),
             .protected = protected,
         };
     }
 
     fn captureDisplayClearRowsForSyntheticHistory(self: *SessionTerminal, mode: DisplayClearMode) !void {
         // This callback runs before Ghostty applies the screen clear. Use a
-        // temporary snapshot for the rows we copy to scrollback; advancing
-        // self.render_state here would make the later draw think the old rows
-        // were already rendered after the clear.
+        // throwaway snapshot for the rows we copy to scrollback; advancing
+        // self.render_state here would make the later draw think the pre-clear
+        // rows were already rendered after the clear.
         var state: RenderState = .empty;
         defer state.deinit(self.allocator);
         try state.update(self.allocator, &self.terminal);
@@ -958,15 +969,14 @@ pub const SessionTerminal = struct {
         const row_rows = row_data.items(.raw);
         const row_cells = row_data.items(.cells);
         const row_count = trimmedRowCount(row_cells);
-        const cursor_row: usize = @intCast(self.terminal.screens.active.cursor.y);
-        const cursor_col: usize = @intCast(self.terminal.screens.active.cursor.x);
+        const cursor_position = self.cursorPosition();
         const start_row = switch (mode) {
             .above => return,
             .complete => 0,
-            .below => if (cursor_col == 0)
-                @min(cursor_row, row_count)
+            .below => if (cursor_position.col == 0)
+                @min(cursor_position.row, row_count)
             else
-                @min(cursor_row + 1, row_count),
+                @min(cursor_position.row + 1, row_count),
         };
         var row_index: usize = start_row;
         while (row_index < row_count) : (row_index += 1) {
@@ -1075,8 +1085,6 @@ pub const SessionTerminal = struct {
 
     fn syntheticRedrawSuffixStart(self: *SessionTerminal, start: usize) !usize {
         const row_data = self.render_state.row_data.slice();
-        const row_pins = row_data.items(.pin);
-        const row_rows = row_data.items(.raw);
         const row_cells = row_data.items(.cells);
         const active_row_count = trimmedRowCount(row_cells);
         const synthetic_rows = self.synthetic_history_rows.items;
@@ -1087,17 +1095,25 @@ pub const SessionTerminal = struct {
         while (match_count < max_match) : (match_count += 1) {
             const synthetic_index = synthetic_rows.len - match_count - 1;
             const active_index = max_match - match_count - 1;
-            if (!try renderedRowIsPrefixOfState(
-                self.allocator,
-                synthetic_rows[synthetic_index],
-                row_cells[active_index],
-                row_pins[active_index],
-                row_rows[active_index],
-                @intCast(self.render_state.cols),
-            )) break;
+            if (!try self.renderedRowIsPrefixOfActiveRow(synthetic_rows[synthetic_index], active_index)) break;
         }
 
         return synthetic_rows.len - match_count;
+    }
+
+    fn renderedRowIsPrefixOfActiveRow(self: *SessionTerminal, expected: RenderedRow, active_index: usize) !bool {
+        const row_data = self.render_state.row_data.slice();
+        const row_pins = row_data.items(.pin);
+        const row_rows = row_data.items(.raw);
+        const row_cells = row_data.items(.cells);
+        const width_cols: u16 = @intCast(self.render_state.cols);
+        if (expected.width_cols != width_cols or expected.flags != rowFlags(row_rows[active_index])) return false;
+        const actual_cells = try rowCellsAlloc(self.allocator, row_cells[active_index], row_pins[active_index]);
+        defer {
+            for (actual_cells) |cell| cell.deinit(self.allocator);
+            if (actual_cells.len > 0) self.allocator.free(actual_cells);
+        }
+        return renderedCellsArePrefix(expected.cells, actual_cells);
     }
 };
 
@@ -1115,10 +1131,10 @@ const ModelTrackingHandler = struct {
         value: ghostty_vt.StreamAction.Value(action),
     ) !void {
         switch (action) {
-            .set_mode => if (self.session.renderBarrierForMode(value.mode, true)) |barrier| {
+            .set_mode => if (self.session.renderBarrierForMode(value.mode, .set)) |barrier| {
                 try self.session.emitRenderBarrier(barrier);
             },
-            .reset_mode => if (self.session.renderBarrierForMode(value.mode, false)) |barrier| {
+            .reset_mode => if (self.session.renderBarrierForMode(value.mode, .reset)) |barrier| {
                 try self.session.emitRenderBarrier(barrier);
             },
             else => {},
@@ -1134,7 +1150,7 @@ const ModelTrackingHandler = struct {
             .device_attributes => try self.session.deviceAttributes(value),
             .device_status => try self.session.deviceStatusReport(value.request),
             .request_mode => try self.session.requestMode(value.mode),
-            .request_mode_unknown => try self.session.requestModeUnknown(value.mode, value.ansi),
+            .request_mode_unknown => try self.session.requestModeUnknown(value.mode, ModeNamespace.fromAnsiFlag(value.ansi)),
             .kitty_keyboard_query => try self.session.kittyKeyboardQuery(),
             .size_report => try self.session.sizeReport(value),
             .xtversion => try self.session.reportXtversion(),
@@ -1243,51 +1259,6 @@ fn cloneRowAlloc(allocator: std.mem.Allocator, row: RenderedRow) !RenderedRow {
         .flags = row.flags,
         .dirty = row.dirty,
     };
-}
-
-fn renderedRowMatchesState(
-    allocator: std.mem.Allocator,
-    expected: RenderedRow,
-    cells: std.MultiArrayList(RenderState.Cell),
-    pin: ghostty_vt.Pin,
-    raw_row: anytype,
-    width_cols: u16,
-) !bool {
-    if (expected.width_cols != width_cols or expected.flags != rowFlags(raw_row)) return false;
-    const actual_cells = try rowCellsAlloc(allocator, cells, pin);
-    defer {
-        for (actual_cells) |cell| cell.deinit(allocator);
-        if (actual_cells.len > 0) allocator.free(actual_cells);
-    }
-    return renderedCellsEqual(expected.cells, actual_cells);
-}
-
-fn renderedCellsEqual(a: []const RenderedCell, b: []const RenderedCell) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| {
-        if (!std.mem.eql(u8, left.text, right.text)) return false;
-        if (left.display_width != right.display_width) return false;
-        if (!left.attrs.eql(right.attrs)) return false;
-        if (!optionalStringEqual(left.hyperlink, right.hyperlink)) return false;
-    }
-    return true;
-}
-
-fn renderedRowIsPrefixOfState(
-    allocator: std.mem.Allocator,
-    expected: RenderedRow,
-    cells: std.MultiArrayList(RenderState.Cell),
-    pin: ghostty_vt.Pin,
-    raw_row: anytype,
-    width_cols: u16,
-) !bool {
-    if (expected.width_cols != width_cols or expected.flags != rowFlags(raw_row)) return false;
-    const actual_cells = try rowCellsAlloc(allocator, cells, pin);
-    defer {
-        for (actual_cells) |cell| cell.deinit(allocator);
-        if (actual_cells.len > 0) allocator.free(actual_cells);
-    }
-    return renderedCellsArePrefix(expected.cells, actual_cells);
 }
 
 fn renderedCellsArePrefix(prefix: []const RenderedCell, full: []const RenderedCell) bool {
@@ -1474,6 +1445,13 @@ fn oscTerminator(terminator: ghostty_vt.osc.Terminator) []const u8 {
     };
 }
 
+fn ghosttyCursorPosition(cursor: ghostty_vt.Cursor, origin: tty.Position) tty.CursorPosition {
+    return .{
+        .row = @intCast(cursor.y -| origin.row),
+        .col = @intCast(cursor.x -| origin.col),
+    };
+}
+
 fn hyperlinkUriAlloc(allocator: std.mem.Allocator, pin: ghostty_vt.Pin, x: usize) !?[]const u8 {
     const page = &pin.node.data;
     const rac = page.getRowAndCell(x, pin.y);
@@ -1489,16 +1467,16 @@ fn appendCodepoint(result: *std.ArrayList(u8), allocator: std.mem.Allocator, cp:
     try result.appendSlice(allocator, buf[0..len]);
 }
 
-fn cursorStyleValue(terminal: *const Terminal) u8 {
+fn cursorStyle(terminal: *const Terminal) tty.CursorStyle {
     const blinking = terminal.modes.get(.cursor_blinking);
     return switch (terminal.screens.active.cursor.cursor_style) {
-        .block, .block_hollow => if (blinking) 1 else 2,
-        .underline => if (blinking) 3 else 4,
-        .bar => if (blinking) 5 else 6,
+        .block, .block_hollow => if (blinking) .blinking_block else .steady_block,
+        .underline => if (blinking) .blinking_underline else .steady_underline,
+        .bar => if (blinking) .blinking_bar else .steady_bar,
     };
 }
 
-pub fn smokePlainString(allocator: std.mem.Allocator) ![]const u8 {
+fn smokePlainString(allocator: std.mem.Allocator) ![]const u8 {
     var terminal: Terminal = try .init(allocator, .{
         .cols = 6,
         .rows = 4,
@@ -1518,7 +1496,7 @@ test "libghostty-vt accepts bytes and exposes terminal text" {
 }
 
 test "session terminal parses VT streams" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("alpha\r\n\x1b[2;1Hbeta");
@@ -1527,37 +1505,19 @@ test "session terminal parses VT streams" {
 
     try std.testing.expect(std.mem.indexOf(u8, snapshot.text, "alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.text, "beta") != null);
-    try std.testing.expectEqual(@as(u16, 1), snapshot.cursor_row);
-}
-
-const TestRenderBarrierContext = struct {
-    count: usize = 0,
-    barrier: ?RenderBarrier = null,
-    active_screen_before_barrier: ?u8 = null,
-    saw_primary_before_barrier: bool = false,
-};
-
-fn testRenderBarrierCallback(context: *anyopaque, terminal: *SessionTerminal, barrier: RenderBarrier) anyerror!void {
-    const barrier_context: *TestRenderBarrierContext = @ptrCast(@alignCast(context));
-    const snapshot = try terminal.plainSnapshot(std.testing.allocator);
-    defer std.testing.allocator.free(snapshot.text);
-
-    barrier_context.count += 1;
-    barrier_context.barrier = barrier;
-    barrier_context.active_screen_before_barrier = terminal.activeScreenId();
-    barrier_context.saw_primary_before_barrier = std.mem.indexOf(u8, snapshot.text, "primary") != null;
+    try std.testing.expectEqual(@as(u16, 1), snapshot.cursor.position.row);
 }
 
 test "render barrier fires before alternate screen mode mutates the model" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
-    var context = TestRenderBarrierContext{};
-    const saw_barrier = try terminal.feedWithRenderBarriers(
-        "primary\x1b[?1049halt",
-        &context,
-        testRenderBarrierCallback,
-    );
+    var context = testing.RenderBarrierContext{};
+    const saw_barrier = try terminal.feedWithRenderBarriers(.{
+        .bytes = "primary\x1b[?1049halt",
+        .context = &context,
+        .callback = testing.renderBarrierCallback,
+    });
 
     try std.testing.expect(saw_barrier);
     try std.testing.expectEqual(@as(usize, 1), context.count);
@@ -1571,8 +1531,43 @@ test "render barrier fires before alternate screen mode mutates the model" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot.text, "alt") != null);
 }
 
+const testing = if (builtin.is_test) struct {
+    const default_terminal_size = tty.WindowSize{ .rows = 4, .cols = 20 };
+    const default_scrollback_rows: u32 = 100;
+
+    const RenderBarrierContext = struct {
+        count: usize = 0,
+        barrier: ?RenderBarrier = null,
+        active_screen_before_barrier: ?u8 = null,
+        saw_primary_before_barrier: bool = false,
+    };
+
+    fn createDefaultTerminal() !*SessionTerminal {
+        return createTerminal(default_terminal_size, default_scrollback_rows);
+    }
+
+    fn createTerminal(size: tty.WindowSize, scrollback_rows: u32) !*SessionTerminal {
+        return SessionTerminal.create(.{
+            .allocator = std.testing.allocator,
+            .size = size,
+            .scrollback_rows = scrollback_rows,
+        });
+    }
+
+    fn renderBarrierCallback(context: *anyopaque, terminal: *SessionTerminal, barrier: RenderBarrier) anyerror!void {
+        const barrier_context: *RenderBarrierContext = @ptrCast(@alignCast(context));
+        const snapshot = try terminal.plainSnapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot.text);
+
+        barrier_context.count += 1;
+        barrier_context.barrier = barrier;
+        barrier_context.active_screen_before_barrier = terminal.activeScreenId();
+        barrier_context.saw_primary_before_barrier = std.mem.indexOf(u8, snapshot.text, "primary") != null;
+    }
+} else struct {};
+
 test "plain text parser boundary is false inside split CSI" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try std.testing.expect(terminal.isPlainTextParserBoundary());
@@ -1583,7 +1578,7 @@ test "plain text parser boundary is false inside split CSI" {
 }
 
 test "plain text parser boundary is false after bare ESC" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try std.testing.expect(terminal.isPlainTextParserBoundary());
@@ -1594,7 +1589,7 @@ test "plain text parser boundary is false after bare ESC" {
 }
 
 test "blank active screen has no plain text rows" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     const snapshot = try terminal.plainSnapshot(std.testing.allocator);
@@ -1604,7 +1599,7 @@ test "blank active screen has no plain text rows" {
 }
 
 test "cleared active screen has no plain text rows" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("hello\r\nworld\x1b[2J\x1b[H");
@@ -1615,7 +1610,7 @@ test "cleared active screen has no plain text rows" {
 }
 
 test "leading blank row is preserved in plain snapshot" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\r\nPROMPT");
@@ -1626,7 +1621,7 @@ test "leading blank row is preserved in plain snapshot" {
 }
 
 test "rendered screen exposes cell style colors" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b[1;31;44mX");
@@ -1643,7 +1638,7 @@ test "rendered screen exposes cell style colors" {
 }
 
 test "rendered screen preserves background-only cells" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b[44m\x1b[2K");
@@ -1659,7 +1654,7 @@ test "rendered screen preserves background-only cells" {
 }
 
 test "rendered screen exposes OSC 8 hyperlinks" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b]8;;https://example.test/\x1b\\L\x1b]8;;\x1b\\");
@@ -1673,25 +1668,25 @@ test "rendered screen exposes OSC 8 hyperlinks" {
 }
 
 test "session terminal enables unicode grapheme clustering" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("🇺🇸X");
     var flag_screen = try terminal.renderedScreen(std.testing.allocator);
     defer flag_screen.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 3), flag_screen.cursor_col);
+    try std.testing.expectEqual(@as(u16, 3), flag_screen.cursor.position.col);
 
-    const zwj_terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const zwj_terminal = try testing.createDefaultTerminal();
     defer zwj_terminal.destroy();
 
     try zwj_terminal.feed("👩‍💻X");
     var zwj_screen = try zwj_terminal.renderedScreen(std.testing.allocator);
     defer zwj_screen.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 3), zwj_screen.cursor_col);
+    try std.testing.expectEqual(@as(u16, 3), zwj_screen.cursor.position.col);
 }
 
 test "rendered screen exposes active screen" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("primary");
@@ -1706,7 +1701,7 @@ test "rendered screen exposes active screen" {
 }
 
 test "rendered screen exposes terminal modes" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b[?1;1003;1004;1006;2004h\x1b[>7u");
@@ -1716,13 +1711,13 @@ test "rendered screen exposes terminal modes" {
     try std.testing.expect((screen.modes.mode_flags & TerminalModes.application_cursor_keys) != 0);
     try std.testing.expect((screen.modes.mode_flags & TerminalModes.focus_reporting) != 0);
     try std.testing.expect((screen.modes.mode_flags & TerminalModes.bracketed_paste) != 0);
-    try std.testing.expectEqual(@as(u8, 3), screen.modes.mouse_tracking);
+    try std.testing.expectEqual(tty.MouseTracking.any, screen.modes.mouse_tracking);
     try std.testing.expect(screen.modes.mouse_sgr);
     try std.testing.expectEqual(@as(u5, 7), screen.modes.kitty_keyboard_flags);
 }
 
 test "session terminal answers kitty keyboard query from current flags" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b[>7u\x1b[?u");
@@ -1732,7 +1727,7 @@ test "session terminal answers kitty keyboard query from current flags" {
 }
 
 test "session terminal exposes synchronized output mode" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try std.testing.expect(!terminal.synchronizedOutputActive());
@@ -1743,7 +1738,7 @@ test "session terminal exposes synchronized output mode" {
 }
 
 test "session terminal answers basic terminal queries to the PTY" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b[3;5H\x1b[6n\x1b[5n\x1b[c\x1b[?7$p");
@@ -1756,9 +1751,14 @@ test "session terminal answers basic terminal queries to the PTY" {
 }
 
 test "session terminal answers complex UI startup probes to the PTY" {
-    const terminal = try SessionTerminal.createWithDefaultColors(std.testing.allocator, 24, 80, 100, .{
-        .foreground_color = 0x010a0b0c,
-        .background_color = 0x010d0e0f,
+    const terminal = try SessionTerminal.create(.{
+        .allocator = std.testing.allocator,
+        .size = .{ .rows = 24, .cols = 80 },
+        .scrollback_rows = 100,
+        .query_default_colors = .{
+            .foreground_color = 0x010a0b0c,
+            .background_color = 0x010d0e0f,
+        },
     });
     defer terminal.destroy();
 
@@ -1793,8 +1793,8 @@ test "session terminal answers complex UI startup probes to the PTY" {
     try std.testing.expect(std.mem.indexOf(u8, responses, "\x1bP1$r0m\x1b\\") != null);
 }
 
-test "session terminal can drain query responses after remote terminal process writes them" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+test "session terminal can drain query responses after terminal worker writes them" {
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b[6n");
@@ -1804,7 +1804,7 @@ test "session terminal can drain query responses after remote terminal process w
 }
 
 test "rendered screen exposes OSC title changes" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b]2;sessh-title-one\x1b\\");
@@ -1823,7 +1823,7 @@ test "rendered screen exposes OSC title changes" {
 }
 
 test "rendered screen distinguishes absent title from empty app title" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     var absent = try terminal.renderedScreen(std.testing.allocator);
@@ -1840,7 +1840,7 @@ test "rendered screen distinguishes absent title from empty app title" {
 }
 
 test "rendered screen exposes OSC 10 and OSC 11 default colors" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b]10;rgb:01/02/03\x1b\\");
@@ -1872,9 +1872,14 @@ test "rendered screen exposes OSC 10 and OSC 11 default colors" {
 }
 
 test "OSC 10 and OSC 11 queries use client-seeded defaults before inner overrides" {
-    const terminal = try SessionTerminal.createWithDefaultColors(std.testing.allocator, 4, 20, 100, .{
-        .foreground_color = 0x010a0b0c,
-        .background_color = 0x010d0e0f,
+    const terminal = try SessionTerminal.create(.{
+        .allocator = std.testing.allocator,
+        .size = .{ .rows = 4, .cols = 20 },
+        .scrollback_rows = 100,
+        .query_default_colors = .{
+            .foreground_color = 0x010a0b0c,
+            .background_color = 0x010d0e0f,
+        },
     });
     defer terminal.destroy();
 
@@ -1902,7 +1907,7 @@ test "OSC 10 and OSC 11 queries use client-seeded defaults before inner override
 }
 
 test "title tracking handles split OSC title sequences" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b]2;sessh-");
@@ -1916,7 +1921,7 @@ test "title tracking handles split OSC title sequences" {
 }
 
 test "scrollback snapshot exposes retained history rows" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 3, 20, 20);
+    const terminal = try testing.createTerminal(.{ .rows = 3, .cols = 20 }, 20);
     defer terminal.destroy();
 
     try terminal.feed("history_01\r\nhistory_02\r\nhistory_03\r\nhistory_04\r\nhistory_05\r\n");
@@ -1935,7 +1940,7 @@ test "scrollback snapshot exposes retained history rows" {
 }
 
 test "scrollback snapshot reports absolute count past retained row limit" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 3, 20, 5);
+    const terminal = try testing.createTerminal(.{ .rows = 3, .cols = 20 }, 5);
     defer terminal.destroy();
 
     var i: usize = 1;
@@ -1957,7 +1962,7 @@ test "scrollback snapshot reports absolute count past retained row limit" {
 }
 
 test "clear screen followed by output commits overflow rows to scrollback" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b[2J\x1b[H");
@@ -1982,7 +1987,7 @@ test "clear screen followed by output commits overflow rows to scrollback" {
 }
 
 test "full reset clears retained and synthetic scrollback" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 100);
+    const terminal = try testing.createDefaultTerminal();
     defer terminal.destroy();
 
     try terminal.feed("\x1b[2J\x1b[HMAIN_SCREEN_MARKER\x1bcREPORT\r\n");
@@ -2005,7 +2010,7 @@ test "full reset clears retained and synthetic scrollback" {
 }
 
 test "synthetic scrollback is consumed by real scrollback growth" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 3, 20, 20);
+    const terminal = try testing.createTerminal(.{ .rows = 3, .cols = 20 }, 20);
     defer terminal.destroy();
 
     try terminal.feed("old_1\r\nold_2\r\nold_3\x1b[H\x1b[2J");
@@ -2022,7 +2027,7 @@ test "synthetic scrollback is consumed by real scrollback growth" {
 }
 
 test "display clear after rendered rows does not create synthetic scrollback" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 4, 20, 20);
+    const terminal = try testing.createTerminal(.{ .rows = 4, .cols = 20 }, 20);
     defer terminal.destroy();
 
     try terminal.feed("old_1\r\nold_2");
@@ -2044,7 +2049,7 @@ test "display clear after rendered rows does not create synthetic scrollback" {
 }
 
 test "scrollback delta tolerates reset terminal history with pending synthetic rows" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 3, 20, 20);
+    const terminal = try testing.createTerminal(.{ .rows = 3, .cols = 20 }, 20);
     defer terminal.destroy();
 
     const cells = try std.testing.allocator.alloc(RenderedCell, 1);
@@ -2067,7 +2072,7 @@ test "scrollback delta tolerates reset terminal history with pending synthetic r
 }
 
 test "rendered screen exposes retained scrollback clears" {
-    const terminal = try SessionTerminal.create(std.testing.allocator, 3, 20, 20);
+    const terminal = try testing.createTerminal(.{ .rows = 3, .cols = 20 }, 20);
     defer terminal.destroy();
 
     try terminal.feed("history_01\r\nhistory_02\r\nhistory_03\r\nhistory_04\r\nhistory_05\r\n");

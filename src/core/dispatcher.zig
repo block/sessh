@@ -39,6 +39,12 @@ pub const FdWatch = struct {
     events: FdEvents,
 };
 
+pub const FdWatchRequest = struct {
+    fd: c.fd_t,
+    events: FdEvents,
+    handler: Handler,
+};
+
 pub const TimerWatch = struct {
     deadline_ms: u64,
 };
@@ -67,9 +73,15 @@ pub const Event = union(enum) {
     timer: TimerEvent,
 };
 
+pub const HandlerEvent = struct {
+    dispatcher: *Dispatcher,
+    id: WatchId,
+    event: Event,
+};
+
 pub const Handler = struct {
     ctx: *anyopaque,
-    callback: *const fn (*anyopaque, *Dispatcher, WatchId, Event) anyerror!void,
+    callback: *const fn (*anyopaque, HandlerEvent) anyerror!void,
 };
 
 const FdWatchSlot = struct {
@@ -131,17 +143,16 @@ pub const Dispatcher = struct {
 
     pub fn watch(self: *Dispatcher, source: WatchSource, handler: Handler) !WatchId {
         return switch (source) {
-            .fd => |fd_watch| .{ .fd = try self.watchFd(fd_watch.fd, fd_watch.events, handler) },
+            .fd => |fd_watch| .{ .fd = try self.watchFd(.{
+                .fd = fd_watch.fd,
+                .events = fd_watch.events,
+                .handler = handler,
+            }) },
             .timer => |timer| .{ .timer = try self.watchTimerAt(timer.deadline_ms, handler) },
         };
     }
 
-    pub fn watchFd(
-        self: *Dispatcher,
-        fd: c.fd_t,
-        events: FdEvents,
-        handler: Handler,
-    ) !FdWatchId {
+    pub fn watchFd(self: *Dispatcher, request: FdWatchRequest) !FdWatchId {
         const reused = self.free_fd_watches.items.len != 0;
         const index = if (reused) self.free_fd_watches.items[self.free_fd_watches.items.len - 1] else self.fd_watches.items.len;
         if (!reused) {
@@ -160,13 +171,13 @@ pub const Dispatcher = struct {
         self.fd_watches.items[index] = .{
             .generation = generation,
             .active = true,
-            .fd = fd,
-            .events = events,
-            .handler = handler,
+            .fd = request.fd,
+            .events = request.events,
+            .handler = request.handler,
         };
         self.pollfds.items[index] = .{
-            .fd = fd,
-            .events = pollEvents(events),
+            .fd = request.fd,
+            .events = pollEvents(request.events),
             .revents = 0,
         };
         self.active_count += 1;
@@ -300,7 +311,11 @@ pub const Dispatcher = struct {
         var dispatched: usize = 0;
         for (self.pending_events.items) |pending_event| {
             const handler = self.handlerForId(pending_event.id) orelse continue;
-            try handler.callback(handler.ctx, self, pending_event.id, pending_event.event);
+            try handler.callback(handler.ctx, .{
+                .dispatcher = self,
+                .id = pending_event.id,
+                .event = pending_event.event,
+            });
             switch (pending_event.event) {
                 .timer => self.cancel(pending_event.id),
                 .fd => {},
@@ -514,7 +529,10 @@ test "dispatcher fires timer watch" {
     const Context = struct {
         fired: bool = false,
 
-        fn onTimer(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+        fn onTimer(ctx: *anyopaque, handler_event: HandlerEvent) !void {
+            const dispatcher = handler_event.dispatcher;
+            const id = handler_event.id;
+            const event = handler_event.event;
             _ = id;
             const self: *@This() = @ptrCast(@alignCast(ctx));
             switch (event) {
@@ -538,7 +556,10 @@ test "dispatcher dispatches fd readability and supports cancellation" {
         fd: c.fd_t,
         read_byte: u8 = 0,
 
-        fn onReadable(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+        fn onReadable(ctx: *anyopaque, handler_event: HandlerEvent) !void {
+            const dispatcher = handler_event.dispatcher;
+            const id = handler_event.id;
+            const event = handler_event.event;
             const self: *@This() = @ptrCast(@alignCast(ctx));
             switch (event) {
                 .fd => |fd_event| {
@@ -562,7 +583,11 @@ test "dispatcher dispatches fd readability and supports cancellation" {
     var dispatcher = try Dispatcher.init(std.testing.allocator);
     defer dispatcher.deinit();
     var context = Context{ .fd = fds[0] };
-    _ = try dispatcher.watchFd(fds[0], .{ .readable = true }, .{ .ctx = &context, .callback = Context.onReadable });
+    _ = try dispatcher.watchFd(.{
+        .fd = fds[0],
+        .events = .{ .readable = true },
+        .handler = .{ .ctx = &context, .callback = Context.onReadable },
+    });
     try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], "x"));
     try dispatcher.run();
     try std.testing.expectEqual(@as(u8, 'x'), context.read_byte);
@@ -573,7 +598,10 @@ test "dispatcher dispatches fd readability and supports cancellation" {
 
 test "dispatcher fd watch slots are reused and stale ids are rejected" {
     const Context = struct {
-        fn onReadable(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+        fn onReadable(ctx: *anyopaque, handler_event: HandlerEvent) !void {
+            const dispatcher = handler_event.dispatcher;
+            const id = handler_event.id;
+            const event = handler_event.event;
             _ = ctx;
             _ = dispatcher;
             _ = id;
@@ -589,9 +617,17 @@ test "dispatcher fd watch slots are reused and stale ids are rejected" {
     defer dispatcher.deinit();
     var context = Context{};
 
-    const old_id = try dispatcher.watchFd(fds[0], .{}, .{ .ctx = &context, .callback = Context.onReadable });
+    const old_id = try dispatcher.watchFd(.{
+        .fd = fds[0],
+        .events = .{},
+        .handler = .{ .ctx = &context, .callback = Context.onReadable },
+    });
     dispatcher.cancel(.{ .fd = old_id });
-    const new_id = try dispatcher.watchFd(fds[0], .{}, .{ .ctx = &context, .callback = Context.onReadable });
+    const new_id = try dispatcher.watchFd(.{
+        .fd = fds[0],
+        .events = .{},
+        .handler = .{ .ctx = &context, .callback = Context.onReadable },
+    });
 
     try std.testing.expectEqual(old_id.index, new_id.index);
     try std.testing.expect(old_id.generation != new_id.generation);
@@ -607,7 +643,10 @@ test "dispatcher rotates ready fd dispatch order" {
         fds: [3]c.fd_t,
         seen: std.ArrayList(u8) = .empty,
 
-        fn onReadable(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+        fn onReadable(ctx: *anyopaque, handler_event: HandlerEvent) !void {
+            const dispatcher = handler_event.dispatcher;
+            const id = handler_event.id;
+            const event = handler_event.event;
             _ = dispatcher;
             _ = id;
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -643,7 +682,11 @@ test "dispatcher rotates ready fd dispatch order" {
     defer context.seen.deinit(std.testing.allocator);
 
     for (context.fds) |fd| {
-        _ = try dispatcher.watchFd(fd, .{ .readable = true }, .{ .ctx = &context, .callback = Context.onReadable });
+        _ = try dispatcher.watchFd(.{
+            .fd = fd,
+            .events = .{ .readable = true },
+            .handler = .{ .ctx = &context, .callback = Context.onReadable },
+        });
     }
 
     try std.testing.expectEqual(@as(usize, 3), try dispatcher.runOnce());
@@ -662,7 +705,10 @@ test "dispatcher timer heap fires earliest timer first without scanning pollfds"
     const Context = struct {
         fired: std.ArrayList(u8) = .empty,
 
-        fn onTimer(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+        fn onTimer(ctx: *anyopaque, handler_event: HandlerEvent) !void {
+            const dispatcher = handler_event.dispatcher;
+            const id = handler_event.id;
+            const event = handler_event.event;
             _ = id;
             const self: *@This() = @ptrCast(@alignCast(ctx));
             switch (event) {
@@ -692,7 +738,10 @@ test "dispatcher timer cancellation removes heap entry and rejects stale ids" {
     const Context = struct {
         fired: bool = false,
 
-        fn onTimer(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+        fn onTimer(ctx: *anyopaque, handler_event: HandlerEvent) !void {
+            const dispatcher = handler_event.dispatcher;
+            const id = handler_event.id;
+            const event = handler_event.event;
             _ = dispatcher;
             _ = id;
             _ = event;
@@ -725,7 +774,10 @@ test "dispatcher cancelled timer does not fire" {
     const Context = struct {
         fired: bool = false,
 
-        fn onTimer(ctx: *anyopaque, dispatcher: *Dispatcher, id: WatchId, event: Event) !void {
+        fn onTimer(ctx: *anyopaque, handler_event: HandlerEvent) !void {
+            const dispatcher = handler_event.dispatcher;
+            const id = handler_event.id;
+            const event = handler_event.event;
             _ = dispatcher;
             _ = id;
             _ = event;

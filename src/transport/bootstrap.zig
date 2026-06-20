@@ -6,13 +6,12 @@ const posix = std.posix;
 const client_ui = @import("../session/client_ui.zig");
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
-const remote_shell = @import("remote_shell.zig");
 
 const max_artifact_bytes = 64 * 1024 * 1024;
 const max_artifact_manifest_bytes = 16 * 1024;
 const artifact_manifest_filename = "artifacts.manifest";
 
-pub const ReconnectIoContext = struct {
+const ReconnectIoContext = struct {
     reconnect_ui: ?*client_ui.ReconnectUi = null,
     poll_reconnect_input: bool = false,
 
@@ -33,67 +32,6 @@ pub const ArtifactSet = struct {
         for (self.entries) |*entry| entry.deinit(self.allocator);
         self.allocator.free(self.entries);
         self.* = undefined;
-    }
-
-    pub fn sendExec(
-        self: *const ArtifactSet,
-        fd: c.fd_t,
-        entrypoint: remote_shell.Entrypoint,
-        entrypoint_args: []const []const u8,
-        reconnect_io: ReconnectIoContext,
-    ) !void {
-        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_io);
-        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_io);
-        for (self.entries) |entry| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_io);
-            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_io);
-        }
-        try writeAllMaybeCancellable(fd, " --", reconnect_io);
-        try writeAllMaybeCancellable(fd, " ", reconnect_io);
-        try writeAllMaybeCancellable(fd, entrypoint.arg(), reconnect_io);
-        for (entrypoint_args) |arg| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_io);
-            try self.writeExecArg(fd, arg, reconnect_io);
-        }
-        try writeAllMaybeCancellable(fd, "\n", reconnect_io);
-    }
-
-    pub fn sendExecArgs(
-        self: *const ArtifactSet,
-        fd: c.fd_t,
-        exec_args: []const []const u8,
-        reconnect_io: ReconnectIoContext,
-    ) !void {
-        try writeAllMaybeCancellable(fd, "EXEC ", reconnect_io);
-        try writeAllMaybeCancellable(fd, self.artifact_set_id, reconnect_io);
-        for (self.entries) |entry| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_io);
-            try writeAllMaybeCancellable(fd, &entry.hash_hex, reconnect_io);
-        }
-        try writeAllMaybeCancellable(fd, " --", reconnect_io);
-        for (exec_args) |arg| {
-            try writeAllMaybeCancellable(fd, " ", reconnect_io);
-            try self.writeExecArg(fd, arg, reconnect_io);
-        }
-        try writeAllMaybeCancellable(fd, "\n", reconnect_io);
-    }
-
-    fn writeExecArg(
-        self: *const ArtifactSet,
-        fd: c.fd_t,
-        arg: []const u8,
-        reconnect_io: ReconnectIoContext,
-    ) !void {
-        if (!remote_shell.needsEncodedExecArg(arg)) {
-            try writeAllMaybeCancellable(fd, arg, reconnect_io);
-            return;
-        }
-
-        const encoded = try self.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(arg.len));
-        defer self.allocator.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, arg);
-        try writeAllMaybeCancellable(fd, remote_shell.bootstrap_exec_encoded_arg_prefix, reconnect_io);
-        try writeAllMaybeCancellable(fd, encoded, reconnect_io);
     }
 
     pub fn find(self: *const ArtifactSet, platform: Platform) ?*const ArtifactEntry {
@@ -276,7 +214,12 @@ fn parsePackagedArtifactManifest(
         if (!isLowerSha256Hex(hash_hex)) return error.InvalidArtifactManifest;
 
         const path = try std.fs.path.join(allocator, &.{ artifact_dir, target.path });
-        entries[target_index] = try artifactEntryFromManifest(allocator, path, target, hash_hex);
+        entries[target_index] = try artifactEntryFromManifest(.{
+            .allocator = allocator,
+            .owned_path = path,
+            .target = target,
+            .hash_text = hash_hex,
+        });
         seen[target_index] = true;
     }
 
@@ -291,34 +234,37 @@ fn parsePackagedArtifactManifest(
     };
 }
 
-fn artifactEntryFromManifest(
+const ArtifactEntryFromManifestOptions = struct {
     allocator: std.mem.Allocator,
-    path: []u8,
+    owned_path: []u8,
     target: PackagedArtifactTarget,
     hash_text: []const u8,
-) !ArtifactEntry {
-    errdefer allocator.free(path);
+};
+
+fn artifactEntryFromManifest(options: ArtifactEntryFromManifestOptions) !ArtifactEntry {
+    const allocator = options.allocator;
+    errdefer allocator.free(options.owned_path);
 
     const id = try std.fmt.allocPrint(
         allocator,
         "sessh-{s}-{s}-{s}",
-        .{ config.version, target.os, target.arch },
+        .{ config.version, options.target.os, options.target.arch },
     );
     errdefer allocator.free(id);
 
-    const os = try allocator.dupe(u8, target.os);
+    const os = try allocator.dupe(u8, options.target.os);
     errdefer allocator.free(os);
-    const arch = try allocator.dupe(u8, target.arch);
+    const arch = try allocator.dupe(u8, options.target.arch);
     errdefer allocator.free(arch);
 
     var hash_hex: [64]u8 = undefined;
-    @memcpy(hash_hex[0..], hash_text);
+    @memcpy(hash_hex[0..], options.hash_text);
 
     return .{
         .id = id,
         .os = os,
         .arch = arch,
-        .path = path,
+        .path = options.owned_path,
         .hash_hex = hash_hex,
     };
 }
@@ -370,39 +316,6 @@ fn loadArtifactEntryForPlatform(
         .path = try allocator.dupe(u8, path),
         .hash_hex = std.fmt.bytesToHex(digest, .lower),
     };
-}
-
-pub fn sendUpload(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    artifact: *const ArtifactEntry,
-    reconnect_io: ReconnectIoContext,
-) !void {
-    const file = try std.fs.openFileAbsolute(artifact.path, .{});
-    defer file.close();
-
-    const bytes = try file.readToEndAlloc(allocator, max_artifact_bytes);
-    defer allocator.free(bytes);
-
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    const actual_hash = std.fmt.bytesToHex(digest, .lower);
-    if (!std.mem.eql(u8, &actual_hash, &artifact.hash_hex)) return error.ArtifactHashMismatch;
-
-    const encoded = try allocator.alloc(
-        u8,
-        std.base64.standard.Encoder.calcSize(bytes.len),
-    );
-    defer allocator.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, bytes);
-
-    try writeAllMaybeCancellable(fd, "UPLOAD ", reconnect_io);
-    try writeAllMaybeCancellable(fd, artifact.id, reconnect_io);
-    try writeAllMaybeCancellable(fd, " ", reconnect_io);
-    try writeAllMaybeCancellable(fd, &artifact.hash_hex, reconnect_io);
-    try writeAllMaybeCancellable(fd, " ", reconnect_io);
-    try writeAllMaybeCancellable(fd, encoded, reconnect_io);
-    try writeAllMaybeCancellable(fd, "\n", reconnect_io);
 }
 
 pub fn parseMissingPlatform(line: []const u8) !Platform {
@@ -460,39 +373,7 @@ fn isLowerSha256Hex(value: []const u8) bool {
     return true;
 }
 
-fn writeAllMaybeCancellable(
-    fd: c.fd_t,
-    bytes: []const u8,
-    reconnect_io: ReconnectIoContext,
-) !void {
-    if (reconnect_io.reconnect_ui == null) {
-        try io.writeAll(fd, bytes);
-        return;
-    }
-
-    // BLOCKING_POLL: foreground SSH bootstrap write. The short timeout exists
-    // only so reconnect UI cancellation can be observed while the pipe blocks.
-    var written: usize = 0;
-    while (written < bytes.len) {
-        var pollfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.OUT,
-            .revents = 0,
-        }};
-        const ready = try posix.poll(&pollfds, 50);
-        if (try reconnect_io.shouldCancel()) return error.ReconnectCancelled;
-        if (ready == 0) continue;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
-        if ((pollfds[0].revents & posix.POLL.OUT) == 0) continue;
-
-        const chunk_len = @min(bytes.len - written, 4096);
-        const n = c.write(fd, bytes[written..].ptr, chunk_len);
-        if (n <= 0) return error.WriteFailed;
-        written += @intCast(n);
-    }
-}
-
-pub fn readBootstrapLine(
+fn readBootstrapLine(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     reconnect_io: ReconnectIoContext,

@@ -2,10 +2,12 @@ const std = @import("std");
 const c = std.c;
 
 const client_log = @import("../core/client_log.zig");
+const fixed_buffer = @import("../core/fixed_buffer.zig");
 const diagnostics_jsonl = @import("jsonl.zig");
 const reconnect_title = @import("../reconnect/title.zig");
 
 pub const max_title_fallback_bytes = 512;
+const TitleFallback = fixed_buffer.FixedBuffer(max_title_fallback_bytes);
 
 pub const Presentation = enum {
     none,
@@ -19,8 +21,7 @@ pub const TitleState = struct {
     enabled: bool = false,
     fd: c.fd_t = -1,
     visible: bool = false,
-    cleanup_title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
-    cleanup_title_fallback_len: usize = 0,
+    cleanup_title_fallback: TitleFallback = .{},
 
     pub fn init(enabled: bool, fd: c.fd_t) TitleState {
         return .{
@@ -34,7 +35,7 @@ pub const TitleState = struct {
         const cleanup_title = std.process.getCwdAlloc(allocator) catch null;
         if (cleanup_title) |title| {
             defer allocator.free(title);
-            self.cleanup_title_fallback_len = copyTitleFallback(&self.cleanup_title_fallback, title);
+            self.cleanup_title_fallback.setTruncate(title);
         }
     }
 
@@ -88,24 +89,22 @@ pub const TitleState = struct {
     }
 
     fn cleanupTitleFallback(self: *const TitleState) []const u8 {
-        return self.cleanup_title_fallback[0..self.cleanup_title_fallback_len];
+        return self.cleanup_title_fallback.slice();
     }
 };
 
-pub fn copyTitleFallback(dest: []u8, title: []const u8) usize {
-    const len = @min(dest.len, title.len);
-    @memcpy(dest[0..len], title[0..len]);
-    return len;
-}
-
-pub fn formatDiagnostic(
+pub const FormatDiagnosticOptions = struct {
     out: []u8,
     diagnostic: *const client_log.UserDiagnosticLine,
     delayed: bool,
-) usize {
+};
+
+pub fn formatDiagnostic(options: FormatDiagnosticOptions) usize {
+    const out = options.out;
+    const diagnostic = options.diagnostic;
     var stream = std.io.fixedBufferStream(out);
     const writer = stream.writer();
-    if (delayed) {
+    if (options.delayed) {
         writer.print("{s} ts_ms={}: ", .{ diagnostic.tag.label(), diagnostic.ts_ms }) catch return stream.pos;
     } else {
         writer.print("{s}: ", .{diagnostic.tag.label()}) catch return stream.pos;
@@ -122,19 +121,25 @@ pub fn writeJsonlStatus(fd: c.fd_t, message: []const u8) !void {
     try diagnostics_jsonl.writeStatus(fd, message);
 }
 
-pub fn appendOnlyRetryStatus(buf: []u8, delay_ms: u64, ctrl_r: bool) ![]const u8 {
+pub const AppendOnlyRetryStatusOptions = struct {
+    buf: []u8,
+    delay_ms: u64,
+    ctrl_r_enabled: bool,
+};
+
+pub fn appendOnlyRetryStatus(options: AppendOnlyRetryStatusOptions) ![]const u8 {
     var delay_buf: [16]u8 = undefined;
-    const delay = try formatDelay(delay_ms, &delay_buf);
-    const retry_at_unix_ms = nowUnixMs() +| delay_ms;
-    if (ctrl_r) {
+    const delay = try formatDelay(options.delay_ms, &delay_buf);
+    const retry_at_unix_ms = nowUnixMs() +| options.delay_ms;
+    if (options.ctrl_r_enabled) {
         return std.fmt.bufPrint(
-            buf,
+            options.buf,
             "sessh: disconnected: Retry connecting {s} (retry_at_unix_ms={}). CTRL-R now",
             .{ delay, retry_at_unix_ms },
         );
     }
     return std.fmt.bufPrint(
-        buf,
+        options.buf,
         "sessh: disconnected: Retry connecting {s} (retry_at_unix_ms={})",
         .{ delay, retry_at_unix_ms },
     );
@@ -209,7 +214,7 @@ test "title state restores local cleanup title on end" {
     defer std.posix.close(fds[0]);
 
     var title = TitleState.init(true, fds[1]);
-    title.cleanup_title_fallback_len = copyTitleFallback(&title.cleanup_title_fallback, "/tmp/local");
+    title.cleanup_title_fallback.setTruncate("/tmp/local");
     title.showRetry(5_000);
     title.restoreForEnd();
     std.posix.close(fds[1]);

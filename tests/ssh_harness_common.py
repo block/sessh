@@ -28,7 +28,7 @@ from socket_harness import (
     DRAW,
     SESSION_CLIENT_CONTROL_RESPONSE,
     SESSION_CLIENT_DEBUG_SEVER_CONNECTION_REQUEST,
-    SESSION_ATTACHED,
+    SESSION_READY,
     TERMINAL_STREAM_OPEN,
     pack_session_create,
     recv_draw_until,
@@ -94,6 +94,36 @@ def run_sessh(args, env, timeout=5.0):
         timeout=timeout,
         check=False,
     )
+
+
+def start_tcp_echo_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    server_port = server.getsockname()[1]
+    server_stop = threading.Event()
+
+    def echo_connection(conn):
+        with conn:
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    return
+                conn.sendall(data)
+
+    def echo_server():
+        while not server_stop.is_set():
+            try:
+                server.settimeout(0.1)
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=echo_connection, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=echo_server, daemon=True).start()
+    return server, server_stop, server_port
 
 
 def run_sessh_with_tty_stdin_and_piped_stdout(args, env, timeout=10.0):
@@ -404,8 +434,9 @@ def run_sessh_in_pty(
         if capture_tty_attrs:
             # Release builds call std.process.exit, so defers do not run. Keep
             # the child parked until the parent records the initial tty state;
-            # otherwise a fast child could put the pty in raw mode before the
-            # test has a baseline to compare against.
+            # otherwise a fast child could put the pty in termios raw mode
+            # before the test has a baseline to compare against. This is about
+            # local tty flags, not sessh's `filter-level=unhygienic`.
             tty_attrs_before = termios.tcgetattr(fd)
             os.write(sync_w, b"x")
             os.close(sync_w)
@@ -993,4 +1024,3 @@ def assert_cached_artifact(env, artifact, context):
         raise AssertionError(f"{context}: cached artifact does not match source binary")
     if not os.access(cached, os.X_OK):
         raise AssertionError(f"{context}: cached artifact is not executable")
-

@@ -1,10 +1,5 @@
 const std = @import("std");
 
-pub const InboundData = struct {
-    new_data: []const u8,
-    recv_next_offset: u64,
-};
-
 pub const StreamByteState = struct {
     outbound: std.ArrayList(u8) = .empty,
     outbound_base: u64 = 0,
@@ -33,8 +28,9 @@ pub const StreamByteState = struct {
     }
 };
 
-// Tracks one byte stream in each direction. The local side appends source bytes
-// to `outbound`; peer data advances `inbound.recv_next_offset`.
+// Tracks one byte stream in each direction. `outbound` contains bytes waiting
+// for the peer. `inbound.recv_next_offset` is stricter: it advances only after
+// bytes have reached the local sink, so ACKs never get ahead of delivery.
 pub const StreamState = struct {
     allocator: std.mem.Allocator,
     guid: []const u8,
@@ -42,21 +38,32 @@ pub const StreamState = struct {
     proxy_port: u16 = 0,
     outbound: StreamByteState = .{},
     inbound: StreamByteState = .{},
+    inbound_pending: std.ArrayList(u8) = .empty,
+    inbound_eof_pending: bool = false,
+    inbound_eof_applied: bool = false,
     peer_ready: bool = false,
     source_eof: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, guid: []const u8, proxy_host: []const u8, proxy_port: u16) StreamState {
+    pub const InitOptions = struct {
+        allocator: std.mem.Allocator,
+        guid: []const u8,
+        proxy_host: []const u8 = "",
+        proxy_port: u16 = 0,
+    };
+
+    pub fn init(options: InitOptions) StreamState {
         return .{
-            .allocator = allocator,
-            .guid = guid,
-            .proxy_host = proxy_host,
-            .proxy_port = proxy_port,
+            .allocator = options.allocator,
+            .guid = options.guid,
+            .proxy_host = options.proxy_host,
+            .proxy_port = options.proxy_port,
         };
     }
 
     pub fn deinit(self: *StreamState) void {
         self.outbound.deinit(self.allocator);
         self.inbound.deinit(self.allocator);
+        self.inbound_pending.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -90,24 +97,58 @@ pub const StreamState = struct {
         }
     }
 
-    pub fn acceptInboundData(self: *StreamState, offset: u64, data: []const u8) !InboundData {
-        if (offset < self.inbound.recv_next_offset) {
-            const already_received: usize = @intCast(self.inbound.recv_next_offset - offset);
-            if (already_received >= data.len) {
-                return .{ .new_data = data[data.len..], .recv_next_offset = self.inbound.recv_next_offset };
-            }
-            const new_data = data[already_received..];
-            self.inbound.recv_next_offset += new_data.len;
-            return .{ .new_data = new_data, .recv_next_offset = self.inbound.recv_next_offset };
+    pub fn inboundQueuedNext(self: *const StreamState) u64 {
+        return self.inbound.recv_next_offset + self.inbound_pending.items.len;
+    }
+
+    pub fn queueInboundData(self: *StreamState, offset: u64, data: []const u8) !usize {
+        var new_offset = offset;
+        var new_data = data;
+
+        if (new_offset < self.inbound.recv_next_offset) {
+            const already_delivered: usize = @intCast(self.inbound.recv_next_offset - new_offset);
+            if (already_delivered >= new_data.len) return 0;
+            new_data = new_data[already_delivered..];
+            new_offset = self.inbound.recv_next_offset;
         }
-        if (offset != self.inbound.recv_next_offset) return error.StreamOffsetGap;
-        self.inbound.recv_next_offset += data.len;
-        return .{ .new_data = data, .recv_next_offset = self.inbound.recv_next_offset };
+
+        const queued_next = self.inboundQueuedNext();
+        if (new_offset < queued_next) {
+            const already_queued: usize = @intCast(queued_next - new_offset);
+            if (already_queued >= new_data.len) return 0;
+            new_data = new_data[already_queued..];
+            new_offset = queued_next;
+        }
+
+        if (new_offset != queued_next) return error.StreamOffsetGap;
+        try self.inbound_pending.appendSlice(self.allocator, new_data);
+        return new_data.len;
+    }
+
+    pub fn pendingInboundData(self: *const StreamState) []const u8 {
+        return self.inbound_pending.items;
+    }
+
+    pub fn noteInboundDelivered(self: *StreamState, n: usize) !void {
+        if (n > self.inbound_pending.items.len) return error.StreamAckOutOfRange;
+        if (n == 0) return;
+        const remaining = self.inbound_pending.items.len - n;
+        std.mem.copyForwards(u8, self.inbound_pending.items[0..remaining], self.inbound_pending.items[n..]);
+        self.inbound_pending.shrinkRetainingCapacity(remaining);
+        self.inbound.recv_next_offset += n;
+        if (self.inbound_eof_pending and self.inbound_pending.items.len == 0) {
+            self.inbound.inbound_eof = true;
+            self.inbound_eof_pending = false;
+        }
     }
 
     pub fn markInboundEof(self: *StreamState, final_offset: u64) !void {
-        if (final_offset != self.inbound.recv_next_offset) return error.StreamOffsetGap;
-        self.inbound.inbound_eof = true;
+        if (final_offset != self.inboundQueuedNext()) return error.StreamOffsetGap;
+        if (self.inbound_pending.items.len == 0) {
+            self.inbound.inbound_eof = true;
+        } else {
+            self.inbound_eof_pending = true;
+        }
     }
 
     pub fn completeOutboundAfterInboundEof(self: *StreamState) void {
@@ -135,13 +176,20 @@ pub const StreamState = struct {
 
     pub fn hasProgress(self: *const StreamState) bool {
         return self.inbound.recv_next_offset != 0 or
+            self.inbound_pending.items.len != 0 or
+            self.inbound_eof_pending or
             self.outbound.outbound_base != 0 or
             self.outbound.outbound.items.len != 0;
     }
 };
 
 test "byte stream appends outbound bytes and ACK drops them" {
-    var state = StreamState.init(std.testing.allocator, "p-test", "host", 22);
+    var state = StreamState.init(.{
+        .allocator = std.testing.allocator,
+        .guid = "p-test",
+        .proxy_host = "host",
+        .proxy_port = 22,
+    });
     defer state.deinit();
 
     try state.appendOutbound("abcdef");
@@ -152,49 +200,115 @@ test "byte stream appends outbound bytes and ACK drops them" {
 }
 
 test "byte stream rejects ACK beyond buffered outbound data" {
-    var state = StreamState.init(std.testing.allocator, "p-test", "host", 22);
+    var state = StreamState.init(.{
+        .allocator = std.testing.allocator,
+        .guid = "p-test",
+        .proxy_host = "host",
+        .proxy_port = 22,
+    });
     defer state.deinit();
 
     try state.appendOutbound("abc");
     try std.testing.expectError(error.StreamAckOutOfRange, state.ackOutbound(4));
 }
 
-test "byte stream accepts duplicate inbound data without moving backwards" {
-    var state = StreamState.init(std.testing.allocator, "p-test", "host", 22);
+test "byte stream queues duplicate inbound data without moving backwards" {
+    var state = StreamState.init(.{
+        .allocator = std.testing.allocator,
+        .guid = "p-test",
+        .proxy_host = "host",
+        .proxy_port = 22,
+    });
     defer state.deinit();
 
-    const first = try state.acceptInboundData(0, "abcdef");
-    try std.testing.expectEqualStrings("abcdef", first.new_data);
-    try std.testing.expectEqual(@as(u64, 6), first.recv_next_offset);
+    try std.testing.expectEqual(@as(usize, 6), try state.queueInboundData(0, "abcdef"));
+    try std.testing.expectEqualStrings("abcdef", state.pendingInboundData());
+    try std.testing.expectEqual(@as(u64, 6), state.inboundQueuedNext());
 
-    const duplicate = try state.acceptInboundData(0, "abc");
-    try std.testing.expectEqual(@as(usize, 0), duplicate.new_data.len);
-    try std.testing.expectEqual(@as(u64, 6), duplicate.recv_next_offset);
+    try std.testing.expectEqual(@as(usize, 0), try state.queueInboundData(0, "abc"));
+    try std.testing.expectEqual(@as(u64, 6), state.inboundQueuedNext());
 
-    const overlap = try state.acceptInboundData(3, "defgh");
-    try std.testing.expectEqualStrings("gh", overlap.new_data);
-    try std.testing.expectEqual(@as(u64, 8), overlap.recv_next_offset);
+    try std.testing.expectEqual(@as(usize, 2), try state.queueInboundData(3, "defgh"));
+    try std.testing.expectEqualStrings("abcdefgh", state.pendingInboundData());
+    try std.testing.expectEqual(@as(u64, 8), state.inboundQueuedNext());
+}
+
+test "byte stream queues inbound data before ACK delivery" {
+    var state = StreamState.init(.{
+        .allocator = std.testing.allocator,
+        .guid = "p-test",
+        .proxy_host = "host",
+        .proxy_port = 22,
+    });
+    defer state.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), try state.queueInboundData(0, "abc"));
+    try std.testing.expectEqual(@as(u64, 0), state.inbound.recv_next_offset);
+    try std.testing.expectEqual(@as(u64, 3), state.inboundQueuedNext());
+    try std.testing.expectEqual(@as(usize, 3), try state.queueInboundData(3, "def"));
+    try std.testing.expectEqualStrings("abcdef", state.pendingInboundData());
+
+    try state.noteInboundDelivered(2);
+    try std.testing.expectEqual(@as(u64, 2), state.inbound.recv_next_offset);
+    try std.testing.expectEqualStrings("cdef", state.pendingInboundData());
+    try std.testing.expectEqual(@as(usize, 1), try state.queueInboundData(5, "fg"));
+    try std.testing.expectEqualStrings("cdefg", state.pendingInboundData());
+}
+
+test "byte stream delays inbound eof until pending bytes are delivered" {
+    var state = StreamState.init(.{
+        .allocator = std.testing.allocator,
+        .guid = "p-test",
+        .proxy_host = "host",
+        .proxy_port = 22,
+    });
+    defer state.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), try state.queueInboundData(0, "abc"));
+    try state.markInboundEof(3);
+    try std.testing.expect(!state.inbound.inbound_eof);
+    try std.testing.expect(state.inbound_eof_pending);
+
+    try state.noteInboundDelivered(3);
+    try std.testing.expect(state.inbound.inbound_eof);
+    try std.testing.expect(!state.inbound_eof_pending);
 }
 
 test "byte stream rejects out-of-order inbound offsets" {
-    var state = StreamState.init(std.testing.allocator, "p-test", "host", 22);
+    var state = StreamState.init(.{
+        .allocator = std.testing.allocator,
+        .guid = "p-test",
+        .proxy_host = "host",
+        .proxy_port = 22,
+    });
     defer state.deinit();
 
-    try std.testing.expectError(error.StreamOffsetGap, state.acceptInboundData(1, "x"));
+    try std.testing.expectError(error.StreamOffsetGap, state.queueInboundData(1, "x"));
 }
 
 test "byte stream marks inbound eof only at current offset" {
-    var state = StreamState.init(std.testing.allocator, "p-test", "host", 22);
+    var state = StreamState.init(.{
+        .allocator = std.testing.allocator,
+        .guid = "p-test",
+        .proxy_host = "host",
+        .proxy_port = 22,
+    });
     defer state.deinit();
 
-    _ = try state.acceptInboundData(0, "abc");
+    try std.testing.expectEqual(@as(usize, 3), try state.queueInboundData(0, "abc"));
     try std.testing.expectError(error.StreamOffsetGap, state.markInboundEof(2));
+    try state.noteInboundDelivered(3);
     try state.markInboundEof(3);
     try std.testing.expect(state.inbound.inbound_eof);
 }
 
 test "byte stream cleanup releases outbound buffer" {
-    var state = StreamState.init(std.testing.allocator, "p-test", "host", 22);
+    var state = StreamState.init(.{
+        .allocator = std.testing.allocator,
+        .guid = "p-test",
+        .proxy_host = "host",
+        .proxy_port = 22,
+    });
     try state.appendOutbound("abc");
     state.deinit();
 }

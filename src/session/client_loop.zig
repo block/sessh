@@ -13,8 +13,9 @@ pub const PasteLikeInputClassifier = struct {
 
     pub fn classify(self: *PasteLikeInputClassifier, forwarded_bytes: usize) bool {
         if (forwarded_bytes == 0) return false;
-        // TODO: Detect bracketed paste delimiters here once client input
-        // parsing tracks them explicitly.
+        // Input reaches this boundary as byte chunks rather than decoded
+        // terminal-input events, so paste detection has to use transport-level
+        // shape: large single reads and dense short windows are paste-like.
         if (forwarded_bytes >= paste_like_single_read_bytes) return true;
 
         const now = self.nowMs();
@@ -43,4 +44,3 @@ pub const PasteLikeInputClassifier = struct {
             std.time.milliTimestamp();
     }
 };
-

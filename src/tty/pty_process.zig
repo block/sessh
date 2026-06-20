@@ -1,18 +1,19 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
 const core_fds = @import("../core/fds.zig");
+const process_wait = @import("../core/waitpid.zig");
+const posix_pty = @import("posix_pty.zig");
 const terminal = @import("terminal.zig");
 const tty_settings = @import("settings.zig");
 
 extern "c" fn forkpty(amaster: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn ttyname(fd: c_int) ?[*:0]u8;
 
 pub const SpawnOptions = struct {
-    rows: u16,
-    cols: u16,
+    size: terminal.WindowSize,
     shell: ?[]const u8 = null,
     command_argv: []const []const u8 = &.{},
     shell_command: ?[]const u8 = null,
@@ -27,27 +28,27 @@ pub const EnvironmentEntry = struct {
     value: [:0]const u8,
 };
 
-pub const Child = struct {
+pub const PtyProcess = struct {
     pid: c.pid_t,
     master_fd: c.fd_t,
 
-    pub fn closeMaster(self: *Child) void {
+    pub fn closeMaster(self: *PtyProcess) void {
         if (self.master_fd >= 0) {
             posix.close(self.master_fd);
             self.master_fd = -1;
         }
     }
 
-    pub fn wait(self: *Child) std.process.Child.Term {
+    pub fn wait(self: *PtyProcess) std.process.Child.Term {
         if (self.pid == 0) return .{ .Unknown = 0 };
         // BLOCKING_WAIT: process cleanup after the PTY master has been closed
         // and SIGTERM has been sent. This is not daemon event-loop work.
         const result = posix.waitpid(self.pid, 0);
         self.pid = 0;
-        return waitStatusToTerm(result.status);
+        return process_wait.termFromStatus(result.status);
     }
 
-    pub fn terminate(self: *Child) void {
+    pub fn terminate(self: *PtyProcess) void {
         self.closeMaster();
         if (self.pid != 0) {
             posix.kill(self.pid, posix.SIG.TERM) catch {};
@@ -59,7 +60,7 @@ pub const Child = struct {
 // All PTY users should go through these master-read helpers instead of calling
 // read(2) directly. PTY EOF is not identical to pipe EOF on every platform:
 // Linux reports the closed slave side as EIO on the master. Keeping that rule
-// here prevents the stream and remote terminal processs from growing separate PTY lore.
+// here prevents the stream and terminal worker from growing separate PTY lore.
 pub const MasterRead = union(enum) {
     bytes: []const u8,
     would_block,
@@ -78,7 +79,7 @@ pub const DrainResult = struct {
     limited: bool = false,
 };
 
-pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
+pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !PtyProcess {
     if (options.command_argv.len > 0 and options.shell_command != null) return error.InvalidSessionCommand;
 
     const shell_path = options.shell orelse defaultShellPath();
@@ -109,8 +110,8 @@ pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
     defer if (term_z) |term| allocator.free(term);
 
     var master: c_int = -1;
-    var size = c.winsize{ .row = options.rows, .col = options.cols, .xpixel = 0, .ypixel = 0 };
-    const pid = forkpty(&master, null, null, &size);
+    var winsize = options.size.winsize();
+    const pid = forkpty(&master, null, null, &winsize);
     if (pid < 0) return error.ForkPtyFailed;
     if (pid == 0) {
         terminal.setSigpipe(posix.SIG.DFL);
@@ -125,7 +126,7 @@ pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
             _ = setenv("TERM", "xterm-256color", 1);
         }
         _ = setenv("SHELL", shell_z.ptr, 1);
-        if (ttyname(posix.STDIN_FILENO)) |path| {
+        if (posix_pty.nameZ(posix.STDIN_FILENO)) |path| {
             _ = setenv("SSH_TTY", path, 1);
         }
         if (session_guid_z) |guid| _ = setenv("SESSH_GUID", guid.ptr, 1);
@@ -136,8 +137,8 @@ pub fn spawn(allocator: std.mem.Allocator, options: SpawnOptions) !Child {
             posix.execvpeZ(command.argv[0].?, command.argv.ptr, @ptrCast(c.environ)) catch {};
         } else {
             const dash_i: [*:0]const u8 = "-i";
-            var child_argv = [_:null]?[*:0]const u8{ shell_argv0.ptr, dash_i };
-            _ = c.execve(shell_z.ptr, &child_argv, @ptrCast(c.environ));
+            var login_shell_argv = [_:null]?[*:0]const u8{ shell_argv0.ptr, dash_i };
+            _ = c.execve(shell_z.ptr, &login_shell_argv, @ptrCast(c.environ));
         }
         std.process.exit(127);
     }
@@ -148,7 +149,7 @@ pub fn readMaster(fd: c.fd_t, buf: []u8) !MasterRead {
     return readMasterInner(fd, buf);
 }
 
-pub fn readMasterNonBlocking(fd: c.fd_t, buf: []u8) !MasterRead {
+fn readMasterNonBlocking(fd: c.fd_t, buf: []u8) !MasterRead {
     var flags_guard = core_fds.StatusFlagsGuard.setNonBlocking(fd) catch return error.PtyMasterReadFailed;
     defer flags_guard.restore();
     return readMasterInner(fd, buf);
@@ -170,20 +171,16 @@ fn readMasterInner(fd: c.fd_t, buf: []u8) !MasterRead {
     }
 }
 
-pub fn drainMasterNonBlocking(
-    fd: c.fd_t,
-    context: anytype,
-    on_bytes: anytype,
-    limits: DrainLimits,
-) !DrainResult {
+pub fn drainMasterNonBlocking(options: anytype) !DrainResult {
+    const limits = options.limits;
     var result = DrainResult{};
     while (result.read_count < limits.max_reads and result.byte_count < limits.max_bytes) {
         var buf: [4096]u8 = undefined;
-        switch (try readMasterNonBlocking(fd, &buf)) {
+        switch (try readMasterNonBlocking(options.fd, &buf)) {
             .bytes => |bytes| {
                 result.read_count += 1;
                 result.byte_count += bytes.len;
-                try on_bytes(context, bytes);
+                try options.on_bytes(options.context, bytes);
             },
             .would_block => return result,
             .eof => {
@@ -194,17 +191,6 @@ pub fn drainMasterNonBlocking(
     }
     result.limited = true;
     return result;
-}
-
-pub fn waitStatusToTerm(status: u32) std.process.Child.Term {
-    return if (posix.W.IFEXITED(status))
-        .{ .Exited = posix.W.EXITSTATUS(status) }
-    else if (posix.W.IFSIGNALED(status))
-        .{ .Signal = posix.W.TERMSIG(status) }
-    else if (posix.W.IFSTOPPED(status))
-        .{ .Stopped = posix.W.STOPSIG(status) }
-    else
-        .{ .Unknown = status };
 }
 
 const PreparedCommand = struct {
@@ -221,10 +207,23 @@ const PreparedCommand = struct {
 
 fn prepareCommandArgv(allocator: std.mem.Allocator, command_argv: []const []const u8) !PreparedCommand {
     if (command_argv.len == 0) return error.InvalidCommandArgv;
-    return prepareCommandArgvInner(allocator, command_argv, false);
+    return prepareCommandArgvInner(.{
+        .allocator = allocator,
+        .command_argv = command_argv,
+        .allow_empty_args = false,
+    });
 }
 
-fn prepareCommandArgvInner(allocator: std.mem.Allocator, command_argv: []const []const u8, allow_empty_args: bool) !PreparedCommand {
+const PrepareCommandArgvOptions = struct {
+    allocator: std.mem.Allocator,
+    command_argv: []const []const u8,
+    allow_empty_args: bool,
+};
+
+fn prepareCommandArgvInner(options: PrepareCommandArgvOptions) !PreparedCommand {
+    const allocator = options.allocator;
+    const command_argv = options.command_argv;
+
     var owned_args = try allocator.alloc([:0]u8, command_argv.len);
     var initialized: usize = 0;
     errdefer {
@@ -236,7 +235,7 @@ fn prepareCommandArgvInner(allocator: std.mem.Allocator, command_argv: []const [
     errdefer allocator.free(argv);
 
     for (command_argv, 0..) |arg, i| {
-        if (!allow_empty_args and arg.len == 0) return error.InvalidCommandArgv;
+        if (!options.allow_empty_args and arg.len == 0) return error.InvalidCommandArgv;
         owned_args[i] = try allocator.dupeZ(u8, arg);
         initialized += 1;
         argv[i] = owned_args[i].ptr;
@@ -246,7 +245,11 @@ fn prepareCommandArgvInner(allocator: std.mem.Allocator, command_argv: []const [
 
 fn prepareShellCommand(allocator: std.mem.Allocator, shell_path: []const u8, shell_command: []const u8) !PreparedCommand {
     const shell_dash_c = [_][]const u8{ shell_path, "-c", shell_command };
-    return prepareCommandArgvInner(allocator, &shell_dash_c, true);
+    return prepareCommandArgvInner(.{
+        .allocator = allocator,
+        .command_argv = &shell_dash_c,
+        .allow_empty_args = true,
+    });
 }
 
 fn loginShellArg0(allocator: std.mem.Allocator, shell_path: []const u8) ![:0]u8 {
@@ -258,7 +261,7 @@ fn loginShellArg0(allocator: std.mem.Allocator, shell_path: []const u8) ![:0]u8 
     return arg;
 }
 
-pub fn defaultShellPath() []const u8 {
+fn defaultShellPath() []const u8 {
     const env_shell = if (c.getenv("SHELL")) |shell_z| std.mem.span(shell_z) else null;
     const passwd_shell = if (c.getpwuid(c.getuid())) |passwd|
         if (passwd.shell) |shell_z| std.mem.span(shell_z) else null
@@ -317,30 +320,16 @@ test "default shell prefers process environment then passwd then sh" {
     try std.testing.expectEqualStrings("/bin/sh", chooseDefaultShell(null, ""));
 }
 
-const DrainTestContext = struct {
-    allocator: std.mem.Allocator,
-    bytes: std.ArrayList(u8) = .empty,
-
-    fn deinit(self: *DrainTestContext) void {
-        self.bytes.deinit(self.allocator);
-    }
-};
-
-fn appendDrainTestBytes(context: *DrainTestContext, bytes: []const u8) !void {
-    try context.bytes.appendSlice(context.allocator, bytes);
-}
-
-test "drain master reads available PTY output while child is still alive" {
-    var child = try spawn(std.testing.allocator, .{
-        .rows = 24,
-        .cols = 80,
+test "drain master reads available PTY output while process is still alive" {
+    var process = try spawn(std.testing.allocator, .{
+        .size = .{ .rows = 24, .cols = 80 },
         .shell = "/bin/sh",
         .shell_command = "printf PTY_MASTER_DRAIN; read ignored",
     });
-    defer child.terminate();
+    defer process.terminate();
 
     var pollfds = [_]posix.pollfd{.{
-        .fd = child.master_fd,
+        .fd = process.master_fd,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
@@ -348,30 +337,17 @@ test "drain master reads available PTY output while child is still alive" {
     try std.testing.expect(ready == 1);
     try std.testing.expect((pollfds[0].revents & posix.POLL.IN) != 0);
 
-    var context = DrainTestContext{ .allocator = std.testing.allocator };
+    var context = testing.DrainContext{ .allocator = std.testing.allocator };
     defer context.deinit();
-    const result = try drainMasterNonBlocking(
-        child.master_fd,
-        &context,
-        appendDrainTestBytes,
-        .{},
-    );
+    const result = try drainMasterNonBlocking(.{
+        .fd = process.master_fd,
+        .context = &context,
+        .on_bytes = testing.appendDrainBytes,
+        .limits = DrainLimits{},
+    });
 
     try std.testing.expectEqualStrings("PTY_MASTER_DRAIN", context.bytes.items);
     try std.testing.expect(!result.eof);
-}
-
-fn readChildPtyOutput(allocator: std.mem.Allocator, child: *Child) ![]u8 {
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(allocator);
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        switch (try readMaster(child.master_fd, &buf)) {
-            .bytes => |bytes| try output.appendSlice(allocator, bytes),
-            .would_block => unreachable,
-            .eof => return output.toOwnedSlice(allocator),
-        }
-    }
 }
 
 test "spawn applies portable tty settings before exec" {
@@ -382,20 +358,47 @@ test "spawn applies portable tty settings before exec" {
         .term = "ansi",
         .modes = &modes,
     };
-    var child = try spawn(std.testing.allocator, .{
-        .rows = 24,
-        .cols = 80,
+    var process = try spawn(std.testing.allocator, .{
+        .size = .{ .rows = 24, .cols = 80 },
         .shell = "/bin/sh",
         .shell_command = "printf 'TERM=%s\\n' \"$TERM\"; stty -a",
         .tty_settings = settings,
     });
-    defer child.terminate();
+    defer process.terminate();
 
-    const output = try readChildPtyOutput(std.testing.allocator, &child);
+    const output = try testing.readPtyProcessOutput(std.testing.allocator, &process);
     defer std.testing.allocator.free(output);
-    const term = child.wait();
+    const term = process.wait();
 
     try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
     try std.testing.expect(std.mem.indexOf(u8, output, "TERM=ansi") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "-echo") != null);
 }
+
+const testing = if (builtin.is_test) struct {
+    const DrainContext = struct {
+        allocator: std.mem.Allocator,
+        bytes: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *DrainContext) void {
+            self.bytes.deinit(self.allocator);
+        }
+    };
+
+    fn appendDrainBytes(context: *DrainContext, bytes: []const u8) !void {
+        try context.bytes.appendSlice(context.allocator, bytes);
+    }
+
+    fn readPtyProcessOutput(allocator: std.mem.Allocator, process: *PtyProcess) ![]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+        while (true) {
+            var buf: [4096]u8 = undefined;
+            switch (try readMaster(process.master_fd, &buf)) {
+                .bytes => |bytes| try output.appendSlice(allocator, bytes),
+                .would_block => unreachable,
+                .eof => return output.toOwnedSlice(allocator),
+            }
+        }
+    }
+} else struct {};

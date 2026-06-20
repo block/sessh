@@ -134,7 +134,7 @@ def run(env, args, **kwargs):
     )
 
 
-def sever_attached_clients(env, timeout=10.0):
+def sever_visible_clients(env, timeout=10.0):
     request = sessh_pb().TerminalEmulatorItem.SessionClientDebugSeverConnectionRequest()
     runtime_root = Path(env.get("SESSH_FAKE_SSH_REMOTE_XDG_RUNTIME_DIR", env["XDG_RUNTIME_DIR"] + ".remote"))
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
@@ -330,7 +330,7 @@ def main():
                 raise AssertionError(f"REMOTE_TOP not found in pane:\n{before}")
             remote_top_index = before_lines.index("REMOTE_TOP")
 
-            sever_attached_clients(child_env)
+            sever_visible_clients(child_env)
             wait_capture(env, session, "sessh: disconnected: Retry connecting 10sec")
             wait_capture(env, session, "sessh: disconnected: Retry connecting 9sec", timeout=2.0)
             overlay = capture_visible(env, session).splitlines()
@@ -374,7 +374,7 @@ def main():
             wait_capture(env, reconnect_close_session, PROMPT)
             run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_close_session, sessh_cmd, "Enter"])
             wait_capture(env, reconnect_close_session, "REMOTE_PROMPT$")
-            sever_attached_clients(child_env)
+            sever_visible_clients(child_env)
             wait_capture(env, reconnect_close_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_close_session, "Enter", "~."])
             run(env, [*TMUX_ARGS, "send-keys", "-t", reconnect_close_session, "printf 'OUTER_RECONNECT_CLOSED\\n'", "Enter"])
@@ -407,7 +407,7 @@ def main():
             if bottom_remote_top_index < len(bottom_before_lines) - 3:
                 raise AssertionError(f"bottom regression did not place sessh near pane bottom:\n{bottom_before}")
 
-            sever_attached_clients(child_env)
+            sever_visible_clients(child_env)
             wait_capture(env, bottom_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_session, "C-r"])
             wait_capture(env, bottom_session, "sessh: disconnected: Reconnecting...", timeout=2.0)
@@ -447,7 +447,7 @@ def main():
                 raise AssertionError(f"REMOTE_TOP not found in bottom failure pane:\n{bottom_failure_before}")
 
             fail_batch_count_file.write_text("1\n")
-            sever_attached_clients(child_env)
+            sever_visible_clients(child_env)
             wait_capture(env, bottom_failure_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", bottom_failure_session, "C-r"])
             wait_capture(env, bottom_failure_session, "planned batch reconnect failure", timeout=6.0)
@@ -524,7 +524,7 @@ def main():
             wait_capture(env, alt_reconnect_close_session, "REMOTE_PROMPT$")
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_close_session, "enter-alt", "Enter"])
             wait_capture(env, alt_reconnect_close_session, "ALT_SCREEN_READY")
-            sever_attached_clients(child_env)
+            sever_visible_clients(child_env)
             wait_capture(env, alt_reconnect_close_session, "sessh: disconnected: Retry connecting 10sec")
             run(env, [*TMUX_ARGS, "send-keys", "-t", alt_reconnect_close_session, "Enter", "~."])
             alt_reconnect_after = capture_visible(env, alt_reconnect_close_session)

@@ -32,42 +32,43 @@ pub const State = struct {
 
     pub fn poll(
         self: *State,
-        input_fd: c.fd_t,
-        output_fd: c.fd_t,
-        diagnostic_notify_read_fd: c.fd_t,
-        timeout_ms: i32,
-        overlay_presentation: bool,
-        now_ms: u64,
+        options: PollOptions,
     ) !Decision {
         var pollfds = [_]posix.pollfd{
             .{
-                .fd = input_fd,
+                .fd = options.terminal_fds.input,
                 .events = posix.POLL.IN,
                 .revents = 0,
             },
             .{
-                .fd = diagnostic_notify_read_fd,
+                .fd = options.diagnostic_notify_read_fd,
                 .events = posix.POLL.IN,
                 .revents = 0,
             },
         };
-        const poll_count: usize = if (diagnostic_notify_read_fd >= 0) 2 else 1;
-        const ready = try posix.poll(pollfds[0..poll_count], self.effectivePollTimeout(timeout_ms, overlay_presentation, now_ms));
+        const poll_count: usize = if (options.diagnostic_notify_read_fd >= 0) 2 else 1;
+        // BLOCKING_POLL: visible-client reconnect UI wait. This process has no
+        // daemon dispatcher work to service while disconnected; the timeout is
+        // the UI refresh cadence for overlay/status updates.
+        const ready = try posix.poll(
+            pollfds[0..poll_count],
+            self.effectivePollTimeout(options.timeout_ms, options.overlay_presentation, options.now_ms),
+        );
         if (ready == 0) return .wait_elapsed;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .client_hangup;
         if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
-            drainDiagnosticNotifier(diagnostic_notify_read_fd);
+            drainDiagnosticNotifier(options.diagnostic_notify_read_fd);
         }
         if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
 
         var input: [256]u8 = undefined;
         var filtered: [512]u8 = undefined;
-        const n = c.read(input_fd, &input, input.len);
+        const n = c.read(options.terminal_fds.input, &input, input.len);
         if (n <= 0) return .client_hangup;
-        io_helpers.noteRead(input_fd, input[0..@intCast(n)]);
+        io_helpers.noteRead(options.terminal_fds.input, input[0..@intCast(n)]);
 
         const bytes = input[0..@intCast(n)];
-        switch (reconnect_control.scanInput(bytes, .{})) {
+        switch (reconnect_control.scanInput(bytes)) {
             .reconnect_now => {
                 self.reconnect_acknowledged = true;
                 return .reconnect_now;
@@ -82,7 +83,7 @@ pub const State = struct {
         };
         if (bytes.len > 0) {
             self.input_during_disconnect = true;
-            try self.alertDisconnectedInput(output_fd, now_ms);
+            try self.alertDisconnectedInput(options.terminal_fds.output, options.now_ms);
         }
         return .wait_elapsed;
     }
@@ -120,7 +121,15 @@ pub const State = struct {
     }
 };
 
-pub fn drainDiagnosticNotifier(fd: c.fd_t) void {
+pub const PollOptions = struct {
+    terminal_fds: terminal.TerminalFds,
+    diagnostic_notify_read_fd: c.fd_t,
+    timeout_ms: i32,
+    overlay_presentation: bool,
+    now_ms: u64,
+};
+
+fn drainDiagnosticNotifier(fd: c.fd_t) void {
     if (fd < 0) return;
     var buf: [128]u8 = undefined;
     while (true) {
@@ -149,7 +158,16 @@ test "reconnect input returns reconnect_now for ctrl-r" {
     var state = State{};
     try std.testing.expectEqual(
         Decision.reconnect_now,
-        try state.poll(input[0], output[1], -1, 0, false, 1_000),
+        try state.poll(.{
+            .terminal_fds = .{
+                .input = input[0],
+                .output = output[1],
+            },
+            .diagnostic_notify_read_fd = -1,
+            .timeout_ms = 0,
+            .overlay_presentation = false,
+            .now_ms = 1_000,
+        }),
     );
     try std.testing.expect(state.hasReconnectAcknowledgement());
 }
@@ -168,7 +186,16 @@ test "reconnect input records ordinary input during disconnect" {
     var state = State{};
     try std.testing.expectEqual(
         Decision.wait_elapsed,
-        try state.poll(input[0], output[1], -1, 0, false, 1_000),
+        try state.poll(.{
+            .terminal_fds = .{
+                .input = input[0],
+                .output = output[1],
+            },
+            .diagnostic_notify_read_fd = -1,
+            .timeout_ms = 0,
+            .overlay_presentation = false,
+            .now_ms = 1_000,
+        }),
     );
     try std.testing.expect(state.input_during_disconnect);
 

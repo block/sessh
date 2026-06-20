@@ -8,20 +8,27 @@ const io = @import("../core/io.zig");
 
 const buffer_len = 8192;
 
-pub fn forwardRawDuplex(left_read_fd: c.fd_t, left_write_fd: c.fd_t, right_fd: c.fd_t) !void {
-    try core_fds.setNonBlocking(left_read_fd);
-    try core_fds.setNonBlocking(left_write_fd);
+pub const SplitEndpointFds = struct {
+    read: c.fd_t,
+    write: c.fd_t,
+};
+
+pub fn forwardRawDuplex(left: SplitEndpointFds, right_fd: c.fd_t) !void {
+    try core_fds.setNonBlocking(left.read);
+    try core_fds.setNonBlocking(left.write);
     try core_fds.setNonBlocking(right_fd);
 
     var left_to_right = RawDirection{
-        .read_fd = left_read_fd,
+        .read_fd = left.read,
         .write_fd = right_fd,
     };
     var right_to_left = RawDirection{
         .read_fd = right_fd,
-        .write_fd = left_write_fd,
+        .write_fd = left.write,
     };
 
+    // PROCESS_EVENT_LOOP: this process is only a byte bridge. There is no
+    // daemon dispatcher hidden behind this loop.
     var raw_dispatcher = try dispatcher.Dispatcher.init(std.heap.page_allocator);
     defer raw_dispatcher.deinit();
     var bridge = RawBridge{
@@ -55,10 +62,26 @@ const RawBridge = struct {
             .{ .bridge = self, .direction = .right_to_left, .kind = .read },
             .{ .bridge = self, .direction = .right_to_left, .kind = .write },
         };
-        self.watches[0] = try raw_dispatcher.watchFd(self.left_to_right.read_fd, .{}, .{ .ctx = &self.watch_contexts[0], .callback = handleRawBridgeEvent });
-        self.watches[1] = try raw_dispatcher.watchFd(self.left_to_right.write_fd, .{}, .{ .ctx = &self.watch_contexts[1], .callback = handleRawBridgeEvent });
-        self.watches[2] = try raw_dispatcher.watchFd(self.right_to_left.read_fd, .{}, .{ .ctx = &self.watch_contexts[2], .callback = handleRawBridgeEvent });
-        self.watches[3] = try raw_dispatcher.watchFd(self.right_to_left.write_fd, .{}, .{ .ctx = &self.watch_contexts[3], .callback = handleRawBridgeEvent });
+        self.watches[0] = try raw_dispatcher.watchFd(.{
+            .fd = self.left_to_right.read_fd,
+            .events = .{},
+            .handler = .{ .ctx = &self.watch_contexts[0], .callback = handleRawBridgeEvent },
+        });
+        self.watches[1] = try raw_dispatcher.watchFd(.{
+            .fd = self.left_to_right.write_fd,
+            .events = .{},
+            .handler = .{ .ctx = &self.watch_contexts[1], .callback = handleRawBridgeEvent },
+        });
+        self.watches[2] = try raw_dispatcher.watchFd(.{
+            .fd = self.right_to_left.read_fd,
+            .events = .{},
+            .handler = .{ .ctx = &self.watch_contexts[2], .callback = handleRawBridgeEvent },
+        });
+        self.watches[3] = try raw_dispatcher.watchFd(.{
+            .fd = self.right_to_left.write_fd,
+            .events = .{},
+            .handler = .{ .ctx = &self.watch_contexts[3], .callback = handleRawBridgeEvent },
+        });
         try self.updateWatches(raw_dispatcher);
     }
 
@@ -84,8 +107,9 @@ const RawWatchContext = struct {
     kind: PollKind,
 };
 
-fn handleRawBridgeEvent(ctx: *anyopaque, raw_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
-    _ = id;
+fn handleRawBridgeEvent(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    const raw_dispatcher = handler_event.dispatcher;
+    const event = handler_event.event;
     const watch: *RawWatchContext = @ptrCast(@alignCast(ctx));
     const fd_event = switch (event) {
         .fd => |fd| fd,
@@ -189,7 +213,10 @@ test "raw duplex propagates right-side eof to the left peer" {
     _ = c.close(right[1]);
     right[1] = -1;
 
-    try forwardRawDuplex(left_input[0], left_output[0], right[0]);
+    try forwardRawDuplex(.{
+        .read = left_input[0],
+        .write = left_output[0],
+    }, right[0]);
 
     var pollfds = [_]posix.pollfd{.{
         .fd = left_output[1],

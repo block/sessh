@@ -37,11 +37,11 @@ HELLO_ERROR = "hello_error"
 ERROR = "error"
 TERMINAL_STREAM_OPEN = "te_stream_open"
 SESSION_CREATE = TERMINAL_STREAM_OPEN
-SESSION_ATTACH = TERMINAL_STREAM_OPEN
+SESSION_OPEN = TERMINAL_STREAM_OPEN
 INPUT = "te_input"
 RESIZE = "te_resize"
 REPAINT_REQUEST = "te_repaint_request"
-SESSION_ATTACHED = "te_session_attached"
+SESSION_READY = "te_session_ready"
 SESSION_ENDED = "te_session_ended"
 DRAW = "te_draw"
 REPAINT_RESPONSE = "te_repaint_response"
@@ -72,7 +72,7 @@ _TE_STREAM_ITEM_FIELDS = {
     INPUT: "input",
     RESIZE: "resize",
     REPAINT_REQUEST: "repaint_request",
-    SESSION_ATTACHED: "session_attached",
+    SESSION_READY: "session_ready",
     SESSION_ENDED: "session_ended",
     DRAW: "draw",
     REPAINT_RESPONSE: "repaint_response",
@@ -506,7 +506,7 @@ def pack_session_create(
     return message.SerializeToString()
 
 
-def pack_session_attach(reconnect_cursor=None, session_guid=""):
+def pack_session_open(reconnect_cursor=None, session_guid=""):
     global _NEXT_REPAINT_REQUEST_SEQ
     pb = sessh_pb()
     message = pb.TerminalEmulatorItem.Open()
@@ -569,13 +569,13 @@ def parse_session_ended(payload):
     return message
 
 
-def assert_session_attached(payload):
-    message = sessh_pb().TerminalEmulatorItem.SessionAttached()
+def assert_session_ready(payload):
+    message = sessh_pb().TerminalEmulatorItem.SessionReady()
     message.ParseFromString(payload)
     return message
 
 
-def create_and_attach_session(
+def create_and_open_session(
     conn,
     shell,
     scrollback=2000,
@@ -614,7 +614,7 @@ def parse_draw(payload):
         "scrollback_cursor_bytes": message.scrollback_cursor,
         "viewport_offset": message.viewport_offset if message.HasField("viewport_offset") else 0,
         "draw_bytes": message.draw_bytes,
-        "attached_client_end_restore_bytes": message.attached_client_end_restore_bytes if message.HasField("attached_client_end_restore_bytes") else None,
+        "visible_client_end_restore_bytes": message.visible_client_end_restore_bytes if message.HasField("visible_client_end_restore_bytes") else None,
     }
 
 

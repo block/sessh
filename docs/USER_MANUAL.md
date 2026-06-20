@@ -6,10 +6,11 @@
 sessh [ssh-option ...] destination [command [argument ...]]
 ```
 
-Interactive terminal-emulator sessions get the strongest recovery. When an ssh
-option requires OpenSSH to own the visible session, sessh uses its ProxyCommand
-stream path instead. If the remote OS/arch has no matching sessh binary, sessh
-prints a warning and falls back to plain `ssh` without persistence.
+The default `filter-level=emulated` gives interactive sessions the strongest
+recovery. When an ssh option requires OpenSSH to own the visible session, sessh
+uses its ProxyCommand stream path instead. If the remote OS/arch has no
+matching sessh binary, sessh prints a warning and falls back to plain `ssh`
+without sessh recovery.
 
 If an interactive connection drops, sessh retries in the background and shows a
 temporary overlay such as:
@@ -19,7 +20,7 @@ temporary overlay such as:
 ```
 
 `CTRL-R` asks sessh to switch to a prepared reconnect when one is available.
-The ssh-style escape `Enter ~ .` closes the visible client.
+The ssh-style escape `Enter ~ .` closes the session.
 There is intentionally no public resume/list/kill command surface.
 
 # Options
@@ -81,8 +82,8 @@ disconnected-reap-hours=168
 `cleanup-wakeup-interval-hours` controls how often local daemons coordinate a
 fallback cleanup scan. `cleanup-retry-limit-hours` controls how long the local
 side keeps trying to clean up stale remote work after a local client
-disappears. `disconnected-reap-hours` controls how long a remote session or
-proxy stream may remain disconnected before the remote daemon hangs it up.
+disappears. `disconnected-reap-hours` controls how long a remote session may
+remain disconnected before the remote daemon hangs it up.
 Values less than or equal to zero disable the relevant timeout.
 
 # Sessions
@@ -97,7 +98,7 @@ remote `sesshd`, and prepends that directory to `$PATH`.
 
 Available ssh-style escapes at the beginning of a line:
 
-- `~.` disconnects the visible client.
+- `~.` closes the session.
 - `~p` requests repaint.
 - `~?` shows escape help.
 - `~~` sends a literal `~`.

@@ -1,5 +1,4 @@
 const std = @import("std");
-const c = std.c;
 
 const protocol = @import("../protocol/mod.zig");
 
@@ -7,6 +6,7 @@ const pb = protocol.pb;
 
 pub const PendingClientFrame = union(enum) {
     continue_reading,
+    transport_control: protocol.TransportControl,
     terminal_item: pb.TerminalEmulatorItem,
     unexpected_empty_terminal_item,
     unexpected_first_terminal_item,
@@ -33,12 +33,13 @@ pub const FirstTerminalItemKind = enum {
 pub fn decodePendingClientFrame(
     allocator: std.mem.Allocator,
     frame: *const protocol.OwnedFrame,
-    control_fd: c.fd_t,
 ) !PendingClientFrame {
     switch (frame.message_type) {
         .daemon_tunnel => {
-            _ = try protocol.handleTransportControlFrame(frame.message_type, frame.payload, control_fd);
-            return .continue_reading;
+            return if (try protocol.decodeTransportControlFrame(allocator, frame.message_type, frame.payload)) |control|
+                .{ .transport_control = control }
+            else
+                .continue_reading;
         },
         .client_remote => {
             var item = try protocol.decodeClientRemoteTerminalEmulatorItem(allocator, frame.payload);
@@ -73,7 +74,7 @@ test "pending client protocol decodes terminal open item" {
         .message_type = .client_remote,
         .payload = item_payload,
     };
-    var decoded = try decodePendingClientFrame(allocator, &frame, -1);
+    var decoded = try decodePendingClientFrame(allocator, &frame);
     defer decoded.deinit(allocator);
 
     switch (decoded) {
@@ -91,7 +92,21 @@ test "pending client protocol rejects non terminal first action" {
         .message_type = .client_daemon,
         .payload = payload,
     };
-    var decoded = try decodePendingClientFrame(allocator, &frame, -1);
+    var decoded = try decodePendingClientFrame(allocator, &frame);
     defer decoded.deinit(allocator);
     try std.testing.expectEqual(PendingClientFrame.unexpected_first_action, decoded);
+}
+
+test "pending client protocol decodes transport control without writing" {
+    const allocator = std.testing.allocator;
+    const payload = try protocol.encodeDaemonTunnelPayload(allocator, .{ .ping = .{} });
+    defer allocator.free(payload);
+
+    var frame = protocol.OwnedFrame{
+        .message_type = .daemon_tunnel,
+        .payload = payload,
+    };
+    var decoded = try decodePendingClientFrame(allocator, &frame);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(PendingClientFrame{ .transport_control = .ping }, decoded);
 }

@@ -17,8 +17,9 @@ pub const Context = struct {
     active_local_clients: *usize,
 };
 
-pub fn acceptDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
-    _ = id;
+pub fn acceptDaemonClient(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    const daemon_dispatcher = handler_event.dispatcher;
+    const event = handler_event.event;
     const accept_context: *Context = @ptrCast(@alignCast(ctx));
 
     const fd_event = switch (event) {
@@ -30,20 +31,20 @@ pub fn acceptDaemonClient(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispat
 
     const client_fd = c.accept(accept_context.listen_fd, null, null);
     if (client_fd < 0) return;
-    errdefer _ = c.close(client_fd);
+    var owned_client_fd = core_fds.OwnedFd.init(client_fd);
+    defer owned_client_fd.deinit();
 
     daemon_log.infof(accept_context.allocator, "client connected", .{});
-    try socket_transport.setCloseOnExec(client_fd);
-    try core_fds.setNonBlocking(client_fd);
-    try client_router.registerAcceptedClient(
-        accept_context.allocator,
-        daemon_dispatcher,
-        client_fd,
-        .{
-            .terminal_remote_exe = accept_context.terminal_remote_exe,
-            .proxy_remote_exe = accept_context.proxy_remote_exe,
-            .identity = accept_context.identity,
-            .active_local_clients = accept_context.active_local_clients,
-        },
-    );
+    try socket_transport.setCloseOnExec(owned_client_fd.get());
+    try core_fds.setNonBlocking(owned_client_fd.get());
+    try client_router.registerAcceptedClient(.{
+        .allocator = accept_context.allocator,
+        .daemon_dispatcher = daemon_dispatcher,
+        .client_fd = owned_client_fd.get(),
+        .terminal_remote_exe = accept_context.terminal_remote_exe,
+        .proxy_remote_exe = accept_context.proxy_remote_exe,
+        .identity = accept_context.identity,
+        .active_local_clients = accept_context.active_local_clients,
+    });
+    _ = owned_client_fd.take();
 }

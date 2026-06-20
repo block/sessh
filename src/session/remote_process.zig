@@ -4,12 +4,9 @@ const posix = std.posix;
 
 const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
+const process_wait = @import("../core/waitpid.zig");
 const pty_process = @import("../tty/pty_process.zig");
 const terminal = @import("../tty/terminal.zig");
-
-// POSIX WNOHANG. Zig 0.15 does not expose a portable constant, and our
-// supported Unix targets use the stable POSIX value.
-const wait_nohang: c_int = 1;
 
 pub const pty_hangup_reap_poll_ms: i64 = 50;
 
@@ -32,12 +29,12 @@ pub const Process = struct {
     pty_closed_for_hangup: bool = false,
 
     pub fn spawn(allocator: std.mem.Allocator, options: pty_process.SpawnOptions) !Process {
-        const child = try pty_process.spawn(allocator, options);
-        errdefer posix.close(child.master_fd);
-        try core_fds.setNonBlocking(child.master_fd);
+        const pty = try pty_process.spawn(allocator, options);
+        errdefer posix.close(pty.master_fd);
+        try core_fds.setNonBlocking(pty.master_fd);
         return .{
-            .pid = child.pid,
-            .pty_fd = child.master_fd,
+            .pid = pty.pid,
+            .pty_fd = pty.master_fd,
         };
     }
 
@@ -45,8 +42,8 @@ pub const Process = struct {
         return self.pty_fd >= 0;
     }
 
-    pub fn setPtySize(self: *const Process, rows: u16, cols: u16) void {
-        if (self.pty_fd >= 0) _ = terminal.setPtySize(self.pty_fd, rows, cols);
+    pub fn setPtySize(self: *const Process, size: terminal.WindowSize) void {
+        if (self.pty_fd >= 0) _ = terminal.setPtySize(self.pty_fd, size);
     }
 
     pub fn closePty(self: *Process) void {
@@ -69,7 +66,7 @@ pub const Process = struct {
 pub fn reapPid(pid: c.pid_t) bool {
     if (pid <= 0) return true;
     var status: c_int = 0;
-    const result = c.waitpid(pid, &status, wait_nohang);
+    const result = c.waitpid(pid, &status, process_wait.nohang);
     if (result == pid) return true;
     if (result < 0) return switch (posix.errno(result)) {
         .CHILD => true,
@@ -87,7 +84,7 @@ pub fn waitForExitInfo(pid: c.pid_t, now_unix_ms: u64) ?ExitInfo {
 
 pub fn pollExit(pid: c.pid_t, now_unix_ms: u64) PollExitResult {
     var status: c_int = 0;
-    const result = c.waitpid(pid, &status, wait_nohang);
+    const result = c.waitpid(pid, &status, process_wait.nohang);
     if (result == pid) return .{ .exited = exitInfoFromWaitStatus(status, now_unix_ms) };
     if (result < 0) {
         return switch (posix.errno(result)) {
@@ -98,7 +95,7 @@ pub fn pollExit(pid: c.pid_t, now_unix_ms: u64) PollExitResult {
     return .running;
 }
 
-pub fn exitInfoFromWaitStatus(status: c_int, now_unix_ms: u64) ExitInfo {
+fn exitInfoFromWaitStatus(status: c_int, now_unix_ms: u64) ExitInfo {
     const raw: u32 = @bitCast(status);
     const signal_number = raw & 0x7f;
     if (signal_number == 0) {

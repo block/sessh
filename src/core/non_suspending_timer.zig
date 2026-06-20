@@ -50,7 +50,7 @@ pub fn nowMs() NonSuspendingTimer.Error!u64 {
     return (try nowNs()) / std.time.ns_per_ms;
 }
 
-pub fn nowNs() NonSuspendingTimer.Error!u64 {
+fn nowNs() NonSuspendingTimer.Error!u64 {
     const clock_id = switch (builtin.os.tag) {
         .linux => std.posix.CLOCK.BOOTTIME,
         .macos, .ios, .tvos, .watchos, .visionos => std.posix.CLOCK.MONOTONIC,

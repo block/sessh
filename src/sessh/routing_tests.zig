@@ -47,7 +47,12 @@ fn shouldUseProxyStreamForTest(parsed: ParsedSesshForTest, stdin_is_tty: bool) b
 }
 
 fn shouldUseProxyStreamForTestWithStdout(parsed: ParsedSesshForTest, stdin_is_tty: bool, stdout_is_tty: bool) bool {
-    return routing.shouldUseProxyStream(remoteNewFromParsedSessh(parsed), parsed.invocation.common, stdin_is_tty, stdout_is_tty);
+    return routing.shouldUseProxyStream(.{
+        .new = remoteNewFromParsedSessh(parsed),
+        .common = parsed.invocation.common,
+        .stdin_is_tty = stdin_is_tty,
+        .stdout_is_tty = stdout_is_tty,
+    });
 }
 
 test "remote shell command detection treats empty command like OpenSSH" {

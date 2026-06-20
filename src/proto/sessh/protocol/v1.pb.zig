@@ -1204,7 +1204,7 @@ pub const ClientDaemonItem = struct {
 
     /// Visible client request to receive/send control messages for a proxy stream.
     /// The ProxyCommand process does not send this: its normal ProxyStreamItem.Open
-    /// already carries the same p-guid, so sesshd can attach this control channel
+    /// already carries the same p-guid, so sesshd can associate this control channel
     /// to the in-memory proxy stream.
     pub const ProxyDiagnosticsOpen = struct {
         proxy_guid: []const u8 = &.{},
@@ -1581,9 +1581,8 @@ pub const DaemonTunnelItem = struct {
         .payload = fd(null, .{ .oneof = payload_union }),
     };
 
-    /// Transport control frame used to check whether the peer is still responsive.
-    /// Ping/Pong live outside all logical streams, so handling them must not
-    /// advance stream offsets or mutate terminal contents.
+    /// Tunnel liveness probe. Ping/Pong live outside all logical streams, so
+    /// handling them must not advance stream offsets or mutate terminal contents.
     pub const Ping = struct {
         pub const _desc_table = .{};
 
@@ -2797,7 +2796,7 @@ pub const TerminalEmulatorItem = struct {
         input_ack,
         resize,
         repaint_request,
-        session_attached,
+        session_ready,
         session_ended,
         draw,
         repaint_response,
@@ -2813,7 +2812,7 @@ pub const TerminalEmulatorItem = struct {
         input_ack: TerminalEmulatorItem.InputAck,
         resize: TerminalEmulatorItem.Resize,
         repaint_request: TerminalEmulatorItem.RepaintRequest,
-        session_attached: TerminalEmulatorItem.SessionAttached,
+        session_ready: TerminalEmulatorItem.SessionReady,
         session_ended: TerminalEmulatorItem.SessionEnded,
         draw: TerminalEmulatorItem.Draw,
         repaint_response: TerminalEmulatorItem.RepaintResponse,
@@ -2828,7 +2827,7 @@ pub const TerminalEmulatorItem = struct {
             .input_ack = fd(3, .submessage),
             .resize = fd(4, .submessage),
             .repaint_request = fd(5, .submessage),
-            .session_attached = fd(6, .submessage),
+            .session_ready = fd(6, .submessage),
             .session_ended = fd(7, .submessage),
             .draw = fd(8, .submessage),
             .repaint_response = fd(9, .submessage),
@@ -2952,8 +2951,9 @@ pub const TerminalEmulatorItem = struct {
         };
 
         /// Portable PTY settings captured from the client-side tty before sessh puts
-        /// it into raw mode. This follows SSH's pty-req model: do not send a native
-        /// termios struct, because those layouts and flag values are OS-specific.
+        /// it into an unhygienic relay state. This follows SSH's pty-req model: do
+        /// not send a native termios struct, because those layouts and flag values
+        /// are OS-specific.
         pub const TtySettings = struct {
             term: ?[]const u8 = null,
             tty_mode: std.ArrayListUnmanaged(TerminalEmulatorItem.SessionCreate.TtySettings.Mode) = .empty,
@@ -3424,7 +3424,7 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Confirms that the remote terminal process received an Input frame.
+    /// Confirms that the terminal worker received an Input frame.
     pub const InputAck = struct {
         input_seq: u64 = 0,
 
@@ -3491,7 +3491,7 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Current terminal size for this attached client.
+    /// Current terminal size for this visible client connection.
     pub const Resize = struct {
         terminal_rows: u32 = 0,
         terminal_cols: u32 = 0,
@@ -3564,8 +3564,8 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Requests that the remote terminal process redraw terminal state for this
-    /// attached client.
+    /// Requests that the terminal worker redraw terminal state for this
+    /// visible client connection.
     pub const RepaintRequest = struct {
         repaint_request_seq: u64 = 0,
         scrollback_cursor: ?[]const u8 = null,
@@ -3635,7 +3635,7 @@ pub const TerminalEmulatorItem = struct {
     };
 
     /// Confirms the session selected for this connection.
-    pub const SessionAttached = struct {
+    pub const SessionReady = struct {
         session_guid: []const u8 = &.{},
 
         pub const _desc_table = .{
@@ -3701,7 +3701,7 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Debug-only request that severs all attached client connections.
+    /// Debug-only request that severs all visible client connections.
     pub const SessionClientDebugSeverConnectionRequest = struct {
         pub const _desc_table = .{};
 
@@ -3764,7 +3764,7 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Debug-only request that makes all attached client connections stop
+    /// Debug-only request that makes all visible client connections stop
     /// responding for a bounded duration. Omitted or zero seconds asks the
     /// receiver to use its default debug-unresponsive duration.
     pub const SessionClientDebugUnresponsiveConnectionRequest = struct {
@@ -3960,7 +3960,7 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Tells an attached client that the session has ended.
+    /// Tells a visible client connection that the session has ended.
     pub const SessionEnded = struct {
         reason: TerminalEmulatorItem.SessionEnded.Reason = @enumFromInt(0),
         exit_status: ?TerminalEmulatorItem.SessionEnded.ExitStatus = null,
@@ -4115,19 +4115,19 @@ pub const TerminalEmulatorItem = struct {
         }
     };
 
-    /// Remote-terminal-generated terminal bytes for the attached session.
+    /// Remote-terminal-generated terminal bytes for the visible session view.
     pub const Draw = struct {
         scrollback_cursor: []const u8 = &.{},
         viewport_offset: ?i32 = null,
         draw_bytes: []const u8 = &.{},
-        attached_client_end_restore_bytes: ?[]const u8 = null,
+        visible_client_end_restore_bytes: ?[]const u8 = null,
         app_title_present: ?bool = null,
 
         pub const _desc_table = .{
             .scrollback_cursor = fd(1, .{ .scalar = .bytes }),
             .viewport_offset = fd(2, .{ .scalar = .sint32 }),
             .draw_bytes = fd(3, .{ .scalar = .bytes }),
-            .attached_client_end_restore_bytes = fd(4, .{ .scalar = .bytes }),
+            .visible_client_end_restore_bytes = fd(4, .{ .scalar = .bytes }),
             .app_title_present = fd(5, .{ .scalar = .bool }),
         };
 

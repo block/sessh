@@ -3,10 +3,12 @@ const app_allocator = @import("../core/app_allocator.zig");
 const guid_ref = @import("../core/guid.zig");
 const protocol = @import("../protocol/mod.zig");
 const pty_process = @import("../tty/pty_process.zig");
+const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
 const vt = @import("vt.zig");
 
 const pb = protocol.pb;
+const WindowSize = terminal.WindowSize;
 
 pub const SessionEnvironment = struct {
     shell: ?[]const u8 = null,
@@ -23,18 +25,18 @@ pub const SessionEnvironment = struct {
     }
 };
 
-pub const AttachRequest = struct {
+pub const VisibleClientOpenRequest = struct {
     resize: ResizePayload,
     session_guid: []u8,
     capture_tty_transcript: bool,
 
-    pub fn deinit(self: *AttachRequest) void {
+    pub fn deinit(self: *VisibleClientOpenRequest) void {
         app_allocator.allocator().free(self.session_guid);
         self.* = undefined;
     }
 };
 
-pub const SessionCreateRequest = struct {
+const SessionCreateRequest = struct {
     resize: ResizePayload,
     scrollback_row_count: u32,
     environment: SessionEnvironment,
@@ -70,8 +72,7 @@ pub const ScrollbackCursor = struct {
 pub const encoded_scrollback_cursor_len = 16;
 
 pub const ResizePayload = struct {
-    rows: u16,
-    cols: u16,
+    size: WindowSize,
     viewport_offset: ?i32,
     repaint_request: ?RepaintRequest,
 };
@@ -82,12 +83,14 @@ fn readDefaultColorValue(color: u32) !u32 {
     return error.InvalidDefaultColor;
 }
 
-pub fn encodeScrollbackCursor(out: *[encoded_scrollback_cursor_len]u8, epoch: u64, per_epoch_cursor: u64) void {
+pub fn encodeScrollbackCursor(epoch: u64, per_epoch_cursor: u64) [encoded_scrollback_cursor_len]u8 {
+    var out: [encoded_scrollback_cursor_len]u8 = undefined;
     writeU64BigEndian(out[0..8], epoch);
     writeU64BigEndian(out[8..16], per_epoch_cursor);
+    return out;
 }
 
-pub fn decodeScrollbackCursor(bytes: []const u8) !ScrollbackCursor {
+fn decodeScrollbackCursor(bytes: []const u8) !ScrollbackCursor {
     if (bytes.len == 0) return .{ .epoch = 0, .per_epoch_cursor = 0 };
     if (bytes.len != encoded_scrollback_cursor_len) return error.InvalidScrollbackCursor;
     return .{
@@ -249,14 +252,16 @@ pub fn resizePayloadFromMessage(message: pb.TerminalEmulatorItem.Resize) !Resize
         if (offset > std.math.maxInt(u16)) return error.IntOutOfRange;
     }
     return .{
-        .rows = @intCast(message.terminal_rows),
-        .cols = @intCast(message.terminal_cols),
+        .size = .{
+            .rows = @intCast(message.terminal_rows),
+            .cols = @intCast(message.terminal_cols),
+        },
         .viewport_offset = message.viewport_offset,
         .repaint_request = if (message.repaint_request) |repaint| try repaintRequestFromMessage(repaint) else null,
     };
 }
 
-pub fn attachRequestFromOpen(message: pb.TerminalEmulatorItem.Open) !AttachRequest {
+pub fn visibleClientOpenRequestFromOpen(message: pb.TerminalEmulatorItem.Open) !VisibleClientOpenRequest {
     const resize = message.resize orelse return error.MissingResize;
     if (message.session_guid.len > 0 and !guid_ref.isValidSessionGuid(message.session_guid)) return error.InvalidSessionGuid;
     return .{
@@ -276,3 +281,23 @@ pub fn repaintRequestFromMessage(message: pb.TerminalEmulatorItem.RepaintRequest
     };
 }
 
+test "resize payload decodes protobuf dimensions into window size" {
+    const payload = try resizePayloadFromMessage(.{
+        .terminal_rows = 33,
+        .terminal_cols = 120,
+        .viewport_offset = 4,
+        .repaint_request = .{ .repaint_request_seq = 7 },
+    });
+
+    try std.testing.expectEqual(WindowSize{ .rows = 33, .cols = 120 }, payload.size);
+    try std.testing.expectEqual(@as(?i32, 4), payload.viewport_offset);
+    try std.testing.expectEqual(@as(u64, 7), payload.repaint_request.?.repaint_request_seq);
+}
+
+test "resize payload rejects impossible viewport offsets" {
+    try std.testing.expectError(error.InvalidViewportOffset, resizePayloadFromMessage(.{
+        .terminal_rows = 24,
+        .terminal_cols = 80,
+        .viewport_offset = -2,
+    }));
+}

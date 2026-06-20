@@ -72,6 +72,32 @@ pub const WriteSomeResult = union(enum) {
     would_block,
 };
 
+pub const ReadSomeResult = union(enum) {
+    bytes: []const u8,
+    would_block,
+    eof,
+};
+
+pub fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
+    while (true) {
+        const n = c.read(fd, buf.ptr, buf.len);
+        if (n > 0) return .{ .bytes = buf[0..@intCast(n)] };
+        if (n == 0) return .eof;
+
+        switch (posix.errno(n)) {
+            .AGAIN => return .would_block,
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+    }
+}
+
+pub fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
+    var flags_guard = core_fds.StatusFlagsGuard.setNonBlocking(fd) catch return error.ReadFailed;
+    defer flags_guard.restore();
+    return readSome(fd, buf);
+}
+
 pub fn writeSomeNonBlocking(fd: c.fd_t, bytes: []const u8) !WriteSomeResult {
     if (bytes.len == 0) return .{ .wrote = 0 };
 
@@ -94,7 +120,7 @@ pub fn writeSomeNonBlocking(fd: c.fd_t, bytes: []const u8) !WriteSomeResult {
 pub fn stderrPrint(comptime fmt: []const u8, args: anytype) !void {
     var buf: [1024]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, fmt, args);
-    try writeAll(2, text);
+    try writeAll(posix.STDERR_FILENO, text);
 }
 
 fn waitReadable(fd: c.fd_t) !void {
@@ -121,4 +147,24 @@ fn waitWritable(fd: c.fd_t) !void {
         if ((pollfds[0].revents & posix.POLL.OUT) != 0) return;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
     }
+}
+
+test "readSomeNonBlocking reports bytes, would-block, and eof" {
+    const pipe_fds = try posix.pipe();
+    var read_end = core_fds.OwnedFd.init(pipe_fds[0]);
+    defer read_end.deinit();
+    var write_end = core_fds.OwnedFd.init(pipe_fds[1]);
+    defer write_end.deinit();
+
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(ReadSomeResult.would_block, try readSomeNonBlocking(read_end.get(), &buf));
+
+    try writeAll(write_end.get(), "abc");
+    switch (try readSomeNonBlocking(read_end.get(), &buf)) {
+        .bytes => |bytes| try std.testing.expectEqualStrings("abc", bytes),
+        else => return error.ExpectedBytes,
+    }
+
+    write_end.deinit();
+    try std.testing.expectEqual(ReadSomeResult.eof, try readSomeNonBlocking(read_end.get(), &buf));
 }

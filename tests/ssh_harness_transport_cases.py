@@ -77,7 +77,7 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
     fake_trace = tmp / "fake-ssh.trace"
     fake_config = tmp / "ssh_config"
     remote_shell = tmp / "remote-shell"
-    marker = "SSH_ATTACH_READY"
+    marker = "SSH_SESSION_READY"
     fake_config.write_text("Host test-host\n")
     remote_shell.write_text(
         f"#!/bin/sh\n"
@@ -131,11 +131,7 @@ def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
         raise AssertionError(ssh_failure_diagnostics("sessh returned non-zero", result, fake_log, fake_trace))
     if marker not in result.stdout:
         raise AssertionError(
-            ssh_failure_diagnostics("ssh attach did not render remote output", result, fake_log, fake_trace)
-        )
-    if "ssh terminal worker attach is not implemented yet" in result.stderr:
-        raise AssertionError(
-            ssh_failure_diagnostics("ssh terminal worker attach fallback was used", result, fake_log, fake_trace)
+            ssh_failure_diagnostics("ssh session did not render remote output", result, fake_log, fake_trace)
         )
     if any(token in result.stdout or token in result.stderr for token in ("MISSING ", "UPLOAD ", "OK\n")):
         raise AssertionError(
@@ -411,7 +407,7 @@ def test_ssh_transports_pool_terminal_tcp_connection(tmp):
                 shell_command=command,
             ),
         )
-        recv_until_message(conn, SESSION_ATTACHED, timeout=30.0)
+        recv_until_message(conn, SESSION_READY, timeout=30.0)
         recv_draw_until(conn, marker.encode("utf-8"), timeout=30.0)
         return conn
 
@@ -510,7 +506,7 @@ def test_ssh_transport_pool_key_ignores_agent_socket_identity(tmp):
                 shell_command=command,
             ),
         )
-        recv_until_message(conn, SESSION_ATTACHED, timeout=30.0)
+        recv_until_message(conn, SESSION_READY, timeout=30.0)
         recv_draw_until(conn, marker.encode("utf-8"), timeout=30.0)
         return conn
 
@@ -586,7 +582,7 @@ def test_ssh_transport_pool_key_includes_ipqos(tmp):
                 shell_command=command,
             ),
         )
-        recv_until_message(conn, SESSION_ATTACHED, timeout=30.0)
+        recv_until_message(conn, SESSION_READY, timeout=30.0)
         recv_draw_until(conn, marker.encode("utf-8"), timeout=30.0)
         return conn
 
@@ -640,33 +636,7 @@ def test_ssh_proxy_streams_pool_tcp_connection(tmp):
     env["SESSH_FAKE_SSH_G_HOSTNAME"] = "pool-host"
     env["SESSH_FAKE_SSH_G_PORT"] = "2222"
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("127.0.0.1", 0))
-    server.listen()
-    server_port = server.getsockname()[1]
-    server_stop = threading.Event()
-
-    def echo_server():
-        while not server_stop.is_set():
-            try:
-                server.settimeout(0.1)
-                conn, _ = server.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            threading.Thread(target=echo_connection, args=(conn,), daemon=True).start()
-
-    def echo_connection(conn):
-        with conn:
-            while True:
-                data = conn.recv(4096)
-                if not data:
-                    return
-                conn.sendall(data)
-
-    server_thread = threading.Thread(target=echo_server, daemon=True)
-    server_thread.start()
+    server, server_stop, server_port = start_tcp_echo_server()
 
     def send_ssh_transport_acquire(conn):
         request = sessh_pb().ClientDaemonItem.SshTransportAcquire(host="test-host", bootstrap=True)
@@ -809,36 +779,6 @@ def recv_fd(sock, timeout=10.0):
     raise AssertionError(f"no fd received; msg={msg!r} ancdata={ancdata!r}")
 
 
-def start_tcp_echo_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("127.0.0.1", 0))
-    server.listen()
-    server_port = server.getsockname()[1]
-    server_stop = threading.Event()
-
-    def echo_connection(conn):
-        with conn:
-            while True:
-                data = conn.recv(4096)
-                if not data:
-                    return
-                conn.sendall(data)
-
-    def echo_server():
-        while not server_stop.is_set():
-            try:
-                server.settimeout(0.1)
-                conn, _ = server.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            threading.Thread(target=echo_connection, args=(conn,), daemon=True).start()
-
-    threading.Thread(target=echo_server, daemon=True).start()
-    return server, server_stop, server_port
-
-
 def test_ssh_proxy_fd_pass_process_exits_and_raw_fd_streams(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
@@ -920,4 +860,3 @@ def test_ssh_proxy_fd_pass_process_exits_and_raw_fd_streams(tmp):
     log_text = optional_text(fake_log)
     if ssh_invocation_count(fake_log) != 1:
         raise AssertionError(f"expected one pooled ssh transport invocation, got log:\n{log_text}")
-

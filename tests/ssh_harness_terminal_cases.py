@@ -171,7 +171,7 @@ def test_ssh_tty_stdin_remote_command_does_not_allocate_tty_without_t(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_terminal_emulator_tty_preserves_exit_status(tmp):
+def test_ssh_filter_level_emulated_tty_preserves_exit_status(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -194,7 +194,7 @@ def test_ssh_terminal_emulator_tty_preserves_exit_status(tmp):
         raise AssertionError(log_text)
 
 
-def test_ssh_terminal_emulator_tty_propagates_resize(tmp):
+def test_ssh_filter_level_emulated_tty_propagates_resize(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -648,7 +648,7 @@ def test_ssh_filter_level_hygienic_release_artifact_restores_local_tty_on_exit(t
         )
 
 
-def test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit(tmp):
+def test_ssh_filter_level_emulated_release_artifact_restores_local_tty_on_exit(tmp):
     artifact = local_artifact()
     if not artifact.exists():
         print(f"SKIP release artifact tty restore test; missing {artifact}", file=sys.stderr)
@@ -675,7 +675,7 @@ def test_ssh_terminal_emulator_release_artifact_restores_local_tty_on_exit(tmp):
         raise AssertionError(result)
     if result.tty_attrs_before != result.tty_attrs_after:
         raise AssertionError(
-            "terminal-emulator release artifact did not restore local tty modes\n"
+            "filter-level emulated release artifact did not restore local tty modes\n"
             f"before: {tty_attr_summary(result.tty_attrs_before)}\n"
             f"after:  {tty_attr_summary(result.tty_attrs_after)}\n"
             f"output: {result.stdout!r}"
@@ -752,7 +752,7 @@ def test_ssh_filter_level_hygienic_tty_uses_proxy_with_hygienic_diagnostics(tmp)
         raise AssertionError(log_text)
 
 
-def test_ssh_terminal_emulator_tty_escape_doubled_tilde(tmp):
+def test_ssh_filter_level_emulated_tty_escape_doubled_tilde(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -777,7 +777,7 @@ def test_ssh_terminal_emulator_tty_escape_doubled_tilde(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_terminal_emulator_tty_escape_help_modal_repaints(tmp):
+def test_ssh_filter_level_emulated_tty_escape_help_modal_repaints(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -804,7 +804,7 @@ def test_ssh_terminal_emulator_tty_escape_help_modal_repaints(tmp):
         output = read_pty_until(fd, output, b"HELP_READY", 10.0)
         os.write(fd, b"\r~?")
         output = read_pty_until(fd, output, b"Any key to dismiss", 10.0)
-        output = read_pty_until(fd, output, b"~.  disconnect", 10.0)
+        output = read_pty_until(fd, output, b"~.  close session", 10.0)
         output = read_pty_until(fd, output, b"~p  repaint", 10.0)
         os.write(fd, b"ignored\n")
         output = read_pty_until_count(fd, output, b"HELP_READY", 2, 10.0)
@@ -1097,7 +1097,7 @@ def test_ssh_version_mismatch_fallback_message_is_precise(tmp):
     combined_output = result.stdout + result.stderr
     if "existing remote sessh is incompatible" not in combined_output:
         raise AssertionError(result)
-    if "falling back to plain ssh without persistence" not in combined_output:
+    if "falling back to plain ssh without sessh recovery" not in combined_output:
         raise AssertionError(result)
     if "no matching sessh binary" in combined_output or "unsupported" in combined_output:
         raise AssertionError(result)

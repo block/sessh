@@ -1,6 +1,6 @@
 # sessh
 
-`sessh` is `ssh` with persistent sessions and seamless connection recovery.
+`sessh` is `ssh` with seamless connection recovery.
 
 - no more losing work due to network disconnections
 - no need to install anything remotely: `sessh` will bootstrap

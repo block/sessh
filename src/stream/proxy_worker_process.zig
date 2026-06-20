@@ -14,7 +14,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const proxy_host = args[3];
     const proxy_port = try std.fmt.parseInt(u16, args[4], 10);
 
-    try proxy_worker.runRemoteWorker(allocator, guid, listener.fd, proxy_host, proxy_port);
+    try proxy_worker.runRemoteWorker(.{
+        .allocator = allocator,
+        .guid = guid,
+        .replacement_listen_fd = listener.fd,
+        .proxy_host = proxy_host,
+        .proxy_port = proxy_port,
+    });
 }
 
 test "proxy worker process rejects invalid argv" {

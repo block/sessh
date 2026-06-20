@@ -5,6 +5,7 @@ const posix = std.posix;
 const app_allocator = @import("../core/app_allocator.zig");
 const client_log = @import("../core/client_log.zig");
 const core_fds = @import("../core/fds.zig");
+const fixed_buffer = @import("../core/fixed_buffer.zig");
 const client_renderer = @import("renderer.zig");
 const connection_event = @import("../diagnostics/connection_event.zig");
 const diagnostics_display = @import("../diagnostics/display.zig");
@@ -18,6 +19,7 @@ const reconnect_title = @import("../reconnect/title.zig");
 const terminal = @import("../tty/terminal.zig");
 
 const WindowSize = terminal.WindowSize;
+const TerminalFds = terminal.TerminalFds;
 const pb = protocol.pb;
 pub const OverlayLine = overlay.Line;
 pub const OverlayDrawState = overlay.DrawState;
@@ -28,6 +30,8 @@ pub const restoreOverlayExpansion = overlay.restoreOverlayExpansion;
 
 pub const ReconnectPresentation = diagnostics_display.Presentation;
 pub const ReconnectDecision = reconnect_input.Decision;
+const OverlayMessage = fixed_buffer.FixedBuffer(overlay.max_message_bytes);
+const OverlayDiagnosticLine = fixed_buffer.FixedBuffer(client_log.max_user_diagnostic_display_bytes);
 
 pub const ReconnectSwitchDisposition = enum {
     automatic,
@@ -36,19 +40,55 @@ pub const ReconnectSwitchDisposition = enum {
     manual_unresponsive,
 };
 
+pub const ReconnectSwitchContext = struct {
+    pending_input_at_disconnect: bool = false,
+    pending_paste_like_input_at_disconnect: bool = false,
+    unresponsive: bool = false,
+};
+
 pub const ReconnectUiOptions = struct {
     presentation: ReconnectPresentation = .overlay,
-    input_fd: c.fd_t = posix.STDIN_FILENO,
-    output_fd: c.fd_t = posix.STDOUT_FILENO,
+    terminal_fds: TerminalFds = .{},
     line_fd: c.fd_t = posix.STDERR_FILENO,
 };
 
-const OverlayDiagnosticLine = struct {
-    bytes: [client_log.max_user_diagnostic_display_bytes]u8 = undefined,
-    len: usize = 0,
+const DiagnosticNotifyPipe = struct {
+    read_fd: c.fd_t = -1,
+    write_fd: c.fd_t = -1,
+    registered: bool = false,
 
-    fn slice(self: *const OverlayDiagnosticLine) []const u8 {
-        return self.bytes[0..self.len];
+    fn init() !DiagnosticNotifyPipe {
+        const fds = try posix.pipe();
+        var pipe = DiagnosticNotifyPipe{
+            .read_fd = fds[0],
+            .write_fd = fds[1],
+        };
+        errdefer pipe.deinit();
+
+        try core_fds.setNonBlocking(pipe.read_fd);
+        try core_fds.setNonBlocking(pipe.write_fd);
+        client_log.registerNonBlockingUserDiagnosticNotifier(pipe.write_fd);
+        pipe.registered = true;
+        return pipe;
+    }
+
+    fn deinit(self: *DiagnosticNotifyPipe) void {
+        if (self.registered) {
+            client_log.unregisterNonBlockingUserDiagnosticNotifier(self.write_fd);
+            self.registered = false;
+        }
+        if (self.write_fd >= 0) {
+            posix.close(self.write_fd);
+            self.write_fd = -1;
+        }
+        if (self.read_fd >= 0) {
+            posix.close(self.read_fd);
+            self.read_fd = -1;
+        }
+    }
+
+    fn readFd(self: *const DiagnosticNotifyPipe) c.fd_t {
+        return self.read_fd;
     }
 };
 
@@ -58,10 +98,8 @@ pub const ReconnectUi = struct {
     mode_guard: terminal.TerminalModeGuard,
     viewport_offset: u16 = 0,
     overlay_state: ?OverlayDrawState = null,
-    overlay_message: [max_overlay_message_bytes]u8 = undefined,
-    overlay_message_len: usize = 0,
-    diagnostic_notify_read_fd: c.fd_t = -1,
-    diagnostic_notify_write_fd: c.fd_t = -1,
+    overlay_message: OverlayMessage = .{},
+    diagnostic_notify_pipe: DiagnosticNotifyPipe = .{},
     clock: NonSuspendingTimer = undefined,
     diagnostic_cursor: u64 = 0,
     live_diagnostic_start_seq: u64 = 0,
@@ -71,8 +109,7 @@ pub const ReconnectUi = struct {
     cursor_hidden: bool = false,
     reconnect_input_state: reconnect_input.State = .{},
     cancelled: bool = false,
-    input_fd: c.fd_t = posix.STDIN_FILENO,
-    output_fd: c.fd_t = posix.STDOUT_FILENO,
+    terminal_fds: TerminalFds = .{},
     line_fd: c.fd_t = posix.STDERR_FILENO,
     title_state: diagnostics_display.TitleState = .{},
     presentation: ReconnectPresentation = .overlay,
@@ -90,14 +127,13 @@ pub const ReconnectUi = struct {
     }
 
     pub fn beginWithOptions(viewport_offset: i32, options: ReconnectUiOptions) !ReconnectUi {
-        const title_enabled = (options.presentation == .overlay or options.presentation == .title) and c.isatty(options.output_fd) != 0;
+        const title_enabled = (options.presentation == .overlay or options.presentation == .title) and c.isatty(options.terminal_fds.output) != 0;
         var ui = ReconnectUi{
-            .mode_guard = try terminal.TerminalModeGuard.enable(options.input_fd),
+            .mode_guard = try terminal.TerminalModeGuard.enable(options.terminal_fds.input),
             .clock = try NonSuspendingTimer.start(),
-            .input_fd = options.input_fd,
-            .output_fd = options.output_fd,
+            .terminal_fds = options.terminal_fds,
             .line_fd = options.line_fd,
-            .title_state = diagnostics_display.TitleState.init(title_enabled, options.output_fd),
+            .title_state = diagnostics_display.TitleState.init(title_enabled, options.terminal_fds.output),
             .presentation = options.presentation,
             .last_size = terminal.currentWindowSize(),
         };
@@ -107,34 +143,17 @@ pub const ReconnectUi = struct {
         ui.diagnostic_cursor = client_log.displayedUserDiagnosticSeq();
         ui.live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq();
         ui.rendered_diagnostic_seq = ui.diagnostic_cursor;
-        const notify_pipe = try posix.pipe();
-        ui.diagnostic_notify_read_fd = notify_pipe[0];
-        ui.diagnostic_notify_write_fd = notify_pipe[1];
-        errdefer {
-            posix.close(ui.diagnostic_notify_read_fd);
-            posix.close(ui.diagnostic_notify_write_fd);
-        }
-        try core_fds.setNonBlocking(ui.diagnostic_notify_read_fd);
-        try core_fds.setNonBlocking(ui.diagnostic_notify_write_fd);
-        client_log.registerUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
-        errdefer client_log.unregisterUserDiagnosticNotifier(ui.diagnostic_notify_write_fd);
+        ui.diagnostic_notify_pipe = try DiagnosticNotifyPipe.init();
+        errdefer ui.diagnostic_notify_pipe.deinit();
         try ui.consumeDiagnostics();
         if (options.presentation == .overlay) try ui.hideCursor();
         return ui;
     }
 
     pub fn deinit(self: *ReconnectUi) void {
-        self.reconnect_input_state.clearDisconnectedInputFlash(self.output_fd) catch {};
+        self.reconnect_input_state.clearDisconnectedInputFlash(self.terminal_fds.output) catch {};
         self.restoreTitleForEnd();
-        if (self.diagnostic_notify_write_fd >= 0) {
-            client_log.unregisterUserDiagnosticNotifier(self.diagnostic_notify_write_fd);
-            posix.close(self.diagnostic_notify_write_fd);
-            self.diagnostic_notify_write_fd = -1;
-        }
-        if (self.diagnostic_notify_read_fd >= 0) {
-            posix.close(self.diagnostic_notify_read_fd);
-            self.diagnostic_notify_read_fd = -1;
-        }
+        self.diagnostic_notify_pipe.deinit();
         self.showCursor() catch {};
         self.mode_guard.restore();
     }
@@ -213,15 +232,10 @@ pub const ReconnectUi = struct {
         return self.reconnect_input_state.consumeReconnectAcknowledgement();
     }
 
-    pub fn reconnectSwitchDisposition(
-        self: *const ReconnectUi,
-        pending_input_at_disconnect: bool,
-        pending_paste_like_input_at_disconnect: bool,
-        unresponsive: bool,
-    ) ReconnectSwitchDisposition {
-        if (unresponsive) return .manual_unresponsive;
-        if (pending_paste_like_input_at_disconnect) return .manual_disconnected;
-        if (pending_input_at_disconnect or self.reconnect_input_state.input_during_disconnect) return .delayed;
+    pub fn reconnectSwitchDisposition(self: *const ReconnectUi, context: ReconnectSwitchContext) ReconnectSwitchDisposition {
+        if (context.unresponsive) return .manual_unresponsive;
+        if (context.pending_paste_like_input_at_disconnect) return .manual_disconnected;
+        if (context.pending_input_at_disconnect or self.reconnect_input_state.input_during_disconnect) return .delayed;
         return .automatic;
     }
 
@@ -304,33 +318,32 @@ pub const ReconnectUi = struct {
 
     pub fn refreshForResize(self: *ReconnectUi) !void {
         const size = terminal.currentWindowSize();
-        if (size.rows == self.last_size.rows and size.cols == self.last_size.cols) return;
+        if (size.eql(self.last_size)) return;
         self.last_size = size;
         self.resize_generation +%= 1;
         if (self.resize_generation == 0) self.resize_generation = 1;
-        if (self.presentation != .overlay or c.isatty(self.output_fd) == 0) return;
+        if (self.presentation != .overlay or c.isatty(self.terminal_fds.output) == 0) return;
 
-        const renderer = client_renderer.Renderer.init(self.output_fd);
-        try renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(self.input_fd, self.output_fd));
+        const renderer = client_renderer.Renderer.init(self.terminal_fds.output);
+        try renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(self.terminal_fds));
         try renderer.clearVisible();
         self.overlay_state = null;
         self.viewport_offset = 0;
-        if (self.overlay_message_len > 0) try self.drawCurrentOverlay();
+        if (!self.overlay_message.isEmpty()) try self.drawCurrentOverlay();
     }
 
     fn pollInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        return self.reconnect_input_state.poll(
-            self.input_fd,
-            self.output_fd,
-            self.diagnostic_notify_read_fd,
-            timeout_ms,
-            self.presentation == .overlay,
-            self.nowMs(),
-        );
+        return self.reconnect_input_state.poll(.{
+            .terminal_fds = self.terminal_fds,
+            .diagnostic_notify_read_fd = self.diagnostic_notify_pipe.readFd(),
+            .timeout_ms = timeout_ms,
+            .overlay_presentation = self.presentation == .overlay,
+            .now_ms = self.nowMs(),
+        });
     }
 
     fn refreshDisconnectedInputFlash(self: *ReconnectUi) !void {
-        try self.reconnect_input_state.refreshDisconnectedInputFlash(self.output_fd, self.nowMs());
+        try self.reconnect_input_state.refreshDisconnectedInputFlash(self.terminal_fds.output, self.nowMs());
     }
 
     fn nowMs(self: *ReconnectUi) u64 {
@@ -339,15 +352,15 @@ pub const ReconnectUi = struct {
 
     pub fn clearOverlay(self: *ReconnectUi) !i32 {
         if (self.presentation != .overlay) return @intCast(self.viewport_offset);
-        if (c.isatty(self.output_fd) == 0) return @intCast(self.viewport_offset);
+        if (c.isatty(self.terminal_fds.output) == 0) return @intCast(self.viewport_offset);
         const state = self.overlay_state orelse return @intCast(self.viewport_offset);
-        const renderer = client_renderer.Renderer.init(self.output_fd);
+        const renderer = client_renderer.Renderer.init(self.terminal_fds.output);
         const size = terminal.currentWindowSize();
-        try eraseOverlayRows(renderer, state, size.rows, size.cols);
-        try restoreOverlayExpansion(renderer, state, size.rows);
+        try eraseOverlayRows(renderer, state, size);
+        try restoreOverlayExpansion(renderer, state, size);
         self.viewport_offset = clearedOverlayViewportOffset(state);
         self.overlay_state = null;
-        try renderer.moveCursor(self.viewport_offset, 0);
+        try renderer.moveCursor(terminal.top_left_position.withRow(self.viewport_offset));
         return @intCast(self.viewport_offset);
     }
 
@@ -361,7 +374,11 @@ pub const ReconnectUi = struct {
             if (self.append_only_retry_announced) return;
             self.append_only_retry_announced = true;
             var message_buf: [192]u8 = undefined;
-            const message = try diagnostics_display.appendOnlyRetryStatus(&message_buf, delay_ms, true);
+            const message = try diagnostics_display.appendOnlyRetryStatus(.{
+                .buf = &message_buf,
+                .delay_ms = delay_ms,
+                .ctrl_r_enabled = true,
+            });
             try self.drawStaticOverlay(message);
             return;
         }
@@ -397,9 +414,7 @@ pub const ReconnectUi = struct {
     }
 
     fn drawStaticOverlay(self: *ReconnectUi, message: []const u8) !void {
-        const copy_len = @min(message.len, self.overlay_message.len);
-        @memcpy(self.overlay_message[0..copy_len], message[0..copy_len]);
-        self.overlay_message_len = copy_len;
+        self.overlay_message.setTruncate(message);
         try self.consumeDiagnostics();
         try self.drawCurrentOverlay();
     }
@@ -411,7 +426,7 @@ pub const ReconnectUi = struct {
     }
 
     fn drawCurrentOverlay(self: *ReconnectUi) !void {
-        const message = self.overlay_message[0..self.overlay_message_len];
+        const message = self.overlay_message.slice();
         switch (self.presentation) {
             .none, .title => return,
             .jsonl => {
@@ -426,14 +441,14 @@ pub const ReconnectUi = struct {
             .overlay => {},
         }
 
-        if (c.isatty(self.output_fd) == 0) {
-            try io_helpers.writeAll(self.output_fd, "\r\n");
-            try io_helpers.writeAll(self.output_fd, message);
-            try io_helpers.writeAll(self.output_fd, "\r\n");
+        if (c.isatty(self.terminal_fds.output) == 0) {
+            try io_helpers.writeAll(self.terminal_fds.output, "\r\n");
+            try io_helpers.writeAll(self.terminal_fds.output, message);
+            try io_helpers.writeAll(self.terminal_fds.output, "\r\n");
             for (self.diagnostic_lines[0..self.diagnostic_line_count]) |*line| {
-                if (line.len == 0) continue;
-                try io_helpers.writeAll(self.output_fd, line.slice());
-                try io_helpers.writeAll(self.output_fd, "\r\n");
+                if (line.isEmpty()) continue;
+                try io_helpers.writeAll(self.terminal_fds.output, line.slice());
+                try io_helpers.writeAll(self.terminal_fds.output, "\r\n");
             }
             return;
         }
@@ -456,14 +471,20 @@ pub const ReconnectUi = struct {
             overlay_lines[overlay_line_count] = .{ .text = line.slice(), .alignment = .left };
             overlay_line_count += 1;
         }
-        const renderer = client_renderer.Renderer.init(self.output_fd);
-        const state = try drawOverlayLines(renderer, size, self.viewport_offset, self.overlay_state, overlay_lines[0..overlay_line_count]);
+        const renderer = client_renderer.Renderer.init(self.terminal_fds.output);
+        const state = try drawOverlayLines(.{
+            .renderer = renderer,
+            .size = size,
+            .viewport_offset = self.viewport_offset,
+            .previous = self.overlay_state,
+            .lines = overlay_lines[0..overlay_line_count],
+        });
         self.viewport_offset = state.viewport_offset;
         self.overlay_state = state;
     }
 
     pub fn refreshOverlayIfDiagnosticsChanged(self: *ReconnectUi) !void {
-        if (self.overlay_message_len == 0) return;
+        if (self.overlay_message.isEmpty()) return;
         if (client_log.currentUserDiagnosticSeq() == self.rendered_diagnostic_seq) return;
         try self.consumeDiagnostics();
         if (self.appendOnlyPresentation()) return;
@@ -499,7 +520,11 @@ pub const ReconnectUi = struct {
     fn writePlainDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
         const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
         var line_buf: [client_log.max_user_diagnostic_display_bytes]u8 = undefined;
-        const len = diagnostics_display.formatDiagnostic(line_buf[0..], diagnostic, delayed);
+        const len = diagnostics_display.formatDiagnostic(.{
+            .out = line_buf[0..],
+            .diagnostic = diagnostic,
+            .delayed = delayed,
+        });
         io_helpers.writeAll(self.line_fd, line_buf[0..len]) catch return;
         io_helpers.writeAll(self.line_fd, "\r\n") catch {};
     }
@@ -516,20 +541,24 @@ pub const ReconnectUi = struct {
         }
         const delayed = diagnostic.seq <= self.live_diagnostic_start_seq;
         const target = &self.diagnostic_lines[self.diagnostic_line_count];
-        target.len = diagnostics_display.formatDiagnostic(target.bytes[0..], diagnostic, delayed);
+        target.assumeLen(diagnostics_display.formatDiagnostic(.{
+            .out = target.storageSlice(),
+            .diagnostic = diagnostic,
+            .delayed = delayed,
+        }));
         self.diagnostic_line_count += 1;
     }
 
     fn hideCursor(self: *ReconnectUi) !void {
-        if (c.isatty(self.output_fd) == 0) return;
-        try io_helpers.writeAll(self.output_fd, "\x1b[?25l");
+        if (c.isatty(self.terminal_fds.output) == 0) return;
+        try io_helpers.writeAll(self.terminal_fds.output, "\x1b[?25l");
         self.cursor_hidden = true;
     }
 
     fn showCursor(self: *ReconnectUi) !void {
         if (!self.cursor_hidden) return;
         self.cursor_hidden = false;
-        try io_helpers.writeAll(self.output_fd, "\x1b[?25h");
+        try io_helpers.writeAll(self.terminal_fds.output, "\x1b[?25h");
     }
 
     pub fn restoreTitleAfterReconnect(self: *ReconnectUi, app_title_present: ?bool, fallback_title: []const u8) void {
@@ -565,6 +594,24 @@ fn elapsedTimerMs(timer: *NonSuspendingTimer) u64 {
     return timer.read() / std.time.ns_per_ms;
 }
 
+test "DiagnosticNotifyPipe receives user diagnostic wakeup" {
+    var pipe = try DiagnosticNotifyPipe.init();
+    defer pipe.deinit();
+
+    client_log.userDiagnosticInfo("notifier smoke", .{});
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = pipe.readFd(),
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expect(try posix.poll(&pollfds, 0) > 0);
+
+    var buf: [8]u8 = undefined;
+    const n = c.read(pipe.readFd(), &buf, buf.len);
+    if (n <= 0) return error.MissingNotifierByte;
+}
+
 test "ReconnectUi records resize event for terminal worker forwarding" {
     var ui = ReconnectUi{
         .mode_guard = undefined,
@@ -586,8 +633,7 @@ test "ReconnectUi writes append-only diagnostics to configured line fd" {
         .mode_guard = undefined,
         .presentation = .line,
         .line_fd = fds[1],
-        .input_fd = -1,
-        .output_fd = -1,
+        .terminal_fds = .{ .input = -1, .output = -1 },
     };
     try ui.drawReconnectOverlay(53_000);
     try ui.drawReconnectOverlay(52_000);
@@ -617,8 +663,7 @@ test "ReconnectUi reads reconnect controls from configured input fd" {
     var ui = ReconnectUi{
         .mode_guard = undefined,
         .presentation = .none,
-        .input_fd = fds[0],
-        .output_fd = -1,
+        .terminal_fds = .{ .input = fds[0], .output = -1 },
         .line_fd = -1,
     };
 
@@ -630,23 +675,23 @@ test "reconnect switch disposition distinguishes typing paste and unresponsive" 
     var ui = ReconnectUi{ .mode_guard = undefined };
     try std.testing.expectEqual(
         ReconnectSwitchDisposition.automatic,
-        ui.reconnectSwitchDisposition(false, false, false),
+        ui.reconnectSwitchDisposition(.{}),
     );
     try std.testing.expectEqual(
         ReconnectSwitchDisposition.delayed,
-        ui.reconnectSwitchDisposition(true, false, false),
+        ui.reconnectSwitchDisposition(.{ .pending_input_at_disconnect = true }),
     );
     ui.reconnect_input_state.input_during_disconnect = true;
     try std.testing.expectEqual(
         ReconnectSwitchDisposition.delayed,
-        ui.reconnectSwitchDisposition(false, false, false),
+        ui.reconnectSwitchDisposition(.{}),
     );
     try std.testing.expectEqual(
         ReconnectSwitchDisposition.manual_disconnected,
-        ui.reconnectSwitchDisposition(false, true, false),
+        ui.reconnectSwitchDisposition(.{ .pending_paste_like_input_at_disconnect = true }),
     );
     try std.testing.expectEqual(
         ReconnectSwitchDisposition.manual_unresponsive,
-        ui.reconnectSwitchDisposition(false, false, true),
+        ui.reconnectSwitchDisposition(.{ .unresponsive = true }),
     );
 }

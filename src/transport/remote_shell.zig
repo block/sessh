@@ -47,7 +47,7 @@ pub fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []
     return shCommand(allocator, script.items);
 }
 
-pub fn shCommand(allocator: std.mem.Allocator, script: []const u8) ![]u8 {
+fn shCommand(allocator: std.mem.Allocator, script: []const u8) ![]u8 {
     const quoted_script = try shellQuote(allocator, script);
     defer allocator.free(quoted_script);
     return std.fmt.allocPrint(allocator, "exec /bin/sh -c {s}", .{quoted_script});
@@ -88,7 +88,7 @@ pub fn needsEncodedExecArg(arg: []const u8) bool {
 // remaining local argv with spaces and lets the remote login shell interpret
 // the result. The caller is responsible for only using this for that ssh-shaped
 // command form.
-pub fn joinRemoteShellCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
+fn joinRemoteShellCommandArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (args, 0..) |arg, i| {

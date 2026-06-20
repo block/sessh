@@ -15,10 +15,10 @@ def run_login_shell_profile_test(_base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, Path("/bin/sh"))
+                create_and_open_session(conn, Path("/bin/sh"))
                 message_type, _payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
                 recv_draw_until(conn, b"LOGIN_PROFILE_READY")
                 send_frame(conn, INPUT, pack_bytes(b"exit\n"))
                 recv_until_message(conn, SESSION_ENDED)
@@ -52,10 +52,10 @@ def run_session_create_command_argv_test(_base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell, command_argv=[command, "arg-one"])
+                create_and_open_session(conn, shell, command_argv=[command, "arg-one"])
                 message_type, _payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
                 _matched, draws = recv_draw_until(conn, b"COMMAND_ARGV_READY:arg-one")
                 draw_bytes = b"".join(draw["draw_bytes"] for draw in draws)
                 if b"UNEXPECTED_SHELL" in draw_bytes:
@@ -95,10 +95,10 @@ def run_session_create_shell_command_test(_base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(conn, shell, shell_command=shell_command)
+                create_and_open_session(conn, shell, shell_command=shell_command)
                 message_type, _payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
                 _matched, draws = recv_draw_until(conn, b"COMMAND_SHELL_READY:s-")
                 draw_bytes = b"".join(draw["draw_bytes"] for draw in draws)
                 if b"SHELL_EVAL_USED" not in draw_bytes:
@@ -125,7 +125,7 @@ def run_session_create_tty_settings_test(_base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn)
-                create_and_attach_session(
+                create_and_open_session(
                     conn,
                     "/bin/sh",
                     shell_command="printf 'TERM=%s\\n' \"$TERM\"; stty -a; exit",
@@ -138,8 +138,8 @@ def run_session_create_tty_settings_test(_base_env):
                     },
                 )
                 message_type, _payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
                 _matched, draws = recv_draw_until(conn, b"-echo")
                 draw_bytes = b"".join(draw["draw_bytes"] for draw in draws)
                 if b"TERM=ansi" not in draw_bytes or b"-echo" not in draw_bytes:
@@ -550,7 +550,7 @@ def run_daemon_log_session_lifecycle_test(_base_env):
             conn.connect(str(socket_path(env)))
             send_hello(conn)
             send_frame(conn, SESSION_CREATE, pack_session_create(shell))
-            recv_until_message(conn, SESSION_ATTACHED)
+            recv_until_message(conn, SESSION_READY)
             recv_until_message(conn, SESSION_ENDED)
 
             output += read_until_pipe(log_proc.stdout, b"terminal stream remote connected", timeout=5.0)
@@ -614,7 +614,7 @@ def run_daemon_log_mux_session_lifecycle_test(_base_env):
             send_mux_te_open(conn, shell, stream_id=1, session_id=session_id)
             while recv_mux_frame(conn).WhichOneof("message") != "open_ok":
                 pass
-            recv_mux_te_payload(conn, "session_attached")
+            recv_mux_te_payload(conn, "session_ready")
             ended_mux = recv_mux_te_payload_frame(conn, "session_ended")
             recv_mux_eof(conn, stream_id=1, expected_final_offset=ended_mux.payload.offset + 1)
 
@@ -627,7 +627,7 @@ def run_daemon_log_mux_session_lifecycle_test(_base_env):
                 f"terminal worker connected session={session_id} isolation_mode=process",
                 f"terminal mux remote open queued stream_id=1 session={session_id} action=create",
                 f"terminal mux stream open ok stream_id=1 session={session_id} action=create",
-                f"terminal session attached stream_id=1 session={session_id}",
+                f"terminal session ready stream_id=1 session={session_id}",
                 f"terminal session ended stream_id=1 session={session_id}",
             ):
                 if expected not in text:
@@ -682,7 +682,7 @@ def run_daemon_log_mux_session_in_daemon_worker_test(_base_env):
             send_mux_te_open(conn, shell, stream_id=1, session_id=session_id, isolation_mode=isolation_mode)
             while recv_mux_frame(conn).WhichOneof("message") != "open_ok":
                 pass
-            recv_mux_te_payload(conn, "session_attached")
+            recv_mux_te_payload(conn, "session_ready")
             ended_mux = recv_mux_te_payload_frame(conn, "session_ended")
             recv_mux_eof(conn, stream_id=1, expected_final_offset=ended_mux.payload.offset + 1)
 
@@ -692,7 +692,7 @@ def run_daemon_log_mux_session_in_daemon_worker_test(_base_env):
                 f"terminal mux stream opening stream_id=1 session={session_id} action=create",
                 f"terminal worker connected session={session_id} isolation_mode=none",
                 f"terminal mux stream open ok stream_id=1 session={session_id} action=create",
-                f"terminal session attached stream_id=1 session={session_id}",
+                f"terminal session ready stream_id=1 session={session_id}",
                 f"terminal session ended stream_id=1 session={session_id}",
             ):
                 if expected not in text:

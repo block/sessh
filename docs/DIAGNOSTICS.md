@@ -2,11 +2,10 @@
 
 Sessh uses diagnostics to provide feedback when the connection becomes
 disrupted (disconnected or unresponsive). Our ability to display diagnostics is
-constrained by whether or not stderr is a TTY (some SSH commands - e.g. port
-forwarding - don't use the TTY at all. It's also possible that we're running an
-SSH command that normally would affect the TTY but we've redirected stdout),
-whether or not the requested SSH command involves the TTY, and the filter-level
-setting.
+constrained by whether stderr is a TTY, whether the requested SSH command
+involves the TTY, and the filter-level setting. Port forwarding, for example,
+often does not use the TTY at all. Some commands normally affect the TTY but
+are run with stdout redirected.
 
 Normally stdin is used for diagnostics input and stderr is used for diagnostics
 output, but that can be overridden with `--diagnostics-file`.
@@ -59,23 +58,23 @@ arrives before the repaint, sessh holds it back, updates the overlay to say the
 connection recovered and that we're waiting for a repaint, and only resumes
 normal output once the repaint arrives.
 
-If diagnostics input is also a TTY then we'll prompt for CTRL-R to reconnect now.
+If diagnostics input is also a TTY, we'll prompt for CTRL-R to reconnect now.
 
 ## `diagnostics-level=status`: An updating status line
 
-When we have sole control of the TTY we can display an updating status line
+When we have sole control of the TTY, we can display an updating status line
 with countdown to when we'll next attempt to reconnect, interleaved with normal
 lines for non-status events (e.g. error messages from stderr from the
-underlying ssh transport)
+underlying ssh transport).
 
-If diagnostics input is also a TTY then we'll prompt for CTRL-R to reconnect now.
+If diagnostics input is also a TTY, we'll prompt for CTRL-R to reconnect now.
 
 ## `diagnostics-level=title`: An updating window title
 
 If we're not emulating a terminal, but we understand TTY state, we'll render
 updating statuses in the window title.
 
-If diagnostics input is also a TTY then we'll prompt for CTRL-R to reconnect now.
+If diagnostics input is also a TTY, we'll prompt for CTRL-R to reconnect now.
 
 ## `diagnostics-level=line`: human-readable events, one-per-line
 

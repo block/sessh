@@ -1,21 +1,35 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const app_allocator = @import("../core/app_allocator.zig");
 const client_renderer = @import("renderer.zig");
 const vt = @import("vt.zig");
+const tty = @import("../tty/terminal.zig");
 
-// What we believe one attached client currently has on its outer terminal.
-// This is separate from the headless terminal model. It lets us track the
-// inner viewport height and send small redraws when the client is in sync.
+pub const ApplyScreenRequest = struct {
+    session_size: tty.WindowSize,
+    screen: *const vt.RenderedScreen,
+    force_redraw: bool,
+    align_viewport: bool,
+};
+
+pub const PlainReplayRequest = struct {
+    screen: *const vt.RenderedScreen,
+    align_viewport: bool,
+    bytes: []const u8,
+    parser_boundary_ok: bool,
+};
+
+// Client-facing presentation cache for one visible terminal connection.
+// This is separate from the headless terminal model: reconnect overlays,
+// skipped stale draws, and terminal resize recovery can invalidate what the
+// user sees without changing the remote PTY's terminal state.
 pub const PresentationState = struct {
     initialized: bool = false,
     active_screen: u8 = 0,
     saved_primary: ?ScreenBufferState = null,
     rendered_rows: u16 = 0,
-    cursor_row: u16 = 0,
-    cursor_col: u16 = 0,
-    cursor_visible: bool = true,
-    cursor_style: client_renderer.CursorStyle = .default,
-    terminal_modes: client_renderer.TerminalModes = .{},
+    cursor: tty.CursorState = .{},
+    terminal_modes: tty.TerminalModes = .{},
     terminal_modes_initialized: bool = false,
     default_colors: client_renderer.DefaultColors = .{},
     default_colors_initialized: bool = false,
@@ -29,8 +43,8 @@ pub const PresentationState = struct {
     // Keep scrollback, but redraw the visible screen from scratch.
     //
     // The client may have shown a reconnect overlay or skipped stale draws, so
-    // cached cursor, mode, and color state is no longer trustworthy. The old
-    // height is kept only so the next draw can clear stale rows.
+    // repaint invalidates cached cursor, mode, and color state. The
+    // previous height is kept only so the next draw can clear stale rows.
     pub fn resetForScreenRepaint(self: *PresentationState) void {
         const active_screen = self.active_screen;
         const saved_primary = self.saved_primary;
@@ -47,20 +61,20 @@ pub const PresentationState = struct {
     pub fn applyScreen(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
-        session_rows: u16,
-        screen: *const vt.RenderedScreen,
-        force_redraw: bool,
-        align_viewport: bool,
+        request: ApplyScreenRequest,
     ) !void {
+        const session_rows = request.session_size.rows;
+        const screen = request.screen;
+        const force_redraw = request.force_redraw;
         try self.switchActiveScreen(renderer, screen.active_screen);
 
-        const desired_modes = vtModesToClient(screen.modes);
+        const desired_modes = screen.modes;
         const mouse_requested = desired_modes.mouse_tracking != .disabled;
         if (screen.active_screen == 1 and mouse_requested) {
             self.full_height_rendering = true;
         }
 
-        if (align_viewport and screen.active_screen == 0) {
+        if (request.align_viewport and screen.active_screen == 0) {
             try self.alignViewportTop(renderer, session_rows);
             if (mouse_requested) self.full_height_rendering = true;
         }
@@ -76,26 +90,21 @@ pub const PresentationState = struct {
             screen.active_screen_changed;
 
         if (replace_visible_grid) {
-            try self.render(
-                renderer,
-                screen,
-                min_rendered_rows,
-            );
+            try self.render(renderer, screen, min_rendered_rows);
         } else {
             if (min_rendered_rows > 0) try self.ensureGridRow(renderer, min_rendered_rows - 1);
             for (screen.rows, 0..) |row, row_index| {
                 if (!row.dirty) continue;
-                try self.moveToGridPosition(renderer, @intCast(row_index), 0);
+                try self.moveToGridPosition(renderer, tty.top_left_position.withRow(@intCast(row_index)));
                 try renderer.clearLine();
                 try renderVtRow(renderer, row);
-                self.cursor_col = renderedCellsDisplayWidth(row.cells);
+                self.cursor.position = self.cursor.position.withCol(renderedCellsDisplayWidth(row.cells));
                 self.rendered_rows = @max(self.rendered_rows, @as(u16, @intCast(row_index + 1)));
             }
-            try self.moveToGridPosition(renderer, screen.cursor_row, screen.cursor_col);
-            try renderer.setCursorVisible(screen.cursor_visible);
-            try renderer.setCursorStyle(try cursorStyleFromVt(screen.cursor_style));
-            self.cursor_visible = screen.cursor_visible;
-            self.cursor_style = try cursorStyleFromVt(screen.cursor_style);
+            try self.moveToGridPosition(renderer, screen.cursor.position);
+            self.cursor = screen.cursor;
+            try renderer.setCursorVisibility(self.cursor.visibility);
+            try renderer.setCursorStyle(self.cursor.style);
         }
 
         if (screen.title_dirty or (force_redraw and screen.title_present)) {
@@ -119,22 +128,18 @@ pub const PresentationState = struct {
         }
     }
 
-    // Restore a full-height screen before leaving attached-client mode, so the user does
-    // not return to a partially painted alternate/full-screen app.
-    pub fn applyAttachedClientEndRestoreScreen(
+    // Restore a full-height screen before the visible client exits, so the user
+    // does not return to a partially painted alternate/full-screen app.
+    pub fn applyVisibleClientEndRestoreScreen(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
-        session_rows: u16,
+        session_size: tty.WindowSize,
         screen: *const vt.RenderedScreen,
     ) !void {
         try self.switchActiveScreen(renderer, screen.active_screen);
-        try self.render(
-            renderer,
-            screen,
-            session_rows,
-        );
+        try self.render(renderer, screen, session_size.rows);
         if (screen.title_dirty) try renderer.setTitle(screen.title);
-        try self.applyTerminalModes(renderer, vtModesToClient(screen.modes));
+        try self.applyTerminalModes(renderer, screen.modes);
         try self.applyDefaultColors(renderer, try vtDefaultColorsToClient(screen.default_colors));
         self.full_height_rendering = false;
     }
@@ -152,69 +157,53 @@ pub const PresentationState = struct {
         try renderer.carriageReturn();
         self.initialized = false;
         self.rendered_rows = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
+        self.cursor.position = tty.top_left_position;
         self.viewport_offset = 0;
     }
 
     // The inner terminal cleared its display. Clear the outer visible area too,
-    // then forget our old row/cursor position.
+    // then forget the cached row/cursor position.
     pub fn clearOuterVisibleForScreen(self: *PresentationState, renderer: client_renderer.Renderer, screen: *const vt.RenderedScreen) !void {
         try self.switchActiveScreen(renderer, screen.active_screen);
         try renderer.clearVisible();
         self.initialized = false;
         self.rendered_rows = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
+        self.cursor.position = tty.top_left_position;
         self.full_height_rendering = screenWantsMouseReporting(screen);
         self.viewport_offset = 0;
     }
 
-    const RenderRequest = struct {
-        screen: *const vt.RenderedScreen,
-        min_rendered_rows: u16,
-
-        fn targetRows(self: RenderRequest) u16 {
-            return targetRenderedRows(self.screen.rows.len, self.screen.cursor_row, self.min_rendered_rows);
-        }
-    };
-
-    // Draw the visible screen and record the new cursor and rendered height.
+    // After any full draw, the visible terminal should match the VT snapshot,
+    // including cursor attributes that are not implied by row contents.
     fn render(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
         screen: *const vt.RenderedScreen,
         min_rendered_rows: u16,
     ) !void {
-        const request = RenderRequest{
-            .screen = screen,
-            .min_rendered_rows = min_rendered_rows,
-        };
+        const target_rows = targetRenderedRows(screen, min_rendered_rows);
         if (!self.initialized) {
-            try self.renderInitial(renderer, request);
+            try self.renderInitial(renderer, screen, target_rows);
         } else {
-            try self.redraw(renderer, request);
+            try self.redraw(renderer, screen, target_rows);
         }
 
-        const cursor_style = try cursorStyleFromVt(screen.cursor_style);
-        try renderer.setCursorVisible(screen.cursor_visible);
-        try renderer.setCursorStyle(cursor_style);
+        self.cursor = screen.cursor;
+        try renderer.setCursorVisibility(self.cursor.visibility);
+        try renderer.setCursorStyle(self.cursor.style);
         self.initialized = true;
-        self.rendered_rows = request.targetRows();
-        self.cursor_row = screen.cursor_row;
-        self.cursor_col = screen.cursor_col;
-        self.cursor_visible = screen.cursor_visible;
-        self.cursor_style = cursor_style;
+        self.rendered_rows = target_rows;
     }
 
-    // Add retained scrollback above the currently rendered screen, like normal
-    // terminal output scrolling older rows upward.
+    // Add retained scrollback above the rendered screen, like normal terminal
+    // output scrolling earlier rows upward.
     pub fn appendScrollbackRows(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
-        session_rows: u16,
+        session_size: tty.WindowSize,
         rows: []const vt.RenderedRow,
     ) !void {
+        const session_rows = session_size.rows;
         if (rows.len == 0) return;
         if (!self.initialized or self.rendered_rows == 0) {
             try renderTranscriptRows(renderer, rows);
@@ -228,35 +217,33 @@ pub const PresentationState = struct {
 
         for (rows) |row| {
             try self.moveToRenderedTop(renderer);
-            self.cursor_row = 0;
-            self.cursor_col = 0;
+            self.cursor.position = tty.top_left_position;
             try renderer.carriageReturn();
             try renderer.clearLine();
             try renderVtRow(renderer, row);
-            self.cursor_col = renderedCellsDisplayWidth(row.cells);
-            try self.moveToGridPosition(renderer, self.rendered_rows - 1, 0);
+            self.cursor.position = self.cursor.position.withCol(renderedCellsDisplayWidth(row.cells));
+            try self.moveToGridPosition(renderer, tty.top_left_position.withRow(self.rendered_rows - 1));
             try renderer.newline();
-            self.cursor_row = self.rendered_rows - 1;
-            self.cursor_col = 0;
+            self.cursor.position = tty.top_left_position.withRow(self.rendered_rows - 1);
         }
         self.viewport_offset = 0;
     }
 
-    // Draw when we cannot rely on the old cursor position or cached terminal
-    // state. If resetForScreenRepaint left an old height behind, clear that
-    // old area before drawing the new trimmed screen.
+    // Draw when we cannot rely on the cached cursor position or terminal
+    // state. If resetForScreenRepaint left a stale height behind, clear that
+    // stale area before drawing the new trimmed screen.
     fn renderInitial(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
-        request: RenderRequest,
+        screen: *const vt.RenderedScreen,
+        target_rows: u16,
     ) !void {
-        const screen = request.screen;
-        // The new snapshot may be shorter than the screen we previously drew.
-        // Clear any old rows below the new screen so stale text and colors are
-        // not left behind.
+        // Include the cached height in the clear pass. Repaint resets keep that
+        // height specifically so a shorter replacement cannot leave old rows
+        // stranded below the new snapshot.
         const rendered_rows = @max(
             self.rendered_rows,
-            request.targetRows(),
+            target_rows,
         );
         var row_index: u16 = 0;
         while (row_index < rendered_rows) : (row_index += 1) {
@@ -264,20 +251,20 @@ pub const PresentationState = struct {
             try renderer.clearLine();
             if (row_index < screen.rows.len) try renderVtRow(renderer, screen.rows[row_index]);
         }
-        try moveToSnapshotCursor(renderer, rendered_rows, screen.cursor_row, screen.cursor_col);
+        try moveToSnapshotCursor(renderer, rendered_rows, screen.cursor.position);
     }
 
-    // Redraw when we know where our old rendered grid is. Clear max(old, new)
-    // rows so a shorter terminal screen does not leave stale content behind.
+    // Redraw when we know where our cached rendered grid is. Clear the larger
+    // of cached and new row counts so a shorter terminal screen does not leave
+    // stale content behind.
     fn redraw(
         self: *PresentationState,
         renderer: client_renderer.Renderer,
-        request: RenderRequest,
+        screen: *const vt.RenderedScreen,
+        new_rows: u16,
     ) !void {
-        const screen = request.screen;
         try self.moveToRenderedTop(renderer);
 
-        const new_rows = request.targetRows();
         const redraw_rows = @max(self.rendered_rows, new_rows);
         var row_index: u16 = 0;
         while (row_index < redraw_rows) : (row_index += 1) {
@@ -287,7 +274,7 @@ pub const PresentationState = struct {
             if (row_index + 1 < redraw_rows) try renderer.newline();
         }
 
-        try moveToSnapshotCursor(renderer, redraw_rows, screen.cursor_row, screen.cursor_col);
+        try moveToSnapshotCursor(renderer, redraw_rows, screen.cursor.position);
     }
 
     // Switch the real terminal buffer to match the inner terminal. We save the
@@ -319,10 +306,7 @@ pub const PresentationState = struct {
         return .{
             .initialized = self.initialized,
             .rendered_rows = self.rendered_rows,
-            .cursor_row = self.cursor_row,
-            .cursor_col = self.cursor_col,
-            .cursor_visible = self.cursor_visible,
-            .cursor_style = self.cursor_style,
+            .cursor = self.cursor,
             .full_height_rendering = self.full_height_rendering,
             .viewport_offset = self.viewport_offset,
         };
@@ -331,17 +315,14 @@ pub const PresentationState = struct {
     fn restoreScreenBufferState(self: *PresentationState, state: ScreenBufferState) void {
         self.initialized = state.initialized;
         self.rendered_rows = state.rendered_rows;
-        self.cursor_row = state.cursor_row;
-        self.cursor_col = state.cursor_col;
-        self.cursor_visible = state.cursor_visible;
-        self.cursor_style = state.cursor_style;
+        self.cursor = state.cursor;
         self.full_height_rendering = state.full_height_rendering;
         self.viewport_offset = state.viewport_offset;
     }
 
     // Terminal modes are global settings on the outer terminal. Emit the full
     // desired mode set only when our cached value differs.
-    fn applyTerminalModes(self: *PresentationState, renderer: client_renderer.Renderer, modes: client_renderer.TerminalModes) !void {
+    fn applyTerminalModes(self: *PresentationState, renderer: client_renderer.Renderer, modes: tty.TerminalModes) !void {
         if (self.terminal_modes_initialized and self.terminal_modes.eql(modes)) return;
         try renderer.applyTerminalModes(modes);
         self.terminal_modes = modes;
@@ -362,20 +343,15 @@ pub const PresentationState = struct {
         self.default_colors_initialized = true;
     }
 
-    // Sometimes child output can be forwarded unchanged instead of converted
+    // Sometimes remote output can be forwarded unchanged instead of converted
     // into a synthetic redraw. Only do that when it cannot disturb hidden
     // state that PresentationState is tracking.
-    pub fn canApplyPlainReplay(
-        self: *const PresentationState,
-        screen: *const vt.RenderedScreen,
-        align_viewport: bool,
-        bytes: []const u8,
-        parser_boundary_ok: bool,
-    ) !bool {
+    pub fn canApplyPlainReplay(self: *const PresentationState, request: PlainReplayRequest) !bool {
+        const screen = request.screen;
         if (!self.initialized) return false;
         if (self.full_height_rendering) return false;
         if (self.viewportOffsetUnknown()) return false;
-        if (align_viewport) return false;
+        if (request.align_viewport) return false;
         if (screen.active_screen != 0) return false;
         if (screen.active_screen_changed) return false;
         if (screen.title_dirty or
@@ -385,11 +361,11 @@ pub const PresentationState = struct {
         {
             return false;
         }
-        if (!parser_boundary_ok) return false;
-        if (!isSafePlainReplay(bytes)) return false;
+        if (!request.parser_boundary_ok) return false;
+        if (!isSafePlainReplay(request.bytes)) return false;
         if (!rowsHaveOnlyDefaultPresentation(screen.rows)) return false;
         if (!self.terminal_modes_initialized or
-            !self.terminal_modes.eql(vtModesToClient(screen.modes)))
+            !self.terminal_modes.eql(screen.modes))
         {
             return false;
         }
@@ -398,37 +374,38 @@ pub const PresentationState = struct {
         {
             return false;
         }
-        if (self.cursor_visible != screen.cursor_visible) return false;
-        if (self.cursor_style != try cursorStyleFromVt(screen.cursor_style)) return false;
+        const screen_cursor = screen.cursor;
+        if (self.cursor.visibility != screen_cursor.visibility) return false;
+        if (self.cursor.style != screen_cursor.style) return false;
         return true;
     }
 
-    // Update our cache after original plain output was replayed successfully.
-    pub fn assumePlainReplayScreen(self: *PresentationState, session_rows: u16, screen: *const vt.RenderedScreen) !void {
+    // Plain replay bypasses synthetic rendering, so the cache has to jump to
+    // the VT snapshot that was produced by those original bytes.
+    pub fn assumePlainReplayScreen(self: *PresentationState, session_size: tty.WindowSize, screen: *const vt.RenderedScreen) !void {
+        const session_rows = session_size.rows;
         if (screen.active_screen > 1) return error.InvalidActiveScreen;
         if (self.active_screen != screen.active_screen) return error.ActiveScreenSwitchRequiresDraw;
         self.initialized = true;
-        const row_count: u16 = @intCast(screen.rows.len);
-        const cursor_row_count = screen.cursor_row +| 1;
-        self.rendered_rows = @min(session_rows, @max(self.rendered_rows, @max(row_count, cursor_row_count)));
-        self.cursor_row = screen.cursor_row;
-        self.cursor_col = screen.cursor_col;
-        self.cursor_visible = screen.cursor_visible;
-        self.cursor_style = try cursorStyleFromVt(screen.cursor_style);
-        self.terminal_modes = vtModesToClient(screen.modes);
+        self.rendered_rows = @min(
+            session_rows,
+            @max(self.rendered_rows, targetRenderedRows(screen, 0)),
+        );
+        self.cursor = screen.cursor;
+        self.terminal_modes = screen.modes;
         self.terminal_modes_initialized = true;
         self.default_colors = try vtDefaultColorsToClient(screen.default_colors);
         self.default_colors_initialized = true;
-        if (screen.modes.mouse_tracking == 0 or !screen.modes.mouse_sgr) {
+        if (screen.modes.mouse_tracking == .disabled or !screen.modes.mouse_sgr) {
             self.full_height_rendering = false;
         }
         self.updateViewportOffset(session_rows);
     }
 
     // Retained scrollback belongs to the primary buffer. If the outer terminal
-    // is currently showing the alternate buffer, switch back before appending
-    // scrollback rows; the following screen draw can switch to alternate again
-    // if the inner terminal is still there.
+    // is showing the alternate buffer, switch back before appending scrollback
+    // rows; the following screen draw can switch to alternate again if the
+    // inner terminal is still there.
     pub fn preparePrimaryForScrollback(self: *PresentationState, renderer: client_renderer.Renderer) !void {
         try self.switchActiveScreen(renderer, 0);
     }
@@ -445,7 +422,8 @@ pub const PresentationState = struct {
         return self.viewport_offset < 0;
     }
 
-    // Keep our viewport-offset estimate consistent with the height we rendered.
+    // Once enough rows have been rendered to fill the viewport, future draws
+    // can treat the inner and outer viewport origins as aligned.
     fn updateViewportOffset(self: *PresentationState, session_rows: u16) void {
         self.updateViewportOffsetForRenderedRows(session_rows, self.rendered_rows);
     }
@@ -458,67 +436,64 @@ pub const PresentationState = struct {
             @min(self.viewport_offset, @as(i32, @intCast(session_rows - rendered_rows)));
     }
 
-    // Move from the cached cursor position back to row 0 of our rendered grid.
+    // The rendered grid may sit above the current terminal cursor in scrollback,
+    // so moves are relative to our cached cursor rather than absolute screen
+    // coordinates.
     fn moveToRenderedTop(self: *const PresentationState, renderer: client_renderer.Renderer) !void {
         if (self.rendered_rows == 0) return;
-        try renderer.cursorUp(self.cursor_row);
+        try renderer.cursorUp(self.cursor.position.row);
         try renderer.carriageReturn();
     }
 
-    // Move within our rendered grid, extending it with blank lines if needed.
-    fn moveToGridPosition(self: *PresentationState, renderer: client_renderer.Renderer, row: u16, col: u16) !void {
-        try self.ensureGridRow(renderer, row);
-        try self.moveWithinGrid(renderer, row, col);
+    // Row writes assume their destination row already exists in the outer
+    // transcript. Extend with blank lines before using relative cursor motion.
+    fn moveToGridPosition(self: *PresentationState, renderer: client_renderer.Renderer, position: tty.CursorPosition) !void {
+        try self.ensureGridRow(renderer, position.row);
+        try self.moveWithinGrid(renderer, position);
     }
 
     // Make sure a row exists in the outer terminal before we move to it.
     fn ensureGridRow(self: *PresentationState, renderer: client_renderer.Renderer, row: u16) !void {
         if (self.rendered_rows == 0) {
             self.rendered_rows = 1;
-            self.cursor_row = 0;
+            self.cursor.position = tty.top_left_position;
         }
 
         while (row >= self.rendered_rows) {
-            try self.moveWithinGrid(renderer, self.rendered_rows - 1, self.cursor_col);
+            try self.moveWithinGrid(renderer, self.cursor.position.withRow(self.rendered_rows - 1));
             try renderer.newline();
-            self.cursor_row = self.rendered_rows;
-            self.cursor_col = 0;
+            self.cursor.position = tty.top_left_position.withRow(self.rendered_rows);
             self.rendered_rows += 1;
         }
     }
 
-    // Move to an already existing row/column and update the cached cursor.
-    fn moveWithinGrid(self: *PresentationState, renderer: client_renderer.Renderer, row: u16, col: u16) !void {
-        if (self.cursor_row > row) {
-            try renderer.cursorUp(self.cursor_row - row);
-        } else if (row > self.cursor_row) {
-            try renderer.cursorDown(row - self.cursor_row);
+    // Absolute cursor addressing only works inside the visible screen. Use
+    // relative movement so the same code works when our grid lives in
+    // scrollback-backed rows.
+    fn moveWithinGrid(self: *PresentationState, renderer: client_renderer.Renderer, position: tty.CursorPosition) !void {
+        const row = position.row;
+        const col = position.col;
+        if (self.cursor.position.row > row) {
+            try renderer.cursorUp(self.cursor.position.row - row);
+        } else if (row > self.cursor.position.row) {
+            try renderer.cursorDown(row - self.cursor.position.row);
         }
         try renderer.carriageReturn();
         try renderer.cursorRight(col);
-        self.cursor_row = row;
-        self.cursor_col = col;
+        self.cursor.position = position;
     }
-};
-
-pub const TerminalOrigin = struct {
-    row: u16,
-    col: u16,
 };
 
 const ScreenBufferState = struct {
     initialized: bool = false,
     rendered_rows: u16 = 0,
-    cursor_row: u16 = 0,
-    cursor_col: u16 = 0,
-    cursor_visible: bool = true,
-    cursor_style: client_renderer.CursorStyle = .default,
+    cursor: tty.CursorState = .{},
     full_height_rendering: bool = false,
     viewport_offset: i32 = 0,
 };
 
 fn screenWantsMouseReporting(screen: *const vt.RenderedScreen) bool {
-    return screen.modes.mouse_tracking != 0;
+    return screen.modes.mouse_tracking != .disabled;
 }
 
 fn renderTranscriptRows(renderer: client_renderer.Renderer, rows: []const vt.RenderedRow) !void {
@@ -563,7 +538,7 @@ fn isSafePlainReplay(bytes: []const u8) bool {
     if (bytes.len == 0) return false;
     // Starting at libghostty-vt ground state plus this byte allowlist preserves
     // ground state: there is no ESC/control introducer and no partial UTF-8.
-    // The remote terminal process therefore only needs to record whether the batch started at a
+    // The terminal worker therefore only needs to record whether the batch started at a
     // plain-text parser boundary before considering original-byte replay.
     // TAB is intentionally excluded because its visual effect depends on tab
     // stop state; add it only after modeling and testing that state boundary.
@@ -577,53 +552,39 @@ fn isSafePlainReplay(bytes: []const u8) bool {
     return true;
 }
 
-// After drawing rows from top to bottom, move to the cursor position reported
-// by the terminal snapshot.
-fn moveToSnapshotCursor(renderer: client_renderer.Renderer, rendered_rows: u16, cursor_row: u16, cursor_col: u16) !void {
+// Rows are drawn from top to bottom, leaving the real cursor on the last
+// rendered row. Move relative to that point instead of jumping absolutely so
+// this still works while the rendered grid lives in scrollback-backed rows.
+fn moveToSnapshotCursor(renderer: client_renderer.Renderer, rendered_rows: u16, cursor: tty.CursorPosition) !void {
     if (rendered_rows == 0) {
-        try renderer.cursorDown(cursor_row);
+        try renderer.cursorDown(cursor.row);
         try renderer.carriageReturn();
-        try renderer.cursorRight(cursor_col);
+        try renderer.cursorRight(cursor.col);
         return;
     }
     const last_row = rendered_rows - 1;
-    if (cursor_row < last_row) try renderer.cursorUp(last_row - cursor_row);
-    if (cursor_row > last_row) try renderer.cursorDown(cursor_row - last_row);
+    if (cursor.row < last_row) try renderer.cursorUp(last_row - cursor.row);
+    if (cursor.row > last_row) try renderer.cursorDown(cursor.row - last_row);
     try renderer.carriageReturn();
-    try renderer.cursorRight(cursor_col);
+    try renderer.cursorRight(cursor.col);
 }
 
-// How many rows of the inner viewport this client currently has mapped onto
-// the outer terminal.
+// How many rows of the inner viewport this client has mapped onto the outer
+// terminal.
 //
 // A trimmed snapshot can mean two different things: the inner viewport is
 // aligned and the bottom rows are blank, or the viewport is still unaligned and
 // drawing more rows would scroll existing outer-terminal content. After
 // alignment, callers need a way to choose the first meaning; min_rendered_rows
 // lets them do that.
-fn targetRenderedRows(rows_len: usize, cursor_row: u16, min_rendered_rows: u16) u16 {
+fn targetRenderedRows(screen: *const vt.RenderedScreen, min_rendered_rows: u16) u16 {
     return @max(
-        @max(@as(u16, @intCast(rows_len)), min_rendered_rows),
-        cursor_row +| 1,
+        @max(@as(u16, @intCast(screen.rows.len)), min_rendered_rows),
+        screen.cursor.position.row +| 1,
     );
 }
 
-fn vtModesToClient(modes: vt.TerminalModes) client_renderer.TerminalModes {
-    return .{
-        .mode_flags = modes.mode_flags,
-        .mouse_tracking = switch (modes.mouse_tracking) {
-            0 => .disabled,
-            1 => .normal,
-            2 => .button,
-            3 => .any,
-            else => .disabled,
-        },
-        .mouse_sgr = modes.mouse_sgr,
-        .kitty_keyboard_flags = modes.kitty_keyboard_flags,
-    };
-}
-
-fn terminalModesWithoutMouse(modes: client_renderer.TerminalModes) client_renderer.TerminalModes {
+fn terminalModesWithoutMouse(modes: tty.TerminalModes) tty.TerminalModes {
     var without_mouse = modes;
     without_mouse.mouse_tracking = .disabled;
     without_mouse.mouse_sgr = false;
@@ -640,7 +601,7 @@ fn vtDefaultColorsToClient(colors: vt.DefaultColors) !client_renderer.DefaultCol
 test "full-height redraw pads blank rows without indexing past VT rows" {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    const renderer = client_renderer.Renderer.bufferedXtermCompatible(&bytes);
 
     const rows = try std.testing.allocator.alloc(vt.RenderedRow, 0);
     var screen = vt.RenderedScreen{
@@ -653,11 +614,8 @@ test "full-height redraw pads blank rows without indexing past VT rows" {
         .default_colors = .{},
         .default_colors_dirty = false,
         .retained_scrollback_clear_dirty = false,
-        .cursor_row = 0,
-        .cursor_col = 0,
-        .cursor_visible = true,
-        .cursor_style = 0,
-        .modes = .{ .mouse_tracking = 1, .mouse_sgr = true },
+        .cursor = .{},
+        .modes = .{ .mouse_tracking = .normal, .mouse_sgr = true },
         .dirty_state = .full,
         .active_screen_changed = false,
         .display_clear = null,
@@ -669,82 +627,97 @@ test "full-height redraw pads blank rows without indexing past VT rows" {
         .rendered_rows = 3,
         .full_height_rendering = true,
     };
-    try presentation.applyScreen(renderer, 3, &screen, true, false);
+    try presentation.applyScreen(renderer, .{
+        .session_size = .{ .rows = 3, .cols = 20 },
+        .screen = &screen,
+        .force_redraw = true,
+        .align_viewport = false,
+    });
     try std.testing.expectEqual(@as(u16, 3), presentation.rendered_rows);
 }
 
 test "active-screen change uses outer alternate screen" {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    const renderer = client_renderer.Renderer.bufferedXtermCompatible(&bytes);
 
-    var first_primary = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        2,
-        &.{ "PRIMARY0", "PRIMARY1", "PRIMARY2" },
-    );
+    var first_primary = try testing.renderedScreen(std.testing.allocator, .{
+        .cursor = .{ .position = .{ .row = 2, .col = 0 } },
+        .labels = &.{ "PRIMARY0", "PRIMARY1", "PRIMARY2" },
+    });
     defer first_primary.deinit(std.testing.allocator);
 
     var presentation = PresentationState{};
-    try presentation.applyScreen(renderer, 4, &first_primary, true, false);
+    try presentation.applyScreen(renderer, .{
+        .session_size = .{ .rows = 4, .cols = 20 },
+        .screen = &first_primary,
+        .force_redraw = true,
+        .align_viewport = false,
+    });
 
     bytes.clearRetainingCapacity();
 
-    var alt_screen = try testRenderedScreen(
-        std.testing.allocator,
-        1,
-        3,
-        &.{ "ALT0", "ALT1", "ALT2", "ALT3" },
-    );
+    var alt_screen = try testing.renderedScreen(std.testing.allocator, .{
+        .active_screen = 1,
+        .cursor = .{ .position = .{ .row = 3, .col = 0 } },
+        .labels = &.{ "ALT0", "ALT1", "ALT2", "ALT3" },
+    });
     defer alt_screen.deinit(std.testing.allocator);
 
-    try presentation.applyScreen(renderer, 4, &alt_screen, true, false);
+    try presentation.applyScreen(renderer, .{
+        .session_size = .{ .rows = 4, .cols = 20 },
+        .screen = &alt_screen,
+        .force_redraw = true,
+        .align_viewport = false,
+    });
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "\x1b[?1049h") != null);
-    try std.testing.expectEqual(@as(u16, 3), presentation.cursor_row);
+    try std.testing.expectEqual(@as(u16, 3), presentation.cursor.position.row);
 
     bytes.clearRetainingCapacity();
 
-    var primary_screen = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        0,
-        &.{"PRIMARY"},
-    );
+    var primary_screen = try testing.renderedScreen(std.testing.allocator, .{
+        .labels = &.{"PRIMARY"},
+    });
     defer primary_screen.deinit(std.testing.allocator);
 
-    try presentation.applyScreen(renderer, 4, &primary_screen, true, false);
+    try presentation.applyScreen(renderer, .{
+        .session_size = .{ .rows = 4, .cols = 20 },
+        .screen = &primary_screen,
+        .force_redraw = true,
+        .align_viewport = false,
+    });
     try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[?1049l\x1b[2A\r"));
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
 }
 
-test "attached-client-end restore leaves outer alternate screen" {
+test "visible-client exit restore leaves outer alternate screen" {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    const renderer = client_renderer.Renderer.bufferedXtermCompatible(&bytes);
 
-    var alt_screen = try testRenderedScreen(
-        std.testing.allocator,
-        1,
-        3,
-        &.{ "ALT0", "ALT1", "ALT2", "ALT3" },
-    );
+    var alt_screen = try testing.renderedScreen(std.testing.allocator, .{
+        .active_screen = 1,
+        .cursor = .{ .position = .{ .row = 3, .col = 0 } },
+        .labels = &.{ "ALT0", "ALT1", "ALT2", "ALT3" },
+    });
     defer alt_screen.deinit(std.testing.allocator);
 
     var presentation = PresentationState{};
-    try presentation.applyScreen(renderer, 4, &alt_screen, true, false);
+    try presentation.applyScreen(renderer, .{
+        .session_size = .{ .rows = 4, .cols = 20 },
+        .screen = &alt_screen,
+        .force_redraw = true,
+        .align_viewport = false,
+    });
 
     bytes.clearRetainingCapacity();
 
-    var primary_screen = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        0,
-        &.{"PRIMARY"},
-    );
+    var primary_screen = try testing.renderedScreen(std.testing.allocator, .{
+        .labels = &.{"PRIMARY"},
+    });
     defer primary_screen.deinit(std.testing.allocator);
 
-    try presentation.applyAttachedClientEndRestoreScreen(renderer, 4, &primary_screen);
+    try presentation.applyVisibleClientEndRestoreScreen(renderer, .{ .rows = 4, .cols = 20 }, &primary_screen);
     try std.testing.expect(std.mem.startsWith(u8, bytes.items, "\x1b[?1049l"));
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "PRIMARY") != null);
 }
@@ -752,18 +725,21 @@ test "attached-client-end restore leaves outer alternate screen" {
 test "initial screen render clears target rows before drawing" {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    const renderer = client_renderer.Renderer.bufferedXtermCompatible(&bytes);
 
-    var screen = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        2,
-        &.{ "short", "", "tiny" },
-    );
+    var screen = try testing.renderedScreen(std.testing.allocator, .{
+        .cursor = .{ .position = .{ .row = 2, .col = 0 } },
+        .labels = &.{ "short", "", "tiny" },
+    });
     defer screen.deinit(std.testing.allocator);
 
     var presentation = PresentationState{};
-    try presentation.applyScreen(renderer, 4, &screen, true, false);
+    try presentation.applyScreen(renderer, .{
+        .session_size = .{ .rows = 4, .cols = 20 },
+        .screen = &screen,
+        .force_redraw = true,
+        .align_viewport = false,
+    });
 
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes.items, "\x1b[2K"));
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "\x1b[2K\x1b[0mshort") != null);
@@ -774,14 +750,11 @@ test "initial screen render clears target rows before drawing" {
 test "screen repaint reset clears previous rows then records new height" {
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(app_allocator.allocator());
-    const renderer = client_renderer.Renderer.buffered(&bytes, .{ .kind = .xterm_compatible });
+    const renderer = client_renderer.Renderer.bufferedXtermCompatible(&bytes);
 
-    var screen = try testRenderedScreen(
-        std.testing.allocator,
-        0,
-        0,
-        &.{"short"},
-    );
+    var screen = try testing.renderedScreen(std.testing.allocator, .{
+        .labels = &.{"short"},
+    });
     defer screen.deinit(std.testing.allocator);
 
     var presentation = PresentationState{
@@ -789,66 +762,72 @@ test "screen repaint reset clears previous rows then records new height" {
         .rendered_rows = 5,
     };
     presentation.resetForScreenRepaint();
-    try presentation.applyScreen(renderer, 5, &screen, true, false);
+    try presentation.applyScreen(renderer, .{
+        .session_size = .{ .rows = 5, .cols = 20 },
+        .screen = &screen,
+        .force_redraw = true,
+        .align_viewport = false,
+    });
 
     try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, bytes.items, "\x1b[2K"));
     try std.testing.expectEqual(@as(u16, 1), presentation.rendered_rows);
 }
 
-fn testRenderedScreen(
-    allocator: std.mem.Allocator,
-    active_screen: u8,
-    cursor_row: u16,
-    labels: []const []const u8,
-) !vt.RenderedScreen {
-    const rows = try allocator.alloc(vt.RenderedRow, labels.len);
-    var rows_filled: usize = 0;
-    errdefer {
-        for (rows[0..rows_filled]) |*row| row.deinit(allocator);
-        allocator.free(rows);
+const testing = if (builtin.is_test) struct {
+    const RenderedScreenFixture = struct {
+        active_screen: u8 = 0,
+        cursor: tty.CursorState = .{},
+        labels: []const []const u8,
+    };
+
+    fn renderedScreen(allocator: std.mem.Allocator, fixture: RenderedScreenFixture) !vt.RenderedScreen {
+        const labels = fixture.labels;
+        const rows = try allocator.alloc(vt.RenderedRow, labels.len);
+        var rows_filled: usize = 0;
+        errdefer {
+            for (rows[0..rows_filled]) |*row| row.deinit(allocator);
+            allocator.free(rows);
+        }
+
+        for (labels, 0..) |label, index| {
+            rows[index] = try renderedRow(allocator, label);
+            rows_filled += 1;
+        }
+
+        return .{
+            .rows = rows,
+            .cols = 80,
+            .active_screen = fixture.active_screen,
+            .title = "",
+            .title_present = false,
+            .title_dirty = false,
+            .default_colors = .{},
+            .default_colors_dirty = false,
+            .retained_scrollback_clear_dirty = false,
+            .cursor = fixture.cursor,
+            .modes = .{},
+            .dirty_state = .full,
+            .active_screen_changed = true,
+            .display_clear = null,
+        };
     }
 
-    for (labels, 0..) |label, index| {
-        rows[index] = try testRenderedRow(allocator, label);
-        rows_filled += 1;
+    fn renderedRow(allocator: std.mem.Allocator, label: []const u8) !vt.RenderedRow {
+        const cells = try allocator.alloc(vt.RenderedCell, 1);
+        errdefer allocator.free(cells);
+        cells[0] = .{
+            .text = try allocator.dupe(u8, label),
+            .display_width = @intCast(label.len),
+            .attrs = .{},
+        };
+        return .{
+            .cells = cells,
+            .width_cols = 80,
+            .flags = 0,
+            .dirty = true,
+        };
     }
-
-    return .{
-        .rows = rows,
-        .cols = 80,
-        .active_screen = active_screen,
-        .title = "",
-        .title_present = false,
-        .title_dirty = false,
-        .default_colors = .{},
-        .default_colors_dirty = false,
-        .retained_scrollback_clear_dirty = false,
-        .cursor_row = cursor_row,
-        .cursor_col = 0,
-        .cursor_visible = true,
-        .cursor_style = 0,
-        .modes = .{},
-        .dirty_state = .full,
-        .active_screen_changed = true,
-        .display_clear = null,
-    };
-}
-
-fn testRenderedRow(allocator: std.mem.Allocator, label: []const u8) !vt.RenderedRow {
-    const cells = try allocator.alloc(vt.RenderedCell, 1);
-    errdefer allocator.free(cells);
-    cells[0] = .{
-        .text = try allocator.dupe(u8, label),
-        .display_width = @intCast(label.len),
-        .attrs = .{},
-    };
-    return .{
-        .cells = cells,
-        .width_cols = 80,
-        .flags = 0,
-        .dirty = true,
-    };
-}
+} else struct {};
 
 fn vtAttrsToClient(attrs: vt.CellAttrs) !client_renderer.CellAttrs {
     if ((attrs.style_flags & 0xfffff000) != 0) return error.InvalidStyleFlags;
@@ -890,17 +869,4 @@ fn vtColorToClient(raw: u32) !client_renderer.Color {
         } };
     }
     return error.InvalidTerminalColor;
-}
-
-fn cursorStyleFromVt(value: u8) !client_renderer.CursorStyle {
-    return switch (value) {
-        0 => .default,
-        1 => .blinking_block,
-        2 => .steady_block,
-        3 => .blinking_underline,
-        4 => .steady_underline,
-        5 => .blinking_bar,
-        6 => .steady_bar,
-        else => error.InvalidCursorStyle,
-    };
 }

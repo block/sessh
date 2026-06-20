@@ -31,32 +31,32 @@ def start_gap_session(env, shell, scrollback_limit):
     conn.connect(str(socket_path(env)))
     send_hello(conn)
     send_resize(conn, 3, 40)
-    create_and_attach_session(conn, shell, scrollback=scrollback_limit)
+    create_and_open_session(conn, shell, scrollback=scrollback_limit)
     message_type, payload = recv_frame(conn)
-    if message_type != SESSION_ATTACHED:
-        raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-    assert_session_attached(payload)
+    if message_type != SESSION_READY:
+        raise AssertionError(f"expected SESSION_READY, got {message_type}")
+    assert_session_ready(payload)
     return conn
 
 
-def attach_gap_session(env, reconnect_cursor=None):
-    attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    attach.settimeout(5.0)
-    attach.connect(str(socket_path(env)))
-    send_hello(attach)
-    send_resize(attach, 3, 40)
+def open_gap_session(env, reconnect_cursor=None):
+    reopened = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    reopened.settimeout(5.0)
+    reopened.connect(str(socket_path(env)))
+    send_hello(reopened)
+    send_resize(reopened, 3, 40)
     send_frame(
-        attach,
-        SESSION_ATTACH,
-        pack_session_attach(
+        reopened,
+        SESSION_OPEN,
+        pack_session_open(
             session_guid=test_session_guid(1),
             reconnect_cursor=reconnect_cursor,
         ),
     )
-    message_type, _ = recv_frame(attach)
-    if message_type != SESSION_ATTACHED:
-        raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-    return attach
+    message_type, _ = recv_frame(reopened)
+    if message_type != SESSION_READY:
+        raise AssertionError(f"expected SESSION_READY, got {message_type}")
+    return reopened
 
 
 def run_reconnect_scrollback_gap_protocol_test(base_env):
@@ -78,9 +78,9 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
 
             time.sleep(0.6)
 
-            attach = attach_gap_session(env, reconnect_cursor=cursor)
+            reopened = open_gap_session(env, reconnect_cursor=cursor)
             try:
-                _, reconnect_draws = recv_draw_until(attach, b"DURING_DONE$ ")
+                _, reconnect_draws = recv_draw_until(reopened, b"DURING_DONE$ ")
                 output = b"".join(draw["draw_bytes"] for draw in reconnect_draws)
                 if b"sessh scrollback truncated" in output:
                     raise AssertionError(f"unexpected truncation marker without truncation: {output!r}")
@@ -89,7 +89,7 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
                     if needle not in output:
                         raise AssertionError(f"missing reconnect output {needle!r}: {output!r}")
             finally:
-                attach.close()
+                reopened.close()
         finally:
             cleanup_runtime(env)
 
@@ -111,9 +111,9 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
 
             time.sleep(0.8)
 
-            attach = attach_gap_session(env, reconnect_cursor=cursor)
+            reopened = open_gap_session(env, reconnect_cursor=cursor)
             try:
-                _, reconnect_draws = recv_draw_until(attach, b"DURING_DONE$ ")
+                _, reconnect_draws = recv_draw_until(reopened, b"DURING_DONE$ ")
                 output = b"".join(draw["draw_bytes"] for draw in reconnect_draws)
                 # With a 3-row PTY and this output shape, the client saw three
                 # retained rows before disconnect and the retained snapshot now
@@ -125,13 +125,13 @@ def run_reconnect_scrollback_gap_protocol_test(base_env):
                 if b"during_14" not in output or b"during_20" not in output:
                     raise AssertionError(f"reconnect did not include retained and visible output: {output!r}")
 
-                send_frame(attach, INPUT, pack_bytes(b"after\n"))
-                _, post_draws = recv_draw_until(attach, b"POST:after")
+                send_frame(reopened, INPUT, pack_bytes(b"after\n"))
+                _, post_draws = recv_draw_until(reopened, b"POST:after")
                 post_output = b"".join(draw["draw_bytes"] for draw in post_draws)
                 if b"POST:after" not in post_output:
                     raise AssertionError(f"post-reconnect input was not delivered: {post_output!r}")
             finally:
-                attach.close()
+                reopened.close()
         finally:
             cleanup_runtime(env)
 
@@ -164,12 +164,12 @@ def run_resize_epoch_does_not_clear_reconnect_scrollback_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, 3, 40)
-                create_and_attach_session(conn, shell, scrollback=20)
+                create_and_open_session(conn, shell, scrollback=20)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
 
                 recv_draw_until(conn, b"READY$ ")
                 send_frame(conn, INPUT, pack_bytes(b"go\n"))
@@ -189,26 +189,26 @@ def run_resize_epoch_does_not_clear_reconnect_scrollback_test(base_env):
             finally:
                 conn.close()
 
-            attach = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            attach.settimeout(5.0)
+            reopened = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            reopened.settimeout(5.0)
             try:
-                attach.connect(str(socket_path(env)))
-                send_hello(attach)
-                send_resize(attach, 3, 20)
+                reopened.connect(str(socket_path(env)))
+                send_hello(reopened)
+                send_resize(reopened, 3, 20)
                 send_frame(
-                    attach,
-                    SESSION_ATTACH,
-                    pack_session_attach(
+                    reopened,
+                    SESSION_OPEN,
+                    pack_session_open(
                         session_guid=test_session_guid(1),
                         reconnect_cursor=cursor,
                     ),
                 )
 
-                message_type, _ = recv_frame(attach)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
+                message_type, _ = recv_frame(reopened)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
 
-                _, reconnect_draws = recv_draw_until(attach, b"AFTER$ ")
+                _, reconnect_draws = recv_draw_until(reopened, b"AFTER$ ")
                 output = b"".join(draw["draw_bytes"] for draw in reconnect_draws)
                 if b"\x1b[3J" in output:
                     raise AssertionError(f"resize epoch bump cleared outer scrollback: {output!r}")
@@ -217,7 +217,7 @@ def run_resize_epoch_does_not_clear_reconnect_scrollback_test(base_env):
                 if b"resize_history_01" not in output:
                     raise AssertionError(f"reconnect did not include retained scrollback after resize: {output!r}")
             finally:
-                attach.close()
+                reopened.close()
         finally:
             cleanup_runtime(env)
 
@@ -243,12 +243,12 @@ def run_screen_repaint_after_presentation_reset_clears_rows_test(base_env):
                 conn.connect(str(socket_path(env)))
                 send_hello(conn)
                 send_resize(conn, 3, 40)
-                create_and_attach_session(conn, shell)
+                create_and_open_session(conn, shell)
 
                 message_type, payload = recv_frame(conn)
-                if message_type != SESSION_ATTACHED:
-                    raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-                assert_session_attached(payload)
+                if message_type != SESSION_READY:
+                    raise AssertionError(f"expected SESSION_READY, got {message_type}")
+                assert_session_ready(payload)
                 recv_draw_until(conn, b"OK")
 
                 send_resize_screen_repaint(conn, 3, 40, 77)
@@ -290,8 +290,8 @@ def run_terminal_remote_crash_client_error_test(base_env):
                 raise AssertionError(f"expected one terminal process, found {pids}")
 
             os.kill(pids[0], signal.SIGKILL)
-            output += read_until(fd, b"sessh: ssh remote attach failed", timeout=5.0)
-            if b"ssh remote attach failed" not in output:
+            output += read_until(fd, b"sessh: ssh remote session failed", timeout=5.0)
+            if b"ssh remote session failed" not in output:
                 raise AssertionError(output)
             alt_leave = output.rfind(b"\x1b[?1049l")
             if alt_leave < 0:
@@ -338,16 +338,13 @@ def run_broker_starts_daemon_session_test(base_env):
         try:
             send_hello(conn)
             send_resize(conn, rows=4, cols=40)
-            create_and_attach_session(conn, shell)
+            create_and_open_session(conn, shell)
             message_type, payload = recv_frame(conn)
-            if message_type != SESSION_ATTACHED:
-                raise AssertionError(f"expected SESSION_ATTACHED, got {message_type}")
-            assert_session_attached(payload)
+            if message_type != SESSION_READY:
+                raise AssertionError(f"expected SESSION_READY, got {message_type}")
+            assert_session_ready(payload)
             recv_draw_until(conn, b"BROKER_READY")
 
-            guid_dir = runtime_root(env) / "guid"
-            if guid_dir.exists():
-                raise AssertionError(f"broker session wrote legacy runtime GUID directory {guid_dir}")
             assert_runtime_dir_symlink(env, Path(env["XDG_RUNTIME_DIR"]))
 
             send_frame(conn, INPUT, pack_bytes(b"exit\n"))
@@ -376,8 +373,6 @@ def spawn_bin(env, args):
 
 def spawn_client(env, extra_args=None):
     extra_args = extra_args or []
-    if extra_args and extra_args[0] == "attach":
-        return spawn_bin(env, ["attach", *extra_args[1:]])
     return spawn_bin(env, ["new", *extra_args, "."])
 
 
@@ -421,5 +416,3 @@ def run_initial_kitty_keyboard_restore_test(tmp_root):
     finally:
         kitty_keyboard_status_response = previous_response
         cleanup_runtime(env)
-
-

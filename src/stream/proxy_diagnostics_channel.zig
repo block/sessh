@@ -5,6 +5,7 @@ const posix = std.posix;
 const app_allocator = @import("../core/app_allocator.zig");
 const core_fds = @import("../core/fds.zig");
 const protocol = @import("../protocol/mod.zig");
+const foreground_frame_io = @import("../transport/foreground_frame_io.zig");
 const pb = protocol.pb;
 
 pub const Message = union(enum) {
@@ -59,12 +60,31 @@ pub const Reader = struct {
     }
 };
 
-pub fn writeConnectionEvent(fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
-    try protocol.sendClientDaemonConnectionEventFrame(app_allocator.allocator(), fd, event);
+// Proxy control paths do not own a dispatcher watch for the diagnostics fd. The
+// caller waits for this one frame to flush, but the write itself still advances
+// through FrameWriteState so backpressure is explicit rather than hidden inside
+// a raw writeAll helper.
+pub fn writeConnectionEventForeground(fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
+    const payload = try protocol.encodeConnectionEventPayload(app_allocator.allocator(), event);
+    defer app_allocator.allocator().free(payload);
+    try foreground_frame_io.writeFrame(.{
+        .allocator = app_allocator.allocator(),
+        .fd = fd,
+        .message_type = .client_daemon,
+        .payload = payload,
+    });
 }
 
-pub fn writeRetryNow(fd: c.fd_t) !void {
-    try protocol.sendClientDaemonPayloadFrame(app_allocator.allocator(), fd, .{ .retry_now = .{} });
+// Same foreground-only contract as writeConnectionEventForeground.
+pub fn writeRetryNowForeground(fd: c.fd_t) !void {
+    const payload = try protocol.encodeClientDaemonPayload(app_allocator.allocator(), .{ .retry_now = .{} });
+    defer app_allocator.allocator().free(payload);
+    try foreground_frame_io.writeFrame(.{
+        .allocator = app_allocator.allocator(),
+        .fd = fd,
+        .message_type = .client_daemon,
+        .payload = payload,
+    });
 }
 
 fn messageFromFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !OwnedMessage {
@@ -82,56 +102,58 @@ fn messageFromFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !O
 }
 
 test "proxy diagnostics uses client daemon frames" {
+    const TestReader = struct {
+        fn readMessage(reader: *Reader, allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
+            while (true) {
+                switch (try reader.readReady(allocator, fd)) {
+                    .blocked => return error.WouldBlock,
+                    .progress => continue,
+                    .message => |message| return message,
+                    .eof => return error.EndOfStream,
+                    .truncated_frame => return error.TruncatedFrame,
+                }
+            }
+        }
+    };
+
     var fds: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
     try core_fds.setNonBlocking(fds[1]);
 
-    try writeConnectionEvent(fds[0], .{ .daemon_disconnected = .{
+    try writeConnectionEventForeground(fds[0], .{ .daemon_disconnected = .{
         .retry_at_local_boot_time_ms = 1234,
     } });
-    try writeConnectionEvent(fds[0], .{ .ssh_stderr = .{ .data = "ssh: nope" } });
-    try writeConnectionEvent(fds[0], .{ .daemon_connected = .{} });
-    try writeRetryNow(fds[0]);
+    try writeConnectionEventForeground(fds[0], .{ .ssh_stderr = .{ .data = "ssh: nope" } });
+    try writeConnectionEventForeground(fds[0], .{ .daemon_connected = .{} });
+    try writeRetryNowForeground(fds[0]);
 
     var reader = Reader.init(std.testing.allocator);
     defer reader.deinit();
 
-    var disconnected = try readMessageForTest(&reader, std.testing.allocator, fds[1]);
+    var disconnected = try TestReader.readMessage(&reader, std.testing.allocator, fds[1]);
     defer disconnected.deinit(std.testing.allocator);
     switch (disconnected.message.connection_event.event.?) {
         .daemon_disconnected => |event| try std.testing.expectEqual(@as(?u64, 1234), event.retry_at_local_boot_time_ms),
         else => return error.UnexpectedProxyDiagnosticsFrame,
     }
 
-    var stderr = try readMessageForTest(&reader, std.testing.allocator, fds[1]);
+    var stderr = try TestReader.readMessage(&reader, std.testing.allocator, fds[1]);
     defer stderr.deinit(std.testing.allocator);
     switch (stderr.message.connection_event.event.?) {
         .ssh_stderr => |event| try std.testing.expectEqualStrings("ssh: nope", event.data),
         else => return error.UnexpectedProxyDiagnosticsFrame,
     }
 
-    var connected = try readMessageForTest(&reader, std.testing.allocator, fds[1]);
+    var connected = try TestReader.readMessage(&reader, std.testing.allocator, fds[1]);
     defer connected.deinit(std.testing.allocator);
     switch (connected.message.connection_event.event.?) {
         .daemon_connected => {},
         else => return error.UnexpectedProxyDiagnosticsFrame,
     }
 
-    var retry_now = try readMessageForTest(&reader, std.testing.allocator, fds[1]);
+    var retry_now = try TestReader.readMessage(&reader, std.testing.allocator, fds[1]);
     defer retry_now.deinit(std.testing.allocator);
     try std.testing.expectEqual(Message.retry_now, retry_now.message);
-}
-
-fn readMessageForTest(reader: *Reader, allocator: std.mem.Allocator, fd: c.fd_t) !OwnedMessage {
-    while (true) {
-        switch (try reader.readReady(allocator, fd)) {
-            .blocked => return error.WouldBlock,
-            .progress => continue,
-            .message => |message| return message,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
-        }
-    }
 }

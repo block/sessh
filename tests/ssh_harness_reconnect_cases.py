@@ -489,7 +489,7 @@ def test_ssh_log_level_quiet_suppresses_buffered_stderr_display(tmp):
         raise AssertionError(result)
 
 
-def test_ssh_session_buffers_and_displays_stderr_after_attach(tmp):
+def test_ssh_session_buffers_and_displays_stderr_after_session_ready(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"
@@ -663,7 +663,7 @@ def test_ssh_unsupported_remote_platform_falls_back_to_plain_ssh(tmp):
     combined_output = result.stdout + result.stderr
     if "no matching sessh binary is available" not in combined_output:
         raise AssertionError(result)
-    if "falling back to plain ssh without persistence" not in combined_output:
+    if "falling back to plain ssh without sessh recovery" not in combined_output:
         raise AssertionError(result)
     if "unsupported" not in combined_output:
         raise AssertionError(result)
@@ -672,4 +672,3 @@ def test_ssh_unsupported_remote_platform_falls_back_to_plain_ssh(tmp):
         raise AssertionError(log_text)
     if "plain_ssh=1" not in log_text or "plain_host=test-host" not in log_text:
         raise AssertionError(log_text)
-

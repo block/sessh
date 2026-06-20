@@ -1,6 +1,4 @@
 const std = @import("std");
-const app_allocator = @import("../core/app_allocator.zig");
-const c = std.c;
 
 const frame = @import("frame.zig");
 
@@ -10,29 +8,33 @@ pub const ClientDaemonPayload = pb.ClientDaemonItem.payload_union;
 pub const ClientRemotePayload = pb.ClientRemoteItem.payload_union;
 pub const DaemonTunnelPayload = pb.DaemonTunnelItem.payload_union;
 pub const MuxStreamMessage = pb.DaemonTunnelItem.MuxStreamFrame.message_union;
-pub const ProxyStreamPayload = pb.ProxyStreamItem.payload_union;
 pub const TerminalEmulatorPayload = pb.TerminalEmulatorItem.payload_union;
+pub const TransportControl = enum {
+    ping,
+    pong,
+};
 
-pub fn sendPing(fd: c.fd_t) !void {
-    try sendDaemonTunnelPayloadFrame(app_allocator.allocator(), fd, .{ .ping = .{} });
-}
+pub const ErrorInfo = struct {
+    code: []const u8,
+    message: []const u8,
+    hint: []const u8 = "",
+};
 
-pub fn sendPong(fd: c.fd_t) !void {
-    try sendDaemonTunnelPayloadFrame(app_allocator.allocator(), fd, .{ .pong = .{} });
-}
+pub fn decodeTransportControlFrame(
+    allocator: std.mem.Allocator,
+    message_type: frame.MessageType,
+    payload: []const u8,
+) !?TransportControl {
+    if (message_type != .daemon_tunnel) return null;
 
-pub fn handleTransportControlFrame(message_type: frame.MessageType, payload: []const u8, write_fd: c.fd_t) !bool {
-    if (message_type != .daemon_tunnel) return false;
+    var item = try frame.decodePayload(pb.DaemonTunnelItem, allocator, payload);
+    defer item.deinit(allocator);
 
-    var item = try frame.decodePayload(pb.DaemonTunnelItem, app_allocator.allocator(), payload);
-    defer item.deinit(app_allocator.allocator());
-
-    switch (item.payload orelse return false) {
-        .ping => try sendPong(write_fd),
-        .pong => {},
-        else => return false,
-    }
-    return true;
+    return switch (item.payload orelse return null) {
+        .ping => .ping,
+        .pong => .pong,
+        else => null,
+    };
 }
 
 pub fn encodeClientDaemonPayload(
@@ -84,16 +86,11 @@ pub fn muxStreamResetFrame(
     };
 }
 
-pub fn encodeErrorPayload(
-    allocator: std.mem.Allocator,
-    code: []const u8,
-    message: []const u8,
-    hint: []const u8,
-) ![]u8 {
+pub fn encodeErrorPayload(allocator: std.mem.Allocator, info: ErrorInfo) ![]u8 {
     return frame.encodePayload(allocator, frame.hpb.Error{
-        .code = code,
-        .message = message,
-        .hint = hint,
+        .code = info.code,
+        .message = info.message,
+        .hint = info.hint,
     });
 }
 
@@ -102,126 +99,6 @@ pub fn encodeTerminalEmulatorItemPayload(
     item: pb.TerminalEmulatorItem,
 ) ![]u8 {
     return encodeClientRemotePayload(allocator, .{ .terminal_emulator = item });
-}
-
-pub fn sendClientDaemonPayloadFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    payload: ClientDaemonPayload,
-) !void {
-    const encoded = try encodeClientDaemonPayload(allocator, payload);
-    defer allocator.free(encoded);
-    try frame.sendFrame(fd, .client_daemon, encoded);
-}
-
-pub fn sendDaemonTunnelPayloadFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    payload: DaemonTunnelPayload,
-) !void {
-    const encoded = try encodeDaemonTunnelPayload(allocator, payload);
-    defer allocator.free(encoded);
-    try frame.sendFrame(fd, .daemon_tunnel, encoded);
-}
-
-pub fn sendClientRemotePayloadFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    payload: ClientRemotePayload,
-) !void {
-    const encoded = try encodeClientRemotePayload(allocator, payload);
-    defer allocator.free(encoded);
-    try frame.sendFrame(fd, .client_remote, encoded);
-}
-
-pub fn sendErrorFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    code: []const u8,
-    message: []const u8,
-    hint: []const u8,
-) !void {
-    const encoded = try encodeErrorPayload(allocator, code, message, hint);
-    defer allocator.free(encoded);
-    try frame.sendFrame(fd, .error_message, encoded);
-}
-
-pub fn sendMuxStreamFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    message: pb.DaemonTunnelItem.MuxStreamFrame,
-) !void {
-    try sendDaemonTunnelPayloadFrame(allocator, fd, .{ .mux_stream = message });
-}
-
-pub fn sendMuxStreamResetFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    stream_id: u64,
-    code: []const u8,
-    message: []const u8,
-) !void {
-    try sendMuxStreamFrame(allocator, fd, muxStreamResetFrame(stream_id, code, message));
-}
-
-pub fn sendTerminalEmulatorItemFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    item: pb.TerminalEmulatorItem,
-) !void {
-    try sendClientRemotePayloadFrame(allocator, fd, .{ .terminal_emulator = item });
-}
-
-pub fn sendTerminalEmulatorPayloadFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    payload: TerminalEmulatorPayload,
-) !void {
-    try sendTerminalEmulatorItemFrame(allocator, fd, .{ .payload = payload });
-}
-
-pub fn sendProxyStreamPayloadFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    payload: ProxyStreamPayload,
-) !void {
-    try sendClientRemotePayloadFrame(allocator, fd, .{ .proxy = .{ .payload = payload } });
-}
-
-pub fn sendSshTransportAcquireFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.ClientDaemonItem.SshTransportAcquire) !void {
-    try sendClientDaemonPayloadFrame(allocator, fd, .{ .ssh_transport_acquire = request });
-}
-
-pub fn sendClientDaemonConnectionEventFrame(
-    allocator: std.mem.Allocator,
-    fd: c.fd_t,
-    event: pb.ConnectionEvent.event_union,
-) !void {
-    try sendClientDaemonPayloadFrame(allocator, fd, .{ .connection_event = .{ .event = event } });
-}
-
-pub fn sendSshTransportStderrFrame(allocator: std.mem.Allocator, fd: c.fd_t, chunk: []const u8) !void {
-    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .ssh_stderr = .{ .data = chunk } });
-}
-
-pub fn sendSshTransportClosedFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .daemon_disconnected = .{} });
-}
-
-pub fn sendSshTransportBinaryBootstrappingFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .binary_bootstrapping = .{} });
-}
-
-pub fn sendSshTransportDaemonConnectingFrame(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendClientDaemonConnectionEventFrame(allocator, fd, .{ .daemon_connecting = .{} });
-}
-
-pub fn sendDaemonLogRequestFrame(allocator: std.mem.Allocator, fd: c.fd_t, request: pb.ClientDaemonItem.DaemonLogRequest) !void {
-    try sendClientDaemonPayloadFrame(allocator, fd, .{ .log_request = request });
-}
-
-pub fn sendDaemonLogEntryFrame(allocator: std.mem.Allocator, fd: c.fd_t, entry: pb.ClientDaemonItem.DaemonLogEntry) !void {
-    try sendClientDaemonPayloadFrame(allocator, fd, .{ .log_entry = entry });
 }
 
 pub fn decodeClientRemoteTerminalEmulatorItem(allocator: std.mem.Allocator, payload: []const u8) !pb.TerminalEmulatorItem {

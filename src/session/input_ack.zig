@@ -6,10 +6,15 @@ pub const Tracker = struct {
     last_acked_seq: u64 = 0,
     paste_like_sent_seq: u64 = 0,
 
-    pub fn allocate(self: *Tracker, paste_like: bool) u64 {
+    pub const InputKind = enum {
+        normal,
+        paste_like,
+    };
+
+    pub fn allocate(self: *Tracker, kind: InputKind) u64 {
         const seq = self.next_seq;
         self.last_sent_seq = seq;
-        if (paste_like) self.paste_like_sent_seq = seq;
+        if (kind == .paste_like) self.paste_like_sent_seq = seq;
         self.next_seq +%= 1;
         if (self.next_seq == 0) self.next_seq = 1;
         return seq;
@@ -51,12 +56,12 @@ pub fn acknowledge(tracker: *Tracker, input_seq: u64) AckResult {
 test "input ack tracker records pending and acknowledged input" {
     var tracker = Tracker{};
     try std.testing.expect(!tracker.pending());
-    const first = tracker.allocate(false);
+    const first = tracker.allocate(.normal);
     try std.testing.expectEqual(@as(u64, 1), first);
     try std.testing.expect(tracker.pending());
     try std.testing.expect(tracker.acknowledge(first));
     try std.testing.expect(!tracker.pending());
-    const second = tracker.allocate(false);
+    const second = tracker.allocate(.normal);
     _ = second;
     try std.testing.expect(!tracker.acknowledge(first));
     try std.testing.expect(tracker.pending());
@@ -66,9 +71,9 @@ test "input ack tracker records pending and acknowledged input" {
 
 test "input ack tracker records pending paste-like input" {
     var tracker = Tracker{};
-    const normal = tracker.allocate(false);
+    const normal = tracker.allocate(.normal);
     try std.testing.expect(!tracker.pendingPasteLike());
-    const pasted = tracker.allocate(true);
+    const pasted = tracker.allocate(.paste_like);
     try std.testing.expect(tracker.pendingPasteLike());
     try std.testing.expect(tracker.acknowledge(normal));
     try std.testing.expect(tracker.pendingPasteLike());

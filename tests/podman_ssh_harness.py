@@ -626,9 +626,9 @@ def test_sendenv_oracle_cases(prefix, config, host_alias, env):
             sendenv_value,
         )
         assert_sendenv_visible(
-            "SendEnv terminal-emulator tty command",
+            "SendEnv filter-level emulated tty command",
             compare_openssh_tmux_visible_oracle(
-                "SendEnv terminal-emulator tty command",
+                "SendEnv filter-level emulated tty command",
                 prefix,
                 config,
                 host_alias,
@@ -1070,8 +1070,6 @@ def test_platform(tmp, prefix, key, os_name, arch, container_platform, expected_
             raise AssertionError(result)
         if marker not in result.stdout:
             raise AssertionError(result)
-        if "ssh terminal worker attach is not implemented yet" in result.stderr:
-            raise AssertionError(result.stderr)
 
         artifact_path = prefix / "libexec" / "sessh" / f"{os_name}-{arch}" / "sessh"
         if not artifact_path.exists():

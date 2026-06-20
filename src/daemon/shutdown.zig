@@ -18,20 +18,6 @@ pub const Context = struct {
     last_live_work_ms: u64,
 };
 
-pub fn initContext(
-    allocator: std.mem.Allocator,
-    daemon_dispatcher: *dispatcher.Dispatcher,
-    cleanup_context: *daemon_cleanup_scheduler.Context,
-    active_local_clients: *usize,
-) Context {
-    return .{
-        .allocator = allocator,
-        .cleanup_context = cleanup_context,
-        .active_local_clients = active_local_clients,
-        .last_live_work_ms = daemon_dispatcher.nowMs(),
-    };
-}
-
 pub fn watchIdle(context: *Context, daemon_dispatcher: *dispatcher.Dispatcher) !void {
     _ = try daemon_dispatcher.watchTimerAfter(daemon_idle_check_ms, .{
         .ctx = context,
@@ -39,8 +25,9 @@ pub fn watchIdle(context: *Context, daemon_dispatcher: *dispatcher.Dispatcher) !
     });
 }
 
-fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
-    _ = id;
+fn checkDaemonIdle(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    const daemon_dispatcher = handler_event.dispatcher;
+    const event = handler_event.event;
     const idle_context: *Context = @ptrCast(@alignCast(ctx));
     switch (event) {
         .timer => {},
@@ -48,14 +35,16 @@ fn checkDaemonIdle(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, i
     }
 
     const now_ms = daemon_dispatcher.nowMs();
-    const has_local_client = idle_context.active_local_clients.* != 0;
-    const cleanup_keeps_daemon_alive = try idle_context.cleanup_context.maintain(now_ms, has_local_client);
+    const cleanup_keeps_daemon_alive = try idle_context.cleanup_context.maintain(
+        now_ms,
+        if (idle_context.active_local_clients.* != 0) .present else .none,
+    );
     if (daemonShouldStayAlive(.{
         .active_local_clients = idle_context.active_local_clients.*,
         .active_pooled_transports = transport_ssh.activePooledSshTransportCount(),
         .active_mux_connections = daemon_tunnel.activeMuxConnectionCount(),
-        .active_terminal_remotes = terminal_worker.activeTerminalWorkerHandleCount(),
-        .active_proxy_remotes = proxy_worker.activeProxyRemoteProcessCount(),
+        .active_terminal_workers = terminal_worker.activeTerminalWorkerHandleCount(),
+        .active_proxy_workers = proxy_worker.activeProxyRemoteProcessCount(),
         .active_log_subscribers = daemon_log.activeSubscriberCount(),
         .cleanup_keeps_daemon_alive = cleanup_keeps_daemon_alive,
     })) {
@@ -73,8 +62,8 @@ const LiveWorkSnapshot = struct {
     active_local_clients: usize = 0,
     active_pooled_transports: usize = 0,
     active_mux_connections: usize = 0,
-    active_terminal_remotes: usize = 0,
-    active_proxy_remotes: usize = 0,
+    active_terminal_workers: usize = 0,
+    active_proxy_workers: usize = 0,
     active_log_subscribers: usize = 0,
     cleanup_keeps_daemon_alive: bool = false,
 };
@@ -83,8 +72,8 @@ fn daemonShouldStayAlive(snapshot: LiveWorkSnapshot) bool {
     return snapshot.active_local_clients != 0 or
         snapshot.active_pooled_transports != 0 or
         snapshot.active_mux_connections != 0 or
-        snapshot.active_terminal_remotes != 0 or
-        snapshot.active_proxy_remotes != 0 or
+        snapshot.active_terminal_workers != 0 or
+        snapshot.active_proxy_workers != 0 or
         snapshot.active_log_subscribers != 0 or
         snapshot.cleanup_keeps_daemon_alive;
 }
@@ -106,8 +95,8 @@ test "daemon liveness snapshot exits when no useful work remains" {
 test "daemon liveness snapshot retains pooled and remote work" {
     try std.testing.expect(daemonShouldStayAlive(.{ .active_pooled_transports = 1 }));
     try std.testing.expect(daemonShouldStayAlive(.{ .active_mux_connections = 1 }));
-    try std.testing.expect(daemonShouldStayAlive(.{ .active_terminal_remotes = 1 }));
-    try std.testing.expect(daemonShouldStayAlive(.{ .active_proxy_remotes = 1 }));
+    try std.testing.expect(daemonShouldStayAlive(.{ .active_terminal_workers = 1 }));
+    try std.testing.expect(daemonShouldStayAlive(.{ .active_proxy_workers = 1 }));
     try std.testing.expect(daemonShouldStayAlive(.{ .active_local_clients = 1 }));
     try std.testing.expect(daemonShouldStayAlive(.{ .active_log_subscribers = 1 }));
 }

@@ -21,7 +21,7 @@ const socket_transport = @import("../transport/socket.zig");
 
 // PROCESS_GLOBAL_REGISTRY: the daemon accept loop increments this for each
 // dispatcher-owned local client connection. Idle shutdown reads it to avoid
-// exiting while a foreground client is still attached.
+// exiting while a foreground client is still connected.
 var active_local_clients: usize = 0;
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
@@ -117,10 +117,19 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
         .cleanup_retry_limit_ms = file_config.cleanup_retry_limit_ms orelse config.default_cleanup_retry_limit_ms,
     };
     defer cleanup_context.deinit();
-    var idle_context = daemon_shutdown.initContext(allocator, &daemon_dispatcher, &cleanup_context, &active_local_clients);
-    _ = try daemon_dispatcher.watchFd(listen_fd, .{ .readable = true }, .{
-        .ctx = &accept_context,
-        .callback = daemon_accept.acceptDaemonClient,
+    var idle_context = daemon_shutdown.Context{
+        .allocator = allocator,
+        .cleanup_context = &cleanup_context,
+        .active_local_clients = &active_local_clients,
+        .last_live_work_ms = daemon_dispatcher.nowMs(),
+    };
+    _ = try daemon_dispatcher.watchFd(.{
+        .fd = listen_fd,
+        .events = .{ .readable = true },
+        .handler = .{
+            .ctx = &accept_context,
+            .callback = daemon_accept.acceptDaemonClient,
+        },
     });
     try daemon_shutdown.watchIdle(&idle_context, &daemon_dispatcher);
     try daemon_dispatcher.run();

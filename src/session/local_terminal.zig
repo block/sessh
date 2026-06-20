@@ -31,8 +31,7 @@ pub const State = struct {
 pub const Probe = struct {
     state: ?State = null,
 
-    pub fn start(allocator: std.mem.Allocator) Probe {
-        _ = allocator;
+    pub fn start() Probe {
         return .{
             .state = capture(),
         };
@@ -58,14 +57,14 @@ pub fn capture() State {
     // The normal sessh path runs a terminal emulator on the remote side. Copy
     // portable line-discipline modes, but keep TERM tied to that emulator
     // contract instead of leaking the outer terminal's TERM.
-    state.tty_settings = tty_settings.capture(app_allocator.allocator(), posix.STDIN_FILENO, .{ .include_term = false }) catch |err| blk: {
+    state.tty_settings = tty_settings.capture(app_allocator.allocator(), posix.STDIN_FILENO, .omit) catch |err| blk: {
         client_log.debug("event=tty_settings_capture_failed error={t}", .{err});
         break :blk null;
     };
 
     if (c.isatty(posix.STDIN_FILENO) == 0 or c.isatty(posix.STDOUT_FILENO) == 0) return state;
 
-    const probe = terminal.queryTerminalProbe(posix.STDIN_FILENO, posix.STDOUT_FILENO) catch {
+    const probe = terminal.queryTerminalProbe(.{}) catch {
         state.viewport_offset = unknown_viewport_offset;
         return state;
     };

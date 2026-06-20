@@ -47,13 +47,9 @@ connection switch if paste-like input was sent to the old connection but was
 not fully acknowledged before the connection disconnected or became
 unresponsive.
 
-For now, we treat input as paste-like if either:
-
-- a single terminal read forwards at least 32 bytes, or
-- at least 64 forwarded bytes arrive within a 250ms monotonic-time window.
-
-In the future we should recognize bracketed paste, but that will require
-parsing input on the client for bracketed paste delimiters.
+The current heuristic treats large single reads and dense short windows of input
+as paste-like. Recognizing bracketed paste directly would require parsing input
+on the client for bracketed paste delimiters.
 
 Pastes while disconnected are discarded by sessh. That should not disable
 automatic switching, because none of it can be partially delivered.

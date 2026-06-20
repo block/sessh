@@ -3,13 +3,31 @@ const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
+const fixed_buffer = @import("../core/fixed_buffer.zig");
 const io = @import("../core/io.zig");
+const non_suspending_timer = @import("../core/non_suspending_timer.zig");
 
 extern "c" fn ioctl(fd: c.fd_t, request: c_ulong, ...) c_int;
 
 pub const WindowSize = struct {
     rows: u16 = 24,
     cols: u16 = 80,
+
+    pub fn eql(self: WindowSize, other: WindowSize) bool {
+        return self.rows == other.rows and self.cols == other.cols;
+    }
+
+    pub fn winsize(self: WindowSize) c.winsize {
+        return .{ .row = self.rows, .col = self.cols, .xpixel = 0, .ypixel = 0 };
+    }
+
+    pub fn withRows(self: WindowSize, rows: u16) WindowSize {
+        return .{ .rows = rows, .cols = self.cols };
+    }
+
+    pub fn withCols(self: WindowSize, cols: u16) WindowSize {
+        return .{ .rows = self.rows, .cols = cols };
+    }
 };
 
 pub const Rgb = struct {
@@ -23,13 +41,101 @@ pub const DefaultColorQuery = struct {
     background: ?Rgb = null,
 };
 
-pub const CursorPosition = struct {
+pub const Position = struct {
     row: u16,
     col: u16,
+
+    pub fn eql(self: Position, other: Position) bool {
+        return self.row == other.row and self.col == other.col;
+    }
+
+    pub fn withRow(self: Position, row: u16) Position {
+        return .{ .row = row, .col = self.col };
+    }
+
+    pub fn withCol(self: Position, col: u16) Position {
+        return .{ .row = self.row, .col = col };
+    }
 };
 
-const terminal_query_timeout_ms: i64 = 150;
-const terminal_query_poll_ms: i64 = 25;
+pub const CursorPosition = Position;
+pub const top_left_position: CursorPosition = .{ .row = 0, .col = 0 };
+
+pub const CursorStyle = enum(u8) {
+    default = 0,
+    blinking_block = 1,
+    steady_block = 2,
+    blinking_underline = 3,
+    steady_underline = 4,
+    blinking_bar = 5,
+    steady_bar = 6,
+};
+
+pub const CursorVisibility = enum {
+    visible,
+    hidden,
+
+    pub fn fromBool(visible: bool) CursorVisibility {
+        return if (visible) .visible else .hidden;
+    }
+};
+
+pub const CursorState = struct {
+    position: CursorPosition = top_left_position,
+    visibility: CursorVisibility = .visible,
+    style: CursorStyle = .default,
+
+    pub fn eql(self: CursorState, other: CursorState) bool {
+        return self.position.eql(other.position) and
+            self.visibility == other.visibility and
+            self.style == other.style;
+    }
+};
+
+pub const MouseTracking = enum(u8) {
+    disabled = 0,
+    normal = 1,
+    button = 2,
+    any = 3,
+};
+
+pub const TerminalModes = struct {
+    mode_flags: u32 = 0,
+    mouse_tracking: MouseTracking = .disabled,
+    mouse_sgr: bool = false,
+    kitty_keyboard_flags: u5 = 0,
+
+    pub const insert_mode: u32 = 1 << 0;
+    pub const origin_mode: u32 = 1 << 1;
+    pub const auto_wrap: u32 = 1 << 2;
+    pub const application_cursor_keys: u32 = 1 << 3;
+    pub const focus_reporting: u32 = 1 << 4;
+    pub const bracketed_paste: u32 = 1 << 5;
+
+    pub fn eql(self: TerminalModes, other: TerminalModes) bool {
+        return self.mode_flags == other.mode_flags and
+            self.mouse_tracking == other.mouse_tracking and
+            self.mouse_sgr == other.mouse_sgr and
+            self.kitty_keyboard_flags == other.kitty_keyboard_flags;
+    }
+};
+
+pub const TerminalFds = struct {
+    input: c.fd_t = posix.STDIN_FILENO,
+    output: c.fd_t = posix.STDOUT_FILENO,
+
+    pub fn eql(self: TerminalFds, other: TerminalFds) bool {
+        return self.input == other.input and self.output == other.output;
+    }
+};
+
+pub fn sanitizedOscTextByte(byte: u8) u8 {
+    return if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+}
+
+const terminal_query_timeout_ms: u64 = 150;
+const terminal_query_poll_ms: u64 = 25;
+const TerminalProbeBytes = fixed_buffer.FixedBuffer(512);
 const kitty_keyboard_query = "\x1b[?u";
 const terminal_probe_request =
     kitty_keyboard_query ++
@@ -55,8 +161,7 @@ pub const TerminalProbe = struct {
 };
 
 var cached_probe: ?TerminalProbe = null;
-var cached_probe_input_fd: c.fd_t = -1;
-var cached_probe_output_fd: c.fd_t = -1;
+var cached_probe_fds: TerminalFds = .{ .input = -1, .output = -1 };
 
 pub const FilterEnd = enum {
     disconnect,
@@ -71,7 +176,7 @@ pub const FilterResult = struct {
 
 pub const escape_help_lines = [_][]const u8{
     "Supported escape sequences:",
-    "~.  disconnect",
+    "~.  close session",
     "~p  repaint",
     "~?  show this help",
     "~~  send ~",
@@ -79,7 +184,7 @@ pub const escape_help_lines = [_][]const u8{
 
 pub const escape_help_overlay_lines = [_][]const u8{
     "Supported escape sequences. Any key to dismiss",
-    "~.  disconnect",
+    "~.  close session",
     "~p  repaint",
     "~?  show this help",
     "~~  send ~",
@@ -204,80 +309,68 @@ pub fn setSigpipe(handler: ?posix.Sigaction.handler_fn) void {
 }
 
 pub fn currentWindowSize() WindowSize {
-    if (getWindowSize(1)) |size| return size;
-    if (getWindowSize(0)) |size| return size;
+    if (getWindowSize(posix.STDOUT_FILENO)) |size| return size;
+    if (getWindowSize(posix.STDIN_FILENO)) |size| return size;
     return .{};
 }
 
-pub fn queryDefaultColors(input_fd: c.fd_t, output_fd: c.fd_t) !DefaultColorQuery {
-    return (try queryTerminalProbe(input_fd, output_fd)).default_colors;
-}
-
-pub fn queryCursorPosition(input_fd: c.fd_t, output_fd: c.fd_t) !?CursorPosition {
-    return (try queryTerminalProbe(input_fd, output_fd)).cursor_position;
-}
-
-pub fn queryKittyKeyboardFlags(input_fd: c.fd_t, output_fd: c.fd_t) !?u5 {
+fn queryKittyKeyboardFlags(fds: TerminalFds) !?u5 {
     if (cached_probe != null and
-        cached_probe_input_fd == input_fd and
-        cached_probe_output_fd == output_fd and
+        cached_probe_fds.eql(fds) and
         cached_probe.?.kitty_keyboard_flags != null)
     {
         return cached_probe.?.kitty_keyboard_flags;
     }
 
     var probe = TerminalProbe{};
-    if (c.isatty(input_fd) == 0 or c.isatty(output_fd) == 0) return null;
+    if (c.isatty(fds.input) == 0 or c.isatty(fds.output) == 0) return null;
 
-    var guard = try TerminalModeGuard.enable(input_fd);
+    var guard = try TerminalModeGuard.enable(fds.input);
     defer guard.restore();
 
-    try io.writeAll(output_fd, kitty_keyboard_query);
-    try readTerminalProbeResponses(input_fd, &probe, .kitty_keyboard_flags);
-    mergeCachedProbe(input_fd, output_fd, probe);
+    try io.writeAll(fds.output, kitty_keyboard_query);
+    try readTerminalProbeResponses(fds.input, &probe, .kitty_keyboard_flags);
+    mergeCachedProbe(fds, probe);
     return probe.kitty_keyboard_flags;
 }
 
 const InitialKittyKeyboardFlags = struct {
-    input_fd: c.fd_t,
-    output_fd: c.fd_t,
+    fds: TerminalFds,
     flags: u5,
 };
 
 var cached_initial_kitty_keyboard_flags: ?InitialKittyKeyboardFlags = null;
 
-pub fn queryInitialKittyKeyboardFlags(input_fd: c.fd_t, output_fd: c.fd_t) u5 {
+pub fn queryInitialKittyKeyboardFlags(fds: TerminalFds) u5 {
     if (cached_initial_kitty_keyboard_flags) |cached| {
-        if (cached.input_fd == input_fd and cached.output_fd == output_fd) return cached.flags;
+        if (cached.fds.eql(fds)) return cached.flags;
     }
 
     // Reconnects keep using the same outer terminal. Querying it again after
     // the reconnect overlay clears can race with typed-ahead input and consume
     // those bytes as probe responses.
-    const flags = (queryKittyKeyboardFlags(input_fd, output_fd) catch null) orelse 0;
+    const flags = (queryKittyKeyboardFlags(fds) catch null) orelse 0;
     cached_initial_kitty_keyboard_flags = .{
-        .input_fd = input_fd,
-        .output_fd = output_fd,
+        .fds = fds,
         .flags = flags,
     };
     return flags;
 }
 
-pub fn queryTerminalProbe(input_fd: c.fd_t, output_fd: c.fd_t) !TerminalProbe {
-    if (cached_probe != null and cached_probe_input_fd == input_fd and cached_probe_output_fd == output_fd) return cached_probe.?;
+pub fn queryTerminalProbe(fds: TerminalFds) !TerminalProbe {
+    if (cached_probe != null and cached_probe_fds.eql(fds)) return cached_probe.?;
     var probe = TerminalProbe{};
-    if (c.isatty(input_fd) == 0 or c.isatty(output_fd) == 0) return probe;
+    if (c.isatty(fds.input) == 0 or c.isatty(fds.output) == 0) return probe;
 
-    var guard = try TerminalModeGuard.enable(input_fd);
+    var guard = try TerminalModeGuard.enable(fds.input);
     defer guard.restore();
 
-    try io.writeAll(output_fd, terminal_probe_request);
+    try io.writeAll(fds.output, terminal_probe_request);
 
-    try readTerminalProbeResponses(input_fd, &probe, .complete);
+    try readTerminalProbeResponses(fds.input, &probe, .complete);
 
     cached_probe = probe;
-    cached_probe_input_fd = input_fd;
-    cached_probe_output_fd = output_fd;
+    cached_probe_fds = fds;
     return probe;
 }
 
@@ -287,36 +380,37 @@ const ProbeReadTarget = enum {
 };
 
 fn readTerminalProbeResponses(input_fd: c.fd_t, probe: *TerminalProbe, target: ProbeReadTarget) !void {
-    var bytes: [512]u8 = undefined;
-    var len: usize = 0;
-    const deadline = std.time.milliTimestamp() + terminal_query_timeout_ms;
+    var bytes = TerminalProbeBytes{};
+    const deadline_ms = terminalProbeNowMs() + terminal_query_timeout_ms;
     // BLOCKING_POLL: foreground local-terminal probe. It runs before the
-    // visible client enters its main attached-client loop and has no daemon
-    // dispatcher work to service.
-    while (std.time.milliTimestamp() < deadline) {
-        const remaining = deadline - std.time.milliTimestamp();
-        if (remaining <= 0) break;
+    // visible client enters its main terminal loop and has no daemon dispatcher
+    // work to service.
+    while (true) {
+        const now_ms = terminalProbeNowMs();
+        if (now_ms >= deadline_ms) break;
+        const remaining_ms = deadline_ms - now_ms;
         var pollfds = [_]posix.pollfd{.{
             .fd = input_fd,
             .events = posix.POLL.IN,
             .revents = 0,
         }};
-        const timeout: i32 = @intCast(@min(remaining, terminal_query_poll_ms));
+        const timeout: i32 = @intCast(@min(remaining_ms, terminal_query_poll_ms));
         const ready = try posix.poll(&pollfds, timeout);
         if (ready == 0) continue;
         if ((pollfds[0].revents & posix.POLL.IN) == 0) {
             if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) break;
             continue;
         }
-        if (len == bytes.len) break;
-        const n = posix.read(input_fd, bytes[len..]) catch |err| switch (err) {
+        const remaining = bytes.remainingSlice();
+        if (remaining.len == 0) break;
+        const n = posix.read(input_fd, remaining) catch |err| switch (err) {
             error.WouldBlock, error.InputOutput => break,
             else => return err,
         };
         if (n == 0) break;
-        io.noteRead(input_fd, bytes[len..][0..n]);
-        len += n;
-        parseTerminalProbeResponses(bytes[0..len], probe);
+        io.noteRead(input_fd, remaining[0..n]);
+        bytes.commitWrite(n);
+        parseTerminalProbeResponses(bytes.slice(), probe);
         switch (target) {
             .complete => if (probe.complete()) break,
             .kitty_keyboard_flags => if (probe.kitty_keyboard_flags != null) break,
@@ -324,15 +418,19 @@ fn readTerminalProbeResponses(input_fd: c.fd_t, probe: *TerminalProbe, target: P
     }
 }
 
-fn mergeCachedProbe(input_fd: c.fd_t, output_fd: c.fd_t, probe: TerminalProbe) void {
+fn terminalProbeNowMs() u64 {
+    return non_suspending_timer.nowMs() catch {
+        const ms = std.time.milliTimestamp();
+        if (ms < 0) return 0;
+        return @intCast(ms);
+    };
+}
+
+fn mergeCachedProbe(fds: TerminalFds, probe: TerminalProbe) void {
     if (!probeHasData(probe)) return;
-    if (cached_probe == null or
-        cached_probe_input_fd != input_fd or
-        cached_probe_output_fd != output_fd)
-    {
+    if (cached_probe == null or !cached_probe_fds.eql(fds)) {
         cached_probe = probe;
-        cached_probe_input_fd = input_fd;
-        cached_probe_output_fd = output_fd;
+        cached_probe_fds = fds;
         return;
     }
 
@@ -355,11 +453,11 @@ fn probeHasData(probe: TerminalProbe) bool {
         probe.color_ops_allowed != null;
 }
 
-pub fn setPtySize(fd: c.fd_t, rows: u16, cols: u16) bool {
+pub fn setPtySize(fd: c.fd_t, size: WindowSize) bool {
     const request = ioctlSetWinszRequest() orelse return false;
 
-    var size = c.winsize{ .row = rows, .col = cols, .xpixel = 0, .ypixel = 0 };
-    return ioctl(fd, request, &size) == 0;
+    var winsize = size.winsize();
+    return ioctl(fd, request, &winsize) == 0;
 }
 
 fn makeRaw(term: *posix.termios) void {
@@ -498,12 +596,6 @@ fn featureListContains(list: []const u8, name: []const u8) bool {
     return false;
 }
 
-fn parseDefaultColorResponses(bytes: []const u8, result: *DefaultColorQuery) void {
-    var probe = TerminalProbe{ .default_colors = result.* };
-    parseOscProbeResponses(bytes, &probe);
-    result.* = probe.default_colors;
-}
-
 fn parseRgbSpec(spec: []const u8) ?Rgb {
     if (!std.mem.startsWith(u8, spec, "rgb:")) return null;
     var channels = std.mem.splitScalar(u8, spec[4..], '/');
@@ -521,15 +613,44 @@ fn parseRgbChannel(hex: []const u8) ?u8 {
     return @intCast((value * 255 + max / 2) / max);
 }
 
+test "window size converts to POSIX winsize" {
+    const winsize = (WindowSize{ .rows = 33, .cols = 120 }).winsize();
+
+    try std.testing.expectEqual(@as(u16, 33), winsize.row);
+    try std.testing.expectEqual(@as(u16, 120), winsize.col);
+    try std.testing.expectEqual(@as(u16, 0), winsize.xpixel);
+    try std.testing.expectEqual(@as(u16, 0), winsize.ypixel);
+}
+
+test "window size helpers preserve the unchanged dimension" {
+    const size = WindowSize{ .rows = 33, .cols = 120 };
+
+    try std.testing.expectEqual(WindowSize{ .rows = 44, .cols = 120 }, size.withRows(44));
+    try std.testing.expectEqual(WindowSize{ .rows = 33, .cols = 132 }, size.withCols(132));
+}
+
+test "position helpers preserve the unchanged coordinate" {
+    const position = Position{ .row = 7, .col = 13 };
+
+    try std.testing.expectEqual(Position{ .row = 9, .col = 13 }, position.withRow(9));
+    try std.testing.expectEqual(Position{ .row = 7, .col = 3 }, position.withCol(3));
+}
+
+test "OSC text sanitizing preserves printable bytes and spaces controls" {
+    try std.testing.expectEqual(@as(u8, 'A'), sanitizedOscTextByte('A'));
+    try std.testing.expectEqual(@as(u8, ' '), sanitizedOscTextByte('\n'));
+    try std.testing.expectEqual(@as(u8, ' '), sanitizedOscTextByte(0x7f));
+}
+
 test "default color response parser handles OSC 10 and OSC 11" {
-    var result = DefaultColorQuery{};
-    parseDefaultColorResponses(
+    var probe = TerminalProbe{};
+    parseOscProbeResponses(
         "noise\x1b]10;rgb:ffff/eeee/dddd\x1b\\more\x1b]11;rgb:01/23/45\x07",
-        &result,
+        &probe,
     );
 
-    try std.testing.expectEqual(Rgb{ .r = 255, .g = 238, .b = 221 }, result.foreground.?);
-    try std.testing.expectEqual(Rgb{ .r = 1, .g = 35, .b = 69 }, result.background.?);
+    try std.testing.expectEqual(Rgb{ .r = 255, .g = 238, .b = 221 }, probe.default_colors.foreground.?);
+    try std.testing.expectEqual(Rgb{ .r = 1, .g = 35, .b = 69 }, probe.default_colors.background.?);
 }
 
 test "terminal probe parser handles batched allowed features, cursor, and color responses" {

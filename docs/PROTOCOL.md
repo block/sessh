@@ -19,10 +19,9 @@ diagnostics. In direct daemon placement, `sessh-proxy` instead sends
 for `ProxyFdPassAccepted`, and exits. The raw OpenSSH byte stream is never the
 framed daemon IPC socket.
 
-The `HelloFrame`/`Frame` separation is designed to allow us maximum protocol
-flexibility in the future. We could migrate off of protobuf for everything past
-`HelloOk` while still emitting clean `Error` responses for incompatible
-versions.
+The `HelloFrame`/`Frame` separation keeps compatibility negotiation isolated
+from the post-handshake schema. That leaves room to change the post-handshake
+encoding while still emitting clean `Error` responses for incompatible versions.
 
 # Attached bytes and file descriptors
 
@@ -30,7 +29,7 @@ Most frames are just the protobuf envelope. Some frames also carry bytes
 immediately after the protobuf envelope, described by `Frame.Attached`.
 
 `RAW` attached bytes are uninterpreted stream data. The daemon can forward those
-bytes without pretending they are protobuf fields.
+bytes without treating them as protobuf fields.
 
 `SCM_RIGHTS` attached bytes are different: the byte is only a marker that lets a
 Unix-domain-socket `recvmsg` collect the file descriptor attached at that byte
@@ -53,9 +52,9 @@ envelope. It names the logical stream, then carries one of:
 
 Mux fairness/backpressure is only partially implemented today. The daemon
 already avoids letting one stream's local write backlog make unrelated streams
-unreadable, but protocol-level credit is still future work. Once implemented, if
-one stream fills its local buffer, the daemon should stop reading for that stream
-without freezing unrelated terminal or proxy streams on the same TCP connection.
+unreadable. Protocol-level credit is future work; once implemented, a full local
+buffer for one stream will stop reads for that stream without freezing unrelated
+mux streams for terminal-emulator or proxy sessions on the same TCP connection.
 
 # Connection and cleanup events
 
@@ -77,31 +76,30 @@ remote answers `Cleaned` or `Missing`.
 Like normal `ssh` PTY handling, we:
 1. forward input from the outer terminal to the remote
 2. forward output from the remote to the outer terminal
-3. Catch signals (e.g. SIGINT for ctrl-c, SIGWINCH for window size change) and
+3. catch signals (e.g. SIGINT for ctrl-c, SIGWINCH for window size change) and
    transmit them to the remote
 
-Our client has 4 additional capabilities:
+Our client has four additional capabilities:
 1. It tracks sufficient state so that it can seamlessly reconnect
 2. It avoids executing stale rendering operations while resizing
-2. It can render overlays independently of the remote
-3. It can cleanup TTY state independently of the remote
+3. It can render overlays independently of the remote
+4. It can clean up TTY state independently of the remote
 
-We are able to implement these 4 additional capabilities with minimal client
-logic, which hopefully means it's easier to preserve compatibility across
-versions.
+The protocol keeps these capabilities in a small amount of client-side logic so
+compatibility-sensitive behavior stays concentrated.
 
 ## Seamless reconnect
 
-The protocol is designed so that the remote terminal process does not retain
-state of disconnected clients. Instead, a reconnecting client sends state to
-remote `sesshd`, which combines that with its own terminal state and then computes
+The protocol is designed so that the terminal worker does not retain state of
+disconnected clients. Instead, a reconnecting client sends state to remote
+`sesshd`, which combines that with its own terminal state and then computes
 missing scrollback and generates accurate repaint instructions for the client.
 
 In the event of a network disconnection, remote `sesshd` will continue
 terminal emulation. The virtual screen may update and/or generate additional
 lines of scrollback. When the client reconnects, it sends a
 `TerminalEmulatorItem.Resize` message with an embedded `RepaintRequest`
-containing enough information for the remote terminal process to decide:
+containing enough information for the terminal worker to decide:
 1. Are the client's scrollback contents stale? (i.e. are they from before
    scrollback was cleared?)
 2. Which retained scrollback rows, if any, should be sent to the client?
@@ -127,12 +125,13 @@ answers an unknown offset by aligning the viewport in the repaint response.
 
 ## Client-side overlay rendering
 
-We allow for the possibility of the client to render overlays independently of
-the remote, but the client doesn't have the ability to remove the overlays by
-itself. It can redraw a different overlay, but the only way it can remove an
-overlay is by asking the remote to repaint. After requesting repaint, the client
-ignores subsequent `Draw` packets up until the matching `RepaintResponse` so that
-the overlay doesn't end up in the outer terminal's scrollback.
+The visible client renders reconnect overlays independently of the remote
+terminal worker. The client can redraw the overlay in place, but it cannot
+remove it safely by itself because only the remote terminal model knows the
+screen underneath. To clear an overlay, the client asks the remote to repaint.
+After requesting repaint, the client ignores subsequent `Draw` packets up until
+the matching `RepaintResponse` so that overlay text does not leak into the outer
+terminal's scrollback.
 
 The client uses overlays to notify the user when the connection has died or
 become unresponsive.
@@ -147,9 +146,9 @@ connections after user input.
 
 ## Client-side state cleanup
 
-Both of the previous capabilities rely on the remote generating well-formed
-packets of rendering instructions. The `Draw` message contains rendering
-instructions, but the remote guarantees that they avoid leaking incidental
+Overlay rendering and input acknowledgement both rely on the remote generating
+well-formed packets of rendering instructions. The `Draw` message contains
+rendering instructions, but the remote guarantees that they avoid leaking incidental
 rendering state (e.g. bold/inverse/colors, OSC 8 hyperlinks, cursor movement,
 etc): If any earlier instructions modify that state, then there must be later
 instructions within that same `Draw` message to restore that state.

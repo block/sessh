@@ -135,8 +135,8 @@ fn usage(code: u8) !void {
         \\  sessh --daemon-log
         \\  SESSH_DAEMON_NAMESPACE=<namespace> sessh --daemon-log
         \\
-        \\sessh wraps ssh, making sessions persistent and automatically
-        \\reconnecting when ssh drops.
+        \\sessh wraps ssh, preserving the visible session across recoverable
+        \\connection drops.
         \\
         \\See the user manual for advanced usage:
         \\  https://github.com/block/sessh/blob/main/docs/USER_MANUAL.md
@@ -216,6 +216,7 @@ test {
     _ = @import("core/non_suspending_timer.zig");
     _ = @import("core/process_exit.zig");
     _ = @import("core/shell.zig");
+    _ = @import("core/string_list.zig");
     _ = @import("core/user_error.zig");
     _ = @import("daemon/accept.zig");
     _ = @import("daemon/client_router.zig");
@@ -235,7 +236,6 @@ test {
     _ = @import("protocol/frame.zig");
     _ = @import("protocol/handshake.zig");
     _ = @import("protocol/mod.zig");
-    _ = @import("protocol/test_helpers.zig");
     _ = @import("protocol/typed_send.zig");
     _ = @import("reconnect/control.zig");
     _ = @import("reconnect/mod.zig");
@@ -243,12 +243,12 @@ test {
     _ = @import("sessh/cli.zig");
     _ = @import("sessh/routing.zig");
     _ = @import("sessh/routing_tests.zig");
-    _ = @import("session/attached_client.zig");
+    _ = @import("session/visible_client.zig");
     _ = @import("session/terminal_worker.zig");
     _ = @import("session/terminal_worker_lifecycle.zig");
     _ = @import("session/terminal_worker_protocol.zig");
     _ = @import("session/terminal_worker_requests.zig");
-    _ = @import("session/attached_client_presentation.zig");
+    _ = @import("session/visible_client_presentation.zig");
     _ = @import("session/daemon_handler.zig");
     _ = @import("session/client_config.zig");
     _ = @import("session/client_ui.zig");
@@ -264,11 +264,14 @@ test {
     _ = @import("session/vt.zig");
     _ = @import("sessh/run.zig");
     _ = @import("stream/byte_stream.zig");
+    _ = @import("stream/local_stream_interrupt.zig");
     _ = @import("stream/mux_proxy.zig");
     _ = @import("stream/proxy_worker.zig");
     _ = @import("stream/proxy_worker_process.zig");
     _ = @import("stream/raw_bridge.zig");
     _ = @import("stream/status_output.zig");
+    _ = @import("stream/stream_input_control.zig");
+    _ = @import("stream/stream_liveness.zig");
     _ = @import("stream/proxy_diagnostics_channel.zig");
     _ = @import("stream/proxy_remote.zig");
     _ = @import("tty/pty_process.zig");
@@ -278,13 +281,19 @@ test {
     _ = @import("transport/artifact_manifest.zig");
     _ = @import("transport/bootstrap.zig");
     _ = @import("transport/bootstrap_client.zig");
+    _ = @import("transport/client_environment.zig");
+    _ = @import("transport/foreground_frame_io.zig");
     _ = @import("transport/frame_forwarder.zig");
     _ = @import("transport/mux_tunnel.zig");
     _ = @import("transport/plain_ssh.zig");
+    _ = @import("transport/pooled_client_startup_timing.zig");
+    _ = @import("transport/pooled_ssh_identity.zig");
     _ = @import("transport/pooled_ssh.zig");
     _ = @import("transport/proxy_entry.zig");
+    _ = @import("transport/raw_proxy_client.zig");
     _ = @import("transport/remote_shell.zig");
     _ = @import("transport/send_env.zig");
+    _ = @import("transport/ssh_failure.zig");
     _ = @import("transport/socket.zig");
     _ = @import("transport/ssh_transport_process.zig");
     _ = @import("transport/ssh_options.zig");

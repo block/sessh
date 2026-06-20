@@ -6,6 +6,34 @@ pub const proxy_guid_prefix = "p-";
 pub const session_guid_len = session_guid_prefix.len + guid_body_len;
 pub const proxy_guid_len = proxy_guid_prefix.len + guid_body_len;
 
+fn FixedGuid(
+    comptime len: usize,
+    comptime invalid_error: anyerror,
+    comptime isValid: fn ([]const u8) bool,
+) type {
+    return struct {
+        bytes: [len]u8 = [_]u8{0} ** len,
+        filled: bool = false,
+
+        pub fn isSet(self: @This()) bool {
+            return self.filled;
+        }
+
+        pub fn slice(self: *const @This()) []const u8 {
+            return if (self.filled) self.bytes[0..] else "";
+        }
+
+        pub fn set(self: *@This(), guid: []const u8) !void {
+            if (!isValid(guid)) return invalid_error;
+            @memcpy(self.bytes[0..], guid);
+            self.filled = true;
+        }
+    };
+}
+
+pub const FixedSessionGuid = FixedGuid(session_guid_len, error.InvalidSessionId, isValidSessionGuid);
+pub const FixedProxyGuid = FixedGuid(proxy_guid_len, error.InvalidProxyId, isValidProxyGuid);
+
 fn isValidGuidBody(guid: []const u8) bool {
     if (guid.len != guid_body_len) return false;
     for (guid, 0..) |byte, i| {
@@ -100,4 +128,22 @@ test "validates session and proxy ids" {
     try std.testing.expect(!isValidSessionGuid(""));
     try std.testing.expect(!isValidSessionGuid("s1"));
     try std.testing.expect(!isValidSessionGuid("s-550e8400-e29b-41d4-a716-44665544000z"));
+}
+
+test "fixed guids store one validated id" {
+    var session = FixedSessionGuid{};
+    try std.testing.expect(!session.isSet());
+
+    try session.set("s-550e8400-e29b-41d4-a716-446655440000");
+    try std.testing.expect(session.isSet());
+    try std.testing.expectEqualStrings("s-550e8400-e29b-41d4-a716-446655440000", session.slice());
+    try std.testing.expectError(error.InvalidSessionId, session.set("p-550e8400-e29b-41d4-a716-446655440000"));
+
+    var proxy = FixedProxyGuid{};
+    try std.testing.expect(!proxy.isSet());
+
+    try proxy.set("p-550e8400-e29b-41d4-a716-446655440000");
+    try std.testing.expect(proxy.isSet());
+    try std.testing.expectEqualStrings("p-550e8400-e29b-41d4-a716-446655440000", proxy.slice());
+    try std.testing.expectError(error.InvalidProxyId, proxy.set("s-550e8400-e29b-41d4-a716-446655440000"));
 }

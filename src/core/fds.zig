@@ -2,9 +2,29 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
-pub fn closeInheritedNonStdioFileDescriptors() void {
-    closeInheritedNonStdioFileDescriptorsExcept(-1);
-}
+pub const OwnedFd = struct {
+    fd: c.fd_t = -1,
+
+    pub fn init(fd: c.fd_t) OwnedFd {
+        return .{ .fd = fd };
+    }
+
+    pub fn deinit(self: *OwnedFd) void {
+        if (self.fd < 0) return;
+        _ = c.close(self.fd);
+        self.fd = -1;
+    }
+
+    pub fn get(self: OwnedFd) c.fd_t {
+        return self.fd;
+    }
+
+    pub fn take(self: *OwnedFd) c.fd_t {
+        const fd = self.fd;
+        self.fd = -1;
+        return fd;
+    }
+};
 
 pub fn closeInheritedNonStdioFileDescriptorsExcept(except_fd: c.fd_t) void {
     closeInheritedNonStdioFileDescriptorsExceptList(&.{except_fd});
@@ -34,7 +54,23 @@ pub fn setNonBlocking(fd: c.fd_t) !void {
     if (c.fcntl(fd, c.F.SETFL, flags | nonblocking_flag) < 0) return error.FcntlFailed;
 }
 
-pub fn nonBlockingFlag() c_int {
+pub fn setCloseOnExec(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const close_on_exec_flag = @as(c_int, @intCast(c.FD_CLOEXEC));
+    if ((flags & close_on_exec_flag) != 0) return;
+    if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
+}
+
+pub fn clearCloseOnExec(fd: c.fd_t) !void {
+    const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    const close_on_exec_flag = @as(c_int, @intCast(c.FD_CLOEXEC));
+    if ((flags & close_on_exec_flag) == 0) return;
+    if (c.fcntl(fd, c.F.SETFD, flags & ~close_on_exec_flag) < 0) return error.FcntlFailed;
+}
+
+fn nonBlockingFlag() c_int {
     return @as(c_int, @bitCast(c.O{ .NONBLOCK = true }));
 }
 
@@ -70,4 +106,36 @@ fn inheritedFdCloseLimit() c.fd_t {
     if (limits.cur <= 3) return 3;
     const capped = @min(limits.cur, max_reasonable);
     return @intCast(capped);
+}
+
+test "OwnedFd take transfers close responsibility" {
+    const pipe_fds = try posix.pipe();
+    var read_end = OwnedFd.init(pipe_fds[0]);
+    defer read_end.deinit();
+    defer posix.close(pipe_fds[1]);
+
+    const taken = read_end.take();
+    defer posix.close(taken);
+    try std.testing.expectEqual(@as(c.fd_t, -1), read_end.get());
+}
+
+test "close-on-exec helpers update descriptor flags" {
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    try clearCloseOnExec(pipe_fds[0]);
+    try std.testing.expect(!try closeOnExecSet(pipe_fds[0]));
+
+    try setCloseOnExec(pipe_fds[0]);
+    try std.testing.expect(try closeOnExecSet(pipe_fds[0]));
+
+    try clearCloseOnExec(pipe_fds[0]);
+    try std.testing.expect(!try closeOnExecSet(pipe_fds[0]));
+}
+
+fn closeOnExecSet(fd: c.fd_t) !bool {
+    const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    return (flags & @as(c_int, @intCast(c.FD_CLOEXEC))) != 0;
 }

@@ -111,7 +111,7 @@ fn keyMatches(key: []const u8, canonical: []const u8) bool {
     return std.mem.eql(u8, normalized_buf[0..key.len], canonical);
 }
 
-pub fn parseScrollbackRowCount(value: []const u8) !u32 {
+fn parseScrollbackRowCount(value: []const u8) !u32 {
     const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidScrollbackRowCount;
     if (parsed == 0) return error.InvalidScrollbackRowCount;
     return parsed;

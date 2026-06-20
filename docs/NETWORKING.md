@@ -7,29 +7,21 @@ specify a command for `ssh` to run. These things cause `ssh` to classify our
 traffic as non-interactive. But that's not what we want: Our traffic is
 interactive.
 
-Even though our traffic is being classified as non-interactive, Nagle's
-algorithm is still being disabled, according to my local testing. I ran `sessh`
-with `-vvv` which gets forwarded to `ssh` and I see:
+OpenSSH still disables Nagle's algorithm for this shape today, which keeps
+interactive latency acceptable. If that changes, sessh will need to force
+`TCP_NODELAY` another way, such as through an artificial `ProxyCommand`.
 
-```
-debug2: fd 7 setting TCP_NODELAY
-```
-
-This is good. If we see reports of `sessh` not disabling Nagle's algorithm then
-we might need to insert an artificial `ProxyCommand` to force the TCP
-connection to be `TCP_NODELAY`.
-
-The other thing that being classified as non-interactive affects is our
-[DSCP](https://en.wikipedia.org/wiki/Differentiated_services) setting. To
-workaround this, we run `ssh -G` and parse the output to learn the interactive
-DSCP setting for the host as configured, then pass
+The other thing affected by non-interactive classification is our
+[DSCP](https://en.wikipedia.org/wiki/Differentiated_services) setting. To work
+around this, we run `ssh -G` and parse the output to learn the interactive DSCP
+setting for the host as configured, then pass
 `-oIPQoS=<interactive DSCP setting>` to `ssh`.
 
 If the connection dies, the client will attempt a new connection, retrying
 failed reconnections with exponential backoff.
 
 Remote `sesshd` ACKs client input. After a timeout, if the client doesn't see
-*any* messages from the remote terminal process when there is unacknowledged input, then
+*any* messages from the terminal worker when there is unacknowledged input, then
 the client will consider the connection unresponsive.
 
 When the client detects that the connection is unresponsive it will attempt a

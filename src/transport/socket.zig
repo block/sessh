@@ -4,6 +4,8 @@ const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
+const core_fds = @import("../core/fds.zig");
+
 extern "c" fn socket(domain: c_int, socket_type: c_int, protocol: c_int) c_int;
 
 var sessh_runtime_dir_symlink_published = false;
@@ -45,7 +47,7 @@ pub fn stateRoot(allocator: std.mem.Allocator) ![]u8 {
     return error.MissingStateHome;
 }
 
-pub fn cacheRoot(allocator: std.mem.Allocator) ![]u8 {
+fn cacheRoot(allocator: std.mem.Allocator) ![]u8 {
     if (c.getenv("XDG_CACHE_HOME")) |cache_z| {
         const cache = std.mem.span(cache_z);
         if (cache.len > 0) {
@@ -59,12 +61,6 @@ pub fn cacheRoot(allocator: std.mem.Allocator) ![]u8 {
         }
     }
     return error.MissingCacheHome;
-}
-
-pub fn cachedArtifactPath(allocator: std.mem.Allocator, artifact_set_id: []const u8, hash_hex: []const u8) ![]u8 {
-    const root = try cacheRoot(allocator);
-    defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/bin/{s}/{s}/sessh", .{ root, artifact_set_id, hash_hex });
 }
 
 pub fn publishSesshRuntimeDirSymlinkOnce(allocator: std.mem.Allocator) void {
@@ -107,14 +103,15 @@ pub fn listenSocket(path: []const u8) !c.fd_t {
 
     const fd = socket(c.AF.UNIX, c.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
-    errdefer _ = c.close(fd);
-    try setCloseOnExec(fd);
+    var owned_fd = core_fds.OwnedFd.init(fd);
+    defer owned_fd.deinit();
+    try setCloseOnExec(owned_fd.get());
 
     var addr = unixAddr(path) catch return error.SocketPathTooLong;
     const len = sockaddrLen(@TypeOf(addr), path.len);
-    if (c.bind(fd, @ptrCast(&addr), len) != 0) return error.BindFailed;
-    if (c.listen(fd, 16) != 0) return error.ListenFailed;
-    return fd;
+    if (c.bind(owned_fd.get(), @ptrCast(&addr), len) != 0) return error.BindFailed;
+    if (c.listen(owned_fd.get(), 16) != 0) return error.ListenFailed;
+    return owned_fd.take();
 }
 
 pub fn connectSocket(path: []const u8) !c.fd_t {
@@ -122,12 +119,13 @@ pub fn connectSocket(path: []const u8) !c.fd_t {
 
     const fd = socket(c.AF.UNIX, c.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
-    errdefer _ = c.close(fd);
-    try setCloseOnExec(fd);
+    var owned_fd = core_fds.OwnedFd.init(fd);
+    defer owned_fd.deinit();
+    try setCloseOnExec(owned_fd.get());
 
     var addr = try unixAddr(path);
     const len = sockaddrLen(@TypeOf(addr), path.len);
-    if (c.connect(fd, @ptrCast(&addr), len) != 0) {
+    if (c.connect(owned_fd.get(), @ptrCast(&addr), len) != 0) {
         const path_z = try app_allocator.allocator().dupeZ(u8, path);
         defer app_allocator.allocator().free(path_z);
         const info = pathInfoZ(path_z.ptr) catch return error.SocketPathMissing;
@@ -135,23 +133,15 @@ pub fn connectSocket(path: []const u8) !c.fd_t {
         if (info.uid != c.getuid()) return error.UnsafeSocketOwner;
         return error.ConnectFailed;
     }
-    return fd;
+    return owned_fd.take();
 }
 
 pub fn setCloseOnExec(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const close_on_exec_flag = @as(c_int, @intCast(c.FD_CLOEXEC));
-    if ((flags & close_on_exec_flag) != 0) return;
-    if (c.fcntl(fd, c.F.SETFD, flags | close_on_exec_flag) < 0) return error.FcntlFailed;
+    return core_fds.setCloseOnExec(fd);
 }
 
 pub fn clearCloseOnExec(fd: c.fd_t) !void {
-    const flags = c.fcntl(fd, c.F.GETFD, @as(c_int, 0));
-    if (flags < 0) return error.FcntlFailed;
-    const close_on_exec_flag = @as(c_int, @intCast(c.FD_CLOEXEC));
-    if ((flags & close_on_exec_flag) == 0) return;
-    if (c.fcntl(fd, c.F.SETFD, flags & ~close_on_exec_flag) < 0) return error.FcntlFailed;
+    return core_fds.clearCloseOnExec(fd);
 }
 
 pub fn ensureSocketDir(allocator: std.mem.Allocator, socket_path: []const u8) !void {

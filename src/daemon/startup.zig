@@ -89,7 +89,7 @@ pub fn tryAcquireStartupLock(allocator: std.mem.Allocator, dir_name: []const u8)
 ///
 /// BLOCKING_WAIT: this runs before the caller has a daemon connection or any
 /// process event loop work to service. A simple bounded sleep loop is more
-/// direct than pretending this foreground startup path has a Dispatcher.
+/// direct than building a one-off Dispatcher for this foreground startup path.
 pub fn waitForStartupLockRelease(allocator: std.mem.Allocator, dir_name: []const u8) !void {
     var timer = try NonSuspendingTimer.start();
     while (true) {
@@ -111,9 +111,9 @@ pub fn waitForStartupLockRelease(allocator: std.mem.Allocator, dir_name: []const
 /// BLOCKING_POLL: foreground daemon startup waits for one byte on the inherited
 /// ready pipe. This is not daemon event-loop work; it is the caller waiting for the
 /// daemon process it just spawned to begin listening.
-pub fn waitForReady(read_fd: c.fd_t) !WaitResult {
+pub fn waitForReady(pipe: *const ReadyPipe) !WaitResult {
     var pollfds = [_]posix.pollfd{.{
-        .fd = read_fd,
+        .fd = pipe.read_fd,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
@@ -124,7 +124,7 @@ pub fn waitForReady(read_fd: c.fd_t) !WaitResult {
     if ((pollfds[0].revents & posix.POLL.IN) != 0) {
         var buf: [8]u8 = undefined;
         while (true) {
-            const n = c.read(read_fd, &buf, buf.len);
+            const n = c.read(pipe.read_fd, &buf, buf.len);
             if (n > 0) return .ready;
             if (n == 0) return .closed;
             switch (posix.errno(n)) {

@@ -34,7 +34,7 @@ pub const StreamRegistry = struct {
         self.* = undefined;
     }
 
-    pub fn noteOpen(
+    fn noteOpen(
         self: *StreamRegistry,
         stream_id: u64,
         open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
@@ -43,7 +43,7 @@ pub const StreamRegistry = struct {
         self.entries.items[entry_index].pending_open = open;
     }
 
-    pub fn setKindIfUnknown(
+    fn setKindIfUnknown(
         self: *StreamRegistry,
         stream_id: u64,
         stream_kind: StreamKind,
@@ -56,12 +56,12 @@ pub const StreamRegistry = struct {
         return .new_kind;
     }
 
-    pub fn pendingOpen(self: *const StreamRegistry, stream_id: u64) ?pb.DaemonTunnelItem.MuxStreamFrame.Open {
+    fn pendingOpen(self: *const StreamRegistry, stream_id: u64) ?pb.DaemonTunnelItem.MuxStreamFrame.Open {
         const entry_index = self.index(stream_id) orelse return null;
         return self.entries.items[entry_index].pending_open;
     }
 
-    pub fn kind(self: *const StreamRegistry, stream_id: u64) StreamKind {
+    fn kind(self: *const StreamRegistry, stream_id: u64) StreamKind {
         const entry_index = self.index(stream_id) orelse return .unknown;
         return self.entries.items[entry_index].kind;
     }
@@ -85,7 +85,7 @@ pub const StreamRegistry = struct {
     }
 };
 
-pub const SetKindResult = enum {
+const SetKindResult = enum {
     already_set,
     new_kind,
     changed_kind,
@@ -151,7 +151,7 @@ pub const StreamIdAllocator = struct {
     }
 };
 
-pub fn kindFromPayload(payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload) ?StreamKind {
+fn kindFromPayload(payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload) ?StreamKind {
     const item = payload.item orelse return null;
     return switch (item) {
         .terminal_emulator => .terminal,
@@ -159,7 +159,7 @@ pub fn kindFromPayload(payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload) ?Str
     };
 }
 
-pub fn closesStream(message: protocol.MuxStreamMessage) bool {
+fn closesStream(message: protocol.MuxStreamMessage) bool {
     return switch (message) {
         .eof, .reset => true,
         else => false,

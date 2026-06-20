@@ -2,6 +2,7 @@ const std = @import("std");
 
 const client_log = @import("../core/client_log.zig");
 const config = @import("../core/config.zig");
+const string_list = @import("../core/string_list.zig");
 
 const default_ipqos_option_prefix = "-oIPQoS=";
 const ssh_config_query_max_output_bytes = 256 * 1024;
@@ -10,6 +11,11 @@ pub const SshTtyRequest = enum {
     none,
     requested,
     forced,
+};
+
+pub const SshOptionClassification = struct {
+    tty_request: SshTtyRequest = .none,
+    proxy_required: bool = false,
 };
 
 pub const ResolvedSshConfig = struct {
@@ -21,7 +27,7 @@ pub const ResolvedSshConfig = struct {
 
     pub fn deinit(self: *ResolvedSshConfig, allocator: std.mem.Allocator) void {
         if (self.ipqos) |value| allocator.free(value);
-        freeStringList(allocator, self.send_env);
+        string_list.freeOwned(allocator, self.send_env);
         allocator.free(self.port);
         allocator.free(self.hostname);
         allocator.free(self.user);
@@ -34,24 +40,18 @@ pub const ResolvedSshConfig = struct {
     }
 };
 
-pub fn classifySshOptions(
-    options: []const []const u8,
-    tty_request: *SshTtyRequest,
-    proxy_required: *bool,
-) !void {
-    var i: usize = 0;
-    while (i < options.len) {
-        try consumeSshOption(options, &i, tty_request, proxy_required);
-    }
-}
-
 pub fn resolveSshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) !ResolvedSshConfig {
     const output = querySshConfig(allocator, ssh_options, host) catch |err| {
         client_log.debug("event=ssh_config_query_failed host={s} error={t}", .{ host, err });
         return fallbackResolvedSshConfig(allocator, ssh_options, host);
     };
     defer allocator.free(output);
-    return parseSshConfig(allocator, output, ssh_options, host) catch |err| {
+    return parseSshConfig(.{
+        .allocator = allocator,
+        .output = output,
+        .ssh_options = ssh_options,
+        .fallback_host = host,
+    }) catch |err| {
         client_log.debug("event=ssh_config_parse_failed host={s} error={t}", .{ host, err });
         return fallbackResolvedSshConfig(allocator, ssh_options, host);
     };
@@ -80,11 +80,15 @@ fn querySshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8,
     const argv = try allocator.alloc([]const u8, transport_options + 3);
     defer allocator.free(argv);
     argv[0] = "ssh";
-    var arg_index: usize = 1;
-    appendTransportSshOptions(argv, &arg_index, ssh_options);
+    const arg_index = appendTransportSshOptions(argv, 1, ssh_options);
     argv[arg_index] = "-G";
     argv[arg_index + 1] = host;
 
+    // BLOCKING_WAIT: OpenSSH is the source of truth for config parsing here.
+    // The resolved user/host/port/IPQoS define the transport pool key, and
+    // SendEnv controls which client environment entries are forwarded. Keeping
+    // the subprocess query isolated here prevents that policy from leaking into
+    // the daemon routing code.
     const result = try std.process.Child.run(.{
         .allocator = allocator,
         .argv = argv,
@@ -101,7 +105,19 @@ fn querySshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8,
     return try allocator.dupe(u8, result.stdout);
 }
 
-pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_options: []const []const u8, fallback_host: []const u8) !ResolvedSshConfig {
+const ParseSshConfigOptions = struct {
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    ssh_options: []const []const u8,
+    fallback_host: []const u8,
+};
+
+fn parseSshConfig(options: ParseSshConfigOptions) !ResolvedSshConfig {
+    const allocator = options.allocator;
+    const output = options.output;
+    const ssh_options = options.ssh_options;
+    const fallback_host = options.fallback_host;
+
     var user: ?[]u8 = null;
     var hostname: ?[]u8 = null;
     var port: ?[]u8 = null;
@@ -112,7 +128,7 @@ pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_opti
         if (hostname) |value| allocator.free(value);
         if (port) |value| allocator.free(value);
         if (ipqos) |value| allocator.free(value);
-        freeStrings(allocator, send_env.items);
+        string_list.freeItems(allocator, send_env.items);
         send_env.deinit(allocator);
     }
 
@@ -158,16 +174,7 @@ pub fn parseSshConfig(allocator: std.mem.Allocator, output: []const u8, ssh_opti
     };
 }
 
-fn freeStringList(allocator: std.mem.Allocator, values: []const []const u8) void {
-    freeStrings(allocator, values);
-    if (values.len != 0) allocator.free(values);
-}
-
-fn freeStrings(allocator: std.mem.Allocator, values: []const []const u8) void {
-    for (values) |value| allocator.free(value);
-}
-
-pub fn explicitSshPort(ssh_options: []const []const u8) ?[]const u8 {
+fn explicitSshPort(ssh_options: []const []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < ssh_options.len) : (i += 1) {
         const option = ssh_options[i];
@@ -222,19 +229,21 @@ pub fn transportSshOptionsLen(options: []const []const u8) usize {
 // protocol. User-provided `-t`/`-tt` only decides whether ssh-shaped remote
 // command args are accepted, so those options must not be forwarded to the
 // transport ssh invocation.
-pub fn appendTransportSshOptions(ssh_argv: [][]const u8, arg_index: *usize, options: []const []const u8) void {
+pub fn appendTransportSshOptions(ssh_argv: [][]const u8, start_index: usize, options: []const []const u8) usize {
+    var arg_index = start_index;
     var i: usize = 0;
     while (i < options.len) : (i += 1) {
         const option = options[i];
         if (isSshTtyRequestOption(option)) continue;
-        ssh_argv[arg_index.*] = option;
-        arg_index.* += 1;
+        ssh_argv[arg_index] = option;
+        arg_index += 1;
         if (sshOptionSeparateValueIndex(options, i)) |value_index| {
-            ssh_argv[arg_index.*] = options[value_index];
-            arg_index.* += 1;
+            ssh_argv[arg_index] = options[value_index];
+            arg_index += 1;
             i = value_index;
         }
     }
+    return arg_index;
 }
 
 pub fn sshOptionSeparateValueIndex(options: []const []const u8, index: usize) ?usize {
@@ -248,17 +257,21 @@ pub fn sshOptionSeparateValueIndex(options: []const []const u8, index: usize) ?u
     return null;
 }
 
-pub fn consumeSshOption(
+pub const SshOptionParseState = struct {
     args: []const []const u8,
     index: *usize,
-    tty_request: *SshTtyRequest,
-    proxy_required: *bool,
-) !void {
+    classification: *SshOptionClassification,
+};
+
+pub fn consumeSshOption(state: SshOptionParseState) !void {
+    const args = state.args;
+    const index = state.index;
+    const classification = state.classification;
     const arg = args[index.*];
     if (std.mem.startsWith(u8, arg, "--")) return error.UnsupportedSshOption;
 
     if (sshTtyRequestCount(arg)) |count| {
-        noteSshTtyRequest(tty_request, count);
+        noteSshTtyRequest(&classification.tty_request, count);
         index.* += 1;
         return;
     }
@@ -267,13 +280,13 @@ pub fn consumeSshOption(
     while (pos < arg.len) {
         const option = arg[pos];
         if (isProxyRequiredSshFlag(option)) {
-            proxy_required.* = true;
+            classification.proxy_required = true;
             pos += 1;
             continue;
         }
         if (isProxyRequiredSshOptionWithValue(option)) {
             _ = try optionValue(args, index, pos);
-            proxy_required.* = true;
+            classification.proxy_required = true;
             return;
         }
         if (isUnsafeSshFlag(option) or isUnsafeSshOptionWithValue(option)) {
@@ -283,7 +296,7 @@ pub fn consumeSshOption(
         if (option == 'o') {
             const value = try optionValue(args, index, pos);
             if (try sshConfigOptionRequiresProxy(value)) {
-                proxy_required.* = true;
+                classification.proxy_required = true;
             } else {
                 try validateSshConfigOption(value);
             }
@@ -462,23 +475,27 @@ fn sshOptionConsumesValueForHostScan(option: u8) bool {
 test "transport ssh option filtering only removes tty request options" {
     const options = &.{ "-F", "-tt", "-t", "-p2222", "-o", "BatchMode=yes" };
     var out: [5][]const u8 = undefined;
-    var index: usize = 0;
 
     try std.testing.expectEqual(@as(usize, 5), transportSshOptionsLen(options));
-    appendTransportSshOptions(out[0..], &index, options);
+    const index = appendTransportSshOptions(out[0..], 0, options);
 
     try expectArgvEqual(&.{ "-F", "-tt", "-p2222", "-o", "BatchMode=yes" }, out[0..index]);
 }
 
 test "parseSshConfig returns resolved endpoint and first configured ipqos value" {
-    var resolved = try parseSshConfig(std.testing.allocator,
+    var resolved = try parseSshConfig(.{
+        .allocator = std.testing.allocator,
+        .output =
         \\hostname example.com
         \\port 2200
         \\ipqos ef cs0
         \\sendenv LANG LC_* SESSH_TEST_SENDENV
         \\user tomm
         \\
-    , &.{}, "alias");
+        ,
+        .ssh_options = &.{},
+        .fallback_host = "alias",
+    });
     defer resolved.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("example.com", resolved.hostname);
     try std.testing.expectEqualStrings("2200", resolved.port);
@@ -487,10 +504,15 @@ test "parseSshConfig returns resolved endpoint and first configured ipqos value"
 }
 
 test "parseSshConfig defaults endpoint fields" {
-    var resolved = try parseSshConfig(std.testing.allocator,
+    var resolved = try parseSshConfig(.{
+        .allocator = std.testing.allocator,
+        .output =
         \\user tomm
         \\
-    , &.{ "-p", "2022" }, "alias");
+        ,
+        .ssh_options = &.{ "-p", "2022" },
+        .fallback_host = "alias",
+    });
     defer resolved.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("alias", resolved.hostname);
     try std.testing.expectEqualStrings("2022", resolved.port);

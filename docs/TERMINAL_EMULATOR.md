@@ -53,20 +53,19 @@ viewport, aligning them.
 i.e. the content is pushed upward until our viewport is the same size as the
 outer terminal.
 
-This has the side-effect of causing our content to scroll upwards. We could
-remove those blank lines, but we'd still be left with our content at the top of
-the viewport. So, we only align our viewports when necessary. Otherwise we wait
-for content to come in normally, aligning the viewports naturally without any
-side-effects. Once the viewports are aligned they stay aligned until the
+This scrolls our content upward. Removing those blank lines would still leave
+our content at the top of the viewport, so we only align viewports when
+necessary. Otherwise we wait for content to arrive normally, aligning the
+viewports naturally. Once the viewports are aligned they stay aligned until the
 session is disconnected.
 
 ## Window resize
 
 When the window size changes, it can reflow the content within the synthetic
-scrollback, modifying our viewport alignment. I don't think it's possible to
-rediscover the new viewport alignment with confidence - the size change may
-happen in the middle of our rendering. We do the safe thing: scroll the entire
-outer terminal screen into scrollback (which aligns our viewports) and repaint.
+scrollback, modifying our viewport alignment. Sessh cannot rediscover the new
+viewport alignment with confidence because the size change may happen in the
+middle of rendering. It does the safe thing: scroll the entire outer terminal
+screen into scrollback, which aligns the viewports, and repaint.
 
 ## Alternate screen handling
 

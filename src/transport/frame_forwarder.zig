@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
@@ -6,7 +7,7 @@ const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
-const test_helpers = @import("../protocol/test_helpers.zig");
+const test_helpers = if (builtin.is_test) @import("../protocol/test_helpers.zig") else struct {};
 
 pub const ReadStatus = enum {
     blocked,
@@ -16,7 +17,7 @@ pub const ReadStatus = enum {
     eof_partial,
 };
 
-pub const ReadBuffer = struct {
+const ReadBuffer = struct {
     bytes: []u8,
     filled: usize = 0,
 
@@ -52,13 +53,13 @@ pub const ReadBuffer = struct {
     }
 };
 
-pub const WriteStatus = enum {
+const WriteStatus = enum {
     blocked,
     partial,
     drained,
 };
 
-pub const WriteBuffer = struct {
+const WriteBuffer = struct {
     bytes: []const u8,
     written: usize = 0,
 
@@ -94,20 +95,25 @@ pub const WriteBuffer = struct {
     }
 };
 
-pub const FrameForwarderReadStatus = enum {
+const FrameForwarderReadStatus = enum {
     blocked,
     progress,
     eof,
     truncated_frame,
 };
 
-pub const FrameForwarderWriteStatus = enum {
+const FrameForwarderWriteStatus = enum {
     blocked,
     progress,
     drained,
 };
 
-pub const FrameForwarder = struct {
+const FrameForwarderFds = struct {
+    read: c.fd_t,
+    write: c.fd_t,
+};
+
+const FrameForwarder = struct {
     read_fd: c.fd_t,
     write_fd: c.fd_t,
     header: [protocol.frame_header_len]u8 = undefined,
@@ -117,10 +123,10 @@ pub const FrameForwarder = struct {
     buffer: CircularBuffer,
     read_closed: bool = false,
 
-    pub fn init(read_fd: c.fd_t, write_fd: c.fd_t, storage: []u8) FrameForwarder {
+    pub fn init(fds: FrameForwarderFds, storage: []u8) FrameForwarder {
         return .{
-            .read_fd = read_fd,
-            .write_fd = write_fd,
+            .read_fd = fds.read,
+            .write_fd = fds.write,
             .buffer = CircularBuffer.init(storage),
         };
     }
@@ -220,21 +226,19 @@ pub const FrameForwarder = struct {
     }
 };
 
-pub const DispatcherFrameRelay = struct {
+const DispatcherFrameRelay = struct {
     allocator: std.mem.Allocator,
-    left_fd: c.fd_t,
-    right_fd: c.fd_t,
+    endpoints: FrameRelayEndpoints,
     left_watch_id: ?dispatcher.FdWatchId = null,
     right_watch_id: ?dispatcher.FdWatchId = null,
     left_to_right: FramePipe,
     right_to_left: FramePipe,
     closing: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, left_fd: c.fd_t, right_fd: c.fd_t) DispatcherFrameRelay {
+    pub fn init(allocator: std.mem.Allocator, endpoints: FrameRelayEndpoints) DispatcherFrameRelay {
         return .{
             .allocator = allocator,
-            .left_fd = left_fd,
-            .right_fd = right_fd,
+            .endpoints = endpoints,
             .left_to_right = FramePipe.init(allocator),
             .right_to_left = FramePipe.init(allocator),
         };
@@ -243,13 +247,13 @@ pub const DispatcherFrameRelay = struct {
     pub fn deinit(self: *DispatcherFrameRelay, d: *dispatcher.Dispatcher) void {
         if (self.left_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
         if (self.right_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-        if (self.left_fd >= 0) {
-            _ = c.close(self.left_fd);
-            self.left_fd = -1;
+        if (self.endpoints.left >= 0) {
+            _ = c.close(self.endpoints.left);
+            self.endpoints.left = -1;
         }
-        if (self.right_fd >= 0) {
-            _ = c.close(self.right_fd);
-            self.right_fd = -1;
+        if (self.endpoints.right >= 0) {
+            _ = c.close(self.endpoints.right);
+            self.endpoints.right = -1;
         }
         self.left_to_right.deinit();
         self.right_to_left.deinit();
@@ -271,7 +275,10 @@ pub const DispatcherFrameRelay = struct {
         }
     }
 
-    fn handleEvent(self: *DispatcherFrameRelay, d: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    fn handleEvent(self: *DispatcherFrameRelay, handler_event: dispatcher.HandlerEvent) !void {
+        const d = handler_event.dispatcher;
+        const id = handler_event.id;
+        const event = handler_event.event;
         const fd_event = switch (event) {
             .fd => |fd| fd,
             .timer => return error.UnexpectedFrameRelayTimer,
@@ -282,11 +289,11 @@ pub const DispatcherFrameRelay = struct {
         }
 
         if (self.isLeftWatch(id)) {
-            if (fd_event.writable) try self.drainPipeToFd(&self.right_to_left, self.left_fd);
-            if (fd_event.readable or fd_event.hangup) try self.readPipeFromFd(&self.left_to_right, self.left_fd);
+            if (fd_event.writable) try self.drainPipeToFd(&self.right_to_left, self.endpoints.left);
+            if (fd_event.readable or fd_event.hangup) try self.readPipeFromFd(&self.left_to_right, self.endpoints.left);
         } else if (self.isRightWatch(id)) {
-            if (fd_event.writable) try self.drainPipeToFd(&self.left_to_right, self.right_fd);
-            if (fd_event.readable or fd_event.hangup) try self.readPipeFromFd(&self.right_to_left, self.right_fd);
+            if (fd_event.writable) try self.drainPipeToFd(&self.left_to_right, self.endpoints.right);
+            if (fd_event.readable or fd_event.hangup) try self.readPipeFromFd(&self.right_to_left, self.endpoints.right);
         }
 
         if (self.closing) {
@@ -343,9 +350,10 @@ pub const DispatcherFrameRelay = struct {
         return watchIdsEqual(right_id, fd_id);
     }
 
-    fn onFd(ctx: *anyopaque, d: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
+    fn onFd(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
         const self: *DispatcherFrameRelay = @ptrCast(@alignCast(ctx));
-        self.handleEvent(d, id, event) catch {
+        self.handleEvent(handler_event) catch {
+            const d = handler_event.dispatcher;
             self.close(d);
         };
     }
@@ -420,41 +428,41 @@ const FramePipe = struct {
     }
 };
 
-pub fn registerFrameRelay(
-    allocator: std.mem.Allocator,
-    d: *dispatcher.Dispatcher,
-    left_fd: c.fd_t,
-    right_fd: c.fd_t,
-) !void {
-    try registerFrameRelayWithInitialWrites(allocator, d, left_fd, right_fd, .{});
-}
-
-pub const InitialWrites = struct {
+const InitialWrites = struct {
     left_to_right: ?protocol.FrameWriteState = null,
     right_to_left: ?protocol.FrameWriteState = null,
 };
 
-pub fn registerFrameRelayWithInitialWrites(
+const FrameRelayEndpoints = struct {
+    left: c.fd_t,
+    right: c.fd_t,
+};
+
+const FrameRelayRegistration = struct {
     allocator: std.mem.Allocator,
-    d: *dispatcher.Dispatcher,
-    left_fd: c.fd_t,
-    right_fd: c.fd_t,
-    initial_writes: InitialWrites,
-) !void {
+    dispatcher: *dispatcher.Dispatcher,
+    endpoints: FrameRelayEndpoints,
+    initial_writes: InitialWrites = .{},
+};
+
+pub fn registerFrameRelayWithInitialWrites(options: FrameRelayRegistration) !void {
+    const allocator = options.allocator;
+    const d = options.dispatcher;
+    const endpoints = options.endpoints;
     // Takes ownership of any supplied FrameWriteState immediately. If setup
     // later fails, this function releases the encoded frames before returning.
-    var writes = initial_writes;
+    var writes = options.initial_writes;
     errdefer {
         if (writes.left_to_right) |*write| write.deinit();
         if (writes.right_to_left) |*write| write.deinit();
     }
 
-    try core_fds.setNonBlocking(left_fd);
-    try core_fds.setNonBlocking(right_fd);
+    try core_fds.setNonBlocking(endpoints.left);
+    try core_fds.setNonBlocking(endpoints.right);
 
     const relay = try allocator.create(DispatcherFrameRelay);
     errdefer allocator.destroy(relay);
-    relay.* = DispatcherFrameRelay.init(allocator, left_fd, right_fd);
+    relay.* = DispatcherFrameRelay.init(allocator, endpoints);
     relay.left_to_right.writer = writes.left_to_right;
     relay.right_to_left.writer = writes.right_to_left;
     writes = .{};
@@ -467,9 +475,17 @@ pub fn registerFrameRelayWithInitialWrites(
         .ctx = relay,
         .callback = DispatcherFrameRelay.onFd,
     };
-    relay.left_watch_id = try d.watchFd(left_fd, .{}, handler);
+    relay.left_watch_id = try d.watchFd(.{
+        .fd = endpoints.left,
+        .events = .{},
+        .handler = handler,
+    });
     errdefer if (relay.left_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-    relay.right_watch_id = try d.watchFd(right_fd, .{}, handler);
+    relay.right_watch_id = try d.watchFd(.{
+        .fd = endpoints.right,
+        .events = .{},
+        .handler = handler,
+    });
     errdefer if (relay.right_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
     try relay.updateWatches(d);
 }
@@ -635,7 +651,7 @@ test "FrameForwarder streams multiple raw frames without decoding" {
     _ = c.close(source[1]);
 
     var storage: [5]u8 = undefined;
-    var forwarder = FrameForwarder.init(source[0], dest[1], &storage);
+    var forwarder = FrameForwarder.init(.{ .read = source[0], .write = dest[1] }, &storage);
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(std.testing.allocator);
 
@@ -676,7 +692,7 @@ test "FrameForwarder applies output backpressure before reading frame body" {
     try io.writeAll(source[1], frame);
 
     var storage: [protocol.frame_header_len]u8 = undefined;
-    var forwarder = FrameForwarder.init(source[0], dest[1], &storage);
+    var forwarder = FrameForwarder.init(.{ .read = source[0], .write = dest[1] }, &storage);
 
     try std.testing.expectEqual(FrameForwarderReadStatus.progress, try forwarder.readReady());
     try std.testing.expect(forwarder.wantsRead());
@@ -711,20 +727,32 @@ test "dispatcher frame relay forwards attached-byte frames in both directions" {
 
     var d = try dispatcher.Dispatcher.init(std.testing.allocator);
     defer d.deinit();
-    try registerFrameRelay(std.testing.allocator, &d, left[1], right[1]);
+    try registerFrameRelayWithInitialWrites(.{
+        .allocator = std.testing.allocator,
+        .dispatcher = &d,
+        .endpoints = .{ .left = left[1], .right = right[1] },
+    });
 
     const payload = try protocol.encodeClientDaemonPayload(std.testing.allocator, .{ .log_request = .{} });
     defer std.testing.allocator.free(payload);
 
-    try protocol.sendFrameWithAttachedBytes(left[0], .client_daemon, payload, "left-to-right");
-    var first = try readRelayedFrameForTest(&d, right[0]);
+    try test_helpers.sendFrameWithAttachedKindAndBytesBlocking(left[0], .{
+        .message_type = .client_daemon,
+        .payload = payload,
+        .attached_bytes = "left-to-right",
+    });
+    var first = try testing.readRelayedFrame(&d, right[0]);
     defer first.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, first.message_type);
     try std.testing.expectEqualStrings(payload, first.payload);
     try std.testing.expectEqualStrings("left-to-right", first.attached_bytes);
 
-    try protocol.sendFrameWithAttachedBytes(right[0], .client_daemon, payload, "right-to-left");
-    var second = try readRelayedFrameForTest(&d, left[0]);
+    try test_helpers.sendFrameWithAttachedKindAndBytesBlocking(right[0], .{
+        .message_type = .client_daemon,
+        .payload = payload,
+        .attached_bytes = "right-to-left",
+    });
+    var second = try testing.readRelayedFrame(&d, left[0]);
     defer second.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, second.message_type);
     try std.testing.expectEqualStrings(payload, second.payload);
@@ -762,17 +790,20 @@ test "dispatcher frame relay drains initial left-to-right write through dispatch
 
     var d = try dispatcher.Dispatcher.init(std.testing.allocator);
     defer d.deinit();
-    try registerFrameRelayWithInitialWrites(std.testing.allocator, &d, left[1], right[1], .{
-        .left_to_right = initial_write,
+    try registerFrameRelayWithInitialWrites(.{
+        .allocator = std.testing.allocator,
+        .dispatcher = &d,
+        .endpoints = .{ .left = left[1], .right = right[1] },
+        .initial_writes = .{ .left_to_right = initial_write },
     });
 
-    var initial = try readRelayedFrameForTest(&d, right[0]);
+    var initial = try testing.readRelayedFrame(&d, right[0]);
     defer initial.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, initial.message_type);
     try std.testing.expectEqualStrings(payload, initial.payload);
 
-    try protocol.sendFrame(left[0], .client_daemon, payload);
-    var relayed = try readRelayedFrameForTest(&d, right[0]);
+    try test_helpers.sendFrameBlocking(left[0], .client_daemon, payload);
+    var relayed = try testing.readRelayedFrame(&d, right[0]);
     defer relayed.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.client_daemon, relayed.message_type);
     try std.testing.expectEqualStrings(payload, relayed.payload);
@@ -802,28 +833,30 @@ test "FrameForwarder reports truncated frame bodies" {
     _ = c.close(source[1]);
 
     var storage: [32]u8 = undefined;
-    var forwarder = FrameForwarder.init(source[0], dest[1], &storage);
+    var forwarder = FrameForwarder.init(.{ .read = source[0], .write = dest[1] }, &storage);
     try std.testing.expectEqual(FrameForwarderReadStatus.progress, try forwarder.readReady());
     try std.testing.expectEqual(FrameForwarderReadStatus.progress, try forwarder.readReady());
     try std.testing.expectEqual(FrameForwarderReadStatus.progress, try forwarder.readReady());
     try std.testing.expectEqual(FrameForwarderReadStatus.truncated_frame, try forwarder.readReady());
 }
 
-fn readRelayedFrameForTest(d: *dispatcher.Dispatcher, fd: c.fd_t) !protocol.OwnedFrame {
-    var reader = protocol.FrameReader.init(std.testing.allocator);
-    defer reader.deinit();
-    var iterations: usize = 0;
-    while (iterations < 100) : (iterations += 1) {
-        while (true) {
-            switch (try reader.readReady(fd)) {
-                .blocked => break,
-                .progress => continue,
-                .frame => |frame| return frame,
-                .eof => return error.UnexpectedEof,
-                .truncated_frame => return error.UnexpectedTruncatedFrame,
+const testing = if (builtin.is_test) struct {
+    fn readRelayedFrame(d: *dispatcher.Dispatcher, fd: c.fd_t) !protocol.OwnedFrame {
+        var reader = protocol.FrameReader.init(std.testing.allocator);
+        defer reader.deinit();
+        var iterations: usize = 0;
+        while (iterations < 100) : (iterations += 1) {
+            while (true) {
+                switch (try reader.readReady(fd)) {
+                    .blocked => break,
+                    .progress => continue,
+                    .frame => |frame| return frame,
+                    .eof => return error.UnexpectedEof,
+                    .truncated_frame => return error.UnexpectedTruncatedFrame,
+                }
             }
+            _ = try d.runOnce();
         }
-        _ = try d.runOnce();
+        return error.TimedOut;
     }
-    return error.TimedOut;
-}
+} else struct {};

@@ -4,10 +4,8 @@ const posix = std.posix;
 
 const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
+const posix_pty = @import("../tty/posix_pty.zig");
 const terminal = @import("../tty/terminal.zig");
-
-extern "c" fn openpty(amaster: *c_int, aslave: *c_int, name: ?[*:0]u8, termp: ?*anyopaque, winp: ?*c.winsize) c_int;
-extern "c" fn ttyname(fd: c_int) ?[*:0]u8;
 
 pub const Handle = struct {
     output_fd: c.fd_t = -1,
@@ -57,6 +55,25 @@ pub const Handle = struct {
             self.output_fd = -1;
         }
         self.input_fd = -1;
+    }
+
+    pub fn outputOr(self: *const Handle, fallback_fd: c.fd_t) c.fd_t {
+        return if (self.output_fd >= 0) self.output_fd else fallback_fd;
+    }
+
+    pub fn inputOr(self: *const Handle, fallback_fd: c.fd_t) c.fd_t {
+        return if (self.input_fd >= 0) self.input_fd else fallback_fd;
+    }
+
+    pub fn hasInput(self: *const Handle) bool {
+        return self.input_fd >= 0;
+    }
+
+    pub fn terminalFdsOr(self: *const Handle, fallback: terminal.TerminalFds) terminal.TerminalFds {
+        return .{
+            .input = self.inputOr(fallback.input),
+            .output = self.outputOr(fallback.output),
+        };
     }
 };
 
@@ -108,6 +125,13 @@ test "opens regular file as output only" {
 
     try std.testing.expect(diagnostics.output_fd >= 0);
     try std.testing.expect(diagnostics.input_fd < 0);
+    try std.testing.expect(!diagnostics.hasInput());
+    try std.testing.expectEqual(diagnostics.output_fd, diagnostics.outputOr(123));
+    try std.testing.expectEqual(@as(c.fd_t, 456), diagnostics.inputOr(456));
+    try std.testing.expectEqual(
+        terminal.TerminalFds{ .input = 456, .output = diagnostics.output_fd },
+        diagnostics.terminalFdsOr(.{ .input = 456, .output = 123 }),
+    );
     try io.writeAll(diagnostics.output_fd, "status\n");
     diagnostics.deinit();
 
@@ -117,27 +141,28 @@ test "opens regular file as output only" {
 }
 
 test "opens tty path as output and reconnect input" {
-    var master_fd: c.fd_t = -1;
-    var slave_fd: c.fd_t = -1;
-    if (openpty(&master_fd, &slave_fd, null, null, null) != 0) return error.OpenPtyFailed;
-    defer if (master_fd >= 0) posix.close(master_fd);
-    defer if (slave_fd >= 0) posix.close(slave_fd);
+    var pty = try posix_pty.open();
+    defer pty.close();
 
-    const path_z = ttyname(slave_fd) orelse return error.MissingTtyName;
-    const path = std.mem.span(path_z);
+    const path = posix_pty.name(pty.slave_fd) orelse return error.MissingTtyName;
 
     var diagnostics = try Handle.open(path);
     defer diagnostics.deinit();
 
     try std.testing.expect(diagnostics.output_fd >= 0);
     try std.testing.expect(diagnostics.input_fd == diagnostics.output_fd);
+    try std.testing.expect(diagnostics.hasInput());
+    try std.testing.expectEqual(
+        terminal.TerminalFds{ .input = diagnostics.input_fd, .output = diagnostics.output_fd },
+        diagnostics.terminalFdsOr(.{ .input = 456, .output = 123 }),
+    );
 
     try io.writeAll(diagnostics.output_fd, "status");
     var output_buf: [16]u8 = undefined;
-    const output_n = try posix.read(master_fd, &output_buf);
+    const output_n = try posix.read(pty.master_fd, &output_buf);
     try std.testing.expectEqualStrings("status", output_buf[0..output_n]);
 
-    try io.writeAll(master_fd, "R");
+    try io.writeAll(pty.master_fd, "R");
     var input_buf: [16]u8 = undefined;
     const input_n = c.read(diagnostics.input_fd, &input_buf, input_buf.len);
     if (input_n < 0) return error.ReadFailed;

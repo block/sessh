@@ -9,6 +9,7 @@ const terminal = @import("../tty/terminal.zig");
 
 const Capabilities = renderer_mod.Capabilities;
 const Renderer = renderer_mod.Renderer;
+const TerminalFds = terminal.TerminalFds;
 
 pub const Guard = struct {
     renderer: Renderer,
@@ -18,22 +19,23 @@ pub const Guard = struct {
     active: bool = true,
 
     pub fn init(fd: c.fd_t) Guard {
-        return .{ .renderer = Renderer.init(fd), .initial_kitty_keyboard_flags = initialKittyKeyboardFlags(fd) };
+        return initWithTerminalFds(.{ .output = fd });
+    }
+
+    pub fn initWithTerminalFds(fds: TerminalFds) Guard {
+        return initWithRenderer(Renderer.init(fds.output), null, initialKittyKeyboardFlags(fds));
     }
 
     pub fn initWithCleanupTitle(fd: c.fd_t, cleanup_title: []const u8) Guard {
-        return .{
-            .renderer = Renderer.init(fd),
-            .cleanup_title = cleanup_title,
-            .initial_kitty_keyboard_flags = initialKittyKeyboardFlags(fd),
-        };
+        return initWithTerminalFdsAndCleanupTitle(.{ .output = fd }, cleanup_title);
+    }
+
+    pub fn initWithTerminalFdsAndCleanupTitle(fds: TerminalFds, cleanup_title: []const u8) Guard {
+        return initWithRenderer(Renderer.init(fds.output), cleanup_title, initialKittyKeyboardFlags(fds));
     }
 
     pub fn initWithInitialKittyKeyboardFlags(fd: c.fd_t, initial_kitty_keyboard_flags: u5) Guard {
-        return .{
-            .renderer = Renderer.init(fd),
-            .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags,
-        };
+        return initWithRenderer(Renderer.init(fd), null, initial_kitty_keyboard_flags);
     }
 
     pub fn initWithCleanupTitleAndInitialKittyKeyboardFlags(
@@ -41,18 +43,15 @@ pub const Guard = struct {
         cleanup_title: []const u8,
         initial_kitty_keyboard_flags: u5,
     ) Guard {
-        return .{
-            .renderer = Renderer.init(fd),
-            .cleanup_title = cleanup_title,
-            .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags,
-        };
+        return initWithRenderer(Renderer.init(fd), cleanup_title, initial_kitty_keyboard_flags);
     }
 
     pub fn withCapabilities(fd: c.fd_t, caps: Capabilities) Guard {
-        return .{
-            .renderer = Renderer.withCapabilities(fd, caps),
-            .initial_kitty_keyboard_flags = initialKittyKeyboardFlags(fd),
-        };
+        return withTerminalFdsAndCapabilities(.{ .output = fd }, caps);
+    }
+
+    pub fn withTerminalFdsAndCapabilities(fds: TerminalFds, caps: Capabilities) Guard {
+        return initWithRenderer(Renderer.withCapabilities(fds.output, caps), null, initialKittyKeyboardFlags(fds));
     }
 
     pub fn withCapabilitiesAndInitialKittyKeyboardFlags(
@@ -60,18 +59,15 @@ pub const Guard = struct {
         caps: Capabilities,
         initial_kitty_keyboard_flags: u5,
     ) Guard {
-        return .{
-            .renderer = Renderer.withCapabilities(fd, caps),
-            .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags,
-        };
+        return initWithRenderer(Renderer.withCapabilities(fd, caps), null, initial_kitty_keyboard_flags);
     }
 
     pub fn withCapabilitiesAndCleanupTitle(fd: c.fd_t, caps: Capabilities, cleanup_title: []const u8) Guard {
-        return .{
-            .renderer = Renderer.withCapabilities(fd, caps),
-            .cleanup_title = cleanup_title,
-            .initial_kitty_keyboard_flags = initialKittyKeyboardFlags(fd),
-        };
+        return withTerminalFdsAndCapabilitiesAndCleanupTitle(.{ .output = fd }, caps, cleanup_title);
+    }
+
+    pub fn withTerminalFdsAndCapabilitiesAndCleanupTitle(fds: TerminalFds, caps: Capabilities, cleanup_title: []const u8) Guard {
+        return initWithRenderer(Renderer.withCapabilities(fds.output, caps), cleanup_title, initialKittyKeyboardFlags(fds));
     }
 
     pub fn enterAlternateScreen(self: *Guard) !void {
@@ -95,12 +91,20 @@ pub const Guard = struct {
     }
 };
 
-pub fn restoreAttachedClientEndBytes(attached_client_end_restore: ?*std.ArrayList(u8)) void {
-    restoreAttachedClientEndBytesToFd(posix.STDOUT_FILENO, attached_client_end_restore);
+fn initWithRenderer(renderer: Renderer, cleanup_title: ?[]const u8, initial_kitty_keyboard_flags: u5) Guard {
+    return .{
+        .renderer = renderer,
+        .cleanup_title = cleanup_title,
+        .initial_kitty_keyboard_flags = initial_kitty_keyboard_flags,
+    };
 }
 
-pub fn restoreAttachedClientEndBytesToFd(fd: c.fd_t, attached_client_end_restore: ?*std.ArrayList(u8)) void {
-    const bytes = attached_client_end_restore orelse return;
+pub fn restoreVisibleClientEndBytes(visible_client_end_restore: ?*std.ArrayList(u8)) void {
+    restoreVisibleClientEndBytesToFd(posix.STDOUT_FILENO, visible_client_end_restore);
+}
+
+fn restoreVisibleClientEndBytesToFd(fd: c.fd_t, visible_client_end_restore: ?*std.ArrayList(u8)) void {
+    const bytes = visible_client_end_restore orelse return;
     defer bytes.clearRetainingCapacity();
     if (c.isatty(fd) == 0) return;
     io.writeAll(fd, bytes.items) catch {};
@@ -117,27 +121,21 @@ pub fn restoreLocal(initial_kitty_keyboard_flags: u5) void {
     }
 }
 
-pub fn restoreLocalFromProbe() void {
-    if (c.isatty(posix.STDOUT_FILENO) == 0) return;
-    const renderer = Renderer.init(posix.STDOUT_FILENO);
-    renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(posix.STDIN_FILENO, posix.STDOUT_FILENO)) catch {};
+fn initialKittyKeyboardFlags(fds: TerminalFds) u5 {
+    if (c.isatty(fds.output) == 0) return 0;
+    return terminal.queryInitialKittyKeyboardFlags(fds);
 }
 
-fn initialKittyKeyboardFlags(output_fd: c.fd_t) u5 {
-    if (c.isatty(output_fd) == 0) return 0;
-    return terminal.queryInitialKittyKeyboardFlags(posix.STDIN_FILENO, output_fd);
-}
-
-test "final attached-client-end restore skips non-tty output and clears saved cleanup bytes" {
+test "final visible-client exit restore skips non-tty output and clears saved cleanup bytes" {
     const output = try posix.pipe();
     defer posix.close(output[0]);
     defer posix.close(output[1]);
 
-    var attached_client_end_restore = std.ArrayList(u8).empty;
-    defer attached_client_end_restore.deinit(std.testing.allocator);
-    try attached_client_end_restore.appendSlice(std.testing.allocator, "restore-primary");
+    var visible_client_end_restore = std.ArrayList(u8).empty;
+    defer visible_client_end_restore.deinit(std.testing.allocator);
+    try visible_client_end_restore.appendSlice(std.testing.allocator, "restore-primary");
 
-    restoreAttachedClientEndBytesToFd(output[1], &attached_client_end_restore);
+    restoreVisibleClientEndBytesToFd(output[1], &visible_client_end_restore);
 
     var pollfds = [_]posix.pollfd{.{
         .fd = output[0],
@@ -145,7 +143,7 @@ test "final attached-client-end restore skips non-tty output and clears saved cl
         .revents = 0,
     }};
     try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pollfds, 0));
-    try std.testing.expectEqual(@as(usize, 0), attached_client_end_restore.items.len);
+    try std.testing.expectEqual(@as(usize, 0), visible_client_end_restore.items.len);
 }
 
 test "presentation guard restores cleanup title" {
@@ -153,9 +151,9 @@ test "presentation guard restores cleanup title" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var guard = Guard.withCapabilitiesAndCleanupTitle(
-        fds[1],
-        .{ .kind = .xterm_compatible },
+    var guard = Guard.withTerminalFdsAndCapabilitiesAndCleanupTitle(
+        .{ .input = fds[0], .output = fds[1] },
+        Capabilities.xterm_compatible,
         "/Users/tomm/Development/sessh",
     );
     guard.restore();
@@ -173,7 +171,7 @@ test "presentation guard restores captured kitty keyboard flags" {
 
     var guard = Guard.withCapabilitiesAndInitialKittyKeyboardFlags(
         fds[1],
-        .{ .kind = .xterm_compatible },
+        Capabilities.xterm_compatible,
         3,
     );
     guard.restore();
@@ -189,7 +187,7 @@ test "presentation guard leaves alternate screen only when it entered it" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var guard = Guard.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    var guard = Guard.withTerminalFdsAndCapabilities(.{ .input = fds[0], .output = fds[1] }, Capabilities.xterm_compatible);
     try guard.enterAlternateScreen();
     guard.restore();
 
@@ -205,7 +203,7 @@ test "presentation guard does not leave alternate screen when it did not enter i
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var guard = Guard.withCapabilities(fds[1], .{ .kind = .xterm_compatible });
+    var guard = Guard.withCapabilities(fds[1], Capabilities.xterm_compatible);
     guard.restore();
 
     var buf: [512]u8 = undefined;

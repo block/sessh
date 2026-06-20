@@ -5,6 +5,7 @@ const client_log = @import("../core/client_log.zig");
 const config = @import("../core/config.zig");
 const ssh_opts = @import("../transport/ssh_options.zig");
 
+const SshOptionClassification = ssh_opts.SshOptionClassification;
 const SshTtyRequest = ssh_opts.SshTtyRequest;
 
 pub const Invocation = struct {
@@ -59,8 +60,7 @@ pub fn parse(scratch: *Scratch, args: []const []const u8) !Invocation {
     var common = CommonSessionOptions{};
     var ssh_options: std.ArrayList([]const u8) = .empty;
     defer ssh_options.deinit(scratch.allocator);
-    var tty_request: SshTtyRequest = .none;
-    var proxy_required = false;
+    var ssh_classification = SshOptionClassification{};
 
     var i: usize = 1;
     while (i < args.len) {
@@ -74,8 +74,7 @@ pub fn parse(scratch: *Scratch, args: []const []const u8) !Invocation {
                 .common = common,
                 .host = args[i],
                 .command_args = args[i + 1 ..],
-                .tty_request = tty_request,
-                .proxy_required = proxy_required,
+                .ssh_classification = ssh_classification,
             });
         }
 
@@ -84,8 +83,7 @@ pub fn parse(scratch: *Scratch, args: []const []const u8) !Invocation {
                 .common = common,
                 .host = arg,
                 .command_args = args[i + 1 ..],
-                .tty_request = tty_request,
-                .proxy_required = proxy_required,
+                .ssh_classification = ssh_classification,
             });
         }
 
@@ -99,7 +97,11 @@ pub fn parse(scratch: *Scratch, args: []const []const u8) !Invocation {
         }
 
         const ssh_option_start = i;
-        try ssh_opts.consumeSshOption(args, &i, &tty_request, &proxy_required);
+        try ssh_opts.consumeSshOption(.{
+            .args = args,
+            .index = &i,
+            .classification = &ssh_classification,
+        });
         try ssh_options.appendSlice(scratch.allocator, args[ssh_option_start..i]);
     }
 
@@ -110,8 +112,7 @@ const FinishOptions = struct {
     common: CommonSessionOptions,
     host: []const u8,
     command_args: []const []const u8,
-    tty_request: SshTtyRequest,
-    proxy_required: bool,
+    ssh_classification: SshOptionClassification,
 };
 
 fn finish(
@@ -123,8 +124,8 @@ fn finish(
         .host = options.host,
         .ssh_options = try scratch.ownSshOptions(ssh_options),
         .command_args = options.command_args,
-        .tty_request = options.tty_request,
-        .proxy_required = options.proxy_required,
+        .tty_request = options.ssh_classification.tty_request,
+        .proxy_required = options.ssh_classification.proxy_required,
         .common = options.common,
     };
 }
@@ -411,7 +412,7 @@ test "parse treats post-host words as remote command" {
     const parsed = try parse(&scratch, &.{
         "sessh",
         "example.com",
-        "attach",
+        "remote-tool",
         "s12",
         "--no-bootstrap",
     });
@@ -419,7 +420,7 @@ test "parse treats post-host words as remote command" {
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expect(parsed.common.bootstrap);
     try std.testing.expect(!parsed.common.bootstrap_set);
-    try expectArgvEqual(&.{ "attach", "s12", "--no-bootstrap" }, parsed.command_args);
+    try expectArgvEqual(&.{ "remote-tool", "s12", "--no-bootstrap" }, parsed.command_args);
 }
 
 test "parse preserves lower filter levels" {

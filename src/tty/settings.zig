@@ -28,8 +28,9 @@ pub const Settings = struct {
     }
 };
 
-pub const CaptureOptions = struct {
-    include_term: bool = true,
+pub const TermCapture = enum {
+    include,
+    omit,
 };
 
 const CharMode = struct {
@@ -156,9 +157,9 @@ const speed_pairs = [_]SpeedPair{
 /// optional TERM plus opcode/value tty modes. The local tty may be macOS and
 /// the remote may be Linux, so this must never copy the native termios bytes
 /// directly.
-pub fn capture(allocator: std.mem.Allocator, fd: c.fd_t, options: CaptureOptions) !?Settings {
+pub fn capture(allocator: std.mem.Allocator, fd: c.fd_t, term_capture: TermCapture) !?Settings {
     var settings = Settings{
-        .term = if (options.include_term) try captureTerm(allocator) else null,
+        .term = if (term_capture == .include) try captureTerm(allocator) else null,
     };
     errdefer settings.deinit(allocator);
 
@@ -176,20 +177,21 @@ fn captureTerm(allocator: std.mem.Allocator) !?[]u8 {
     return try allocator.dupe(u8, std.mem.span(term_z));
 }
 
-pub fn modesFromTermios(allocator: std.mem.Allocator, termios: posix.termios) ![]Mode {
+fn modesFromTermios(allocator: std.mem.Allocator, termios: posix.termios) ![]Mode {
     var modes: std.ArrayList(Mode) = .empty;
     errdefer modes.deinit(allocator);
 
     try modes.append(allocator, .{ .opcode = op_ospeed, .value = speedToBaud(cfgetospeed(&termios)) });
     try modes.append(allocator, .{ .opcode = op_ispeed, .value = speedToBaud(cfgetispeed(&termios)) });
 
-    inline for (char_modes) |mode| try appendCharMode(&modes, allocator, termios, mode.name, mode.opcode);
-    inline for (iflag_modes) |mode| try appendFlagMode(&modes, allocator, termios.iflag, mode.name, mode.opcode);
-    inline for (lflag_modes) |mode| try appendFlagMode(&modes, allocator, termios.lflag, mode.name, mode.opcode);
-    inline for (oflag_modes) |mode| try appendFlagMode(&modes, allocator, termios.oflag, mode.name, mode.opcode);
+    const writer = ModeWriter{ .modes = &modes, .allocator = allocator };
+    inline for (char_modes) |mode| try writer.appendChar(termios, mode);
+    inline for (iflag_modes) |mode| try writer.appendFlag(termios.iflag, mode);
+    inline for (lflag_modes) |mode| try writer.appendFlag(termios.lflag, mode);
+    inline for (oflag_modes) |mode| try writer.appendFlag(termios.oflag, mode);
     try modes.append(allocator, .{ .opcode = 90, .value = @intFromBool(termios.cflag.CSIZE == .CS7) });
     try modes.append(allocator, .{ .opcode = 91, .value = @intFromBool(termios.cflag.CSIZE == .CS8) });
-    inline for (cflag_modes) |mode| try appendFlagMode(&modes, allocator, termios.cflag, mode.name, mode.opcode);
+    inline for (cflag_modes) |mode| try writer.appendFlag(termios.cflag, mode);
 
     return modes.toOwnedSlice(allocator);
 }
@@ -200,11 +202,11 @@ pub fn applyToFd(settings: Settings, fd: c.fd_t) !void {
     try posix.tcsetattr(fd, .NOW, termios);
 }
 
-pub fn applyToTermios(settings: Settings, termios: *posix.termios) void {
+fn applyToTermios(settings: Settings, termios: *posix.termios) void {
     for (settings.modes) |mode| applyMode(termios, mode.opcode, mode.value);
 }
 
-pub fn encodeModes(allocator: std.mem.Allocator, modes: []const Mode) ![]u8 {
+fn encodeModes(allocator: std.mem.Allocator, modes: []const Mode) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (modes) |mode| {
@@ -215,7 +217,7 @@ pub fn encodeModes(allocator: std.mem.Allocator, modes: []const Mode) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-pub fn decodeModes(allocator: std.mem.Allocator, bytes: []const u8) ![]Mode {
+fn decodeModes(allocator: std.mem.Allocator, bytes: []const u8) ![]Mode {
     var modes: std.ArrayList(Mode) = .empty;
     errdefer modes.deinit(allocator);
 
@@ -235,34 +237,27 @@ pub fn decodeModes(allocator: std.mem.Allocator, bytes: []const u8) ![]Mode {
     return error.InvalidTtyModeBytes;
 }
 
-fn appendCharMode(
+const ModeWriter = struct {
     modes: *std.ArrayList(Mode),
     allocator: std.mem.Allocator,
-    termios: posix.termios,
-    comptime name: []const u8,
-    opcode: u8,
-) !void {
-    if (comptime !enumHasField(posix.V, name)) return;
-    const index = @intFromEnum(@field(posix.V, name));
-    try modes.append(allocator, .{
-        .opcode = opcode,
-        .value = encodeControlChar(@intCast(termios.cc[index])),
-    });
-}
 
-fn appendFlagMode(
-    modes: *std.ArrayList(Mode),
-    allocator: std.mem.Allocator,
-    flags: anytype,
-    comptime name: []const u8,
-    opcode: u8,
-) !void {
-    if (comptime !@hasField(@TypeOf(flags), name)) return;
-    try modes.append(allocator, .{
-        .opcode = opcode,
-        .value = @intFromBool(@field(flags, name)),
-    });
-}
+    fn appendChar(self: ModeWriter, termios: posix.termios, comptime mode: CharMode) !void {
+        if (comptime !enumHasField(posix.V, mode.name)) return;
+        const index = @intFromEnum(@field(posix.V, mode.name));
+        try self.modes.append(self.allocator, .{
+            .opcode = mode.opcode,
+            .value = encodeControlChar(@intCast(termios.cc[index])),
+        });
+    }
+
+    fn appendFlag(self: ModeWriter, flags: anytype, comptime mode: FlagMode) !void {
+        if (comptime !@hasField(@TypeOf(flags), mode.name)) return;
+        try self.modes.append(self.allocator, .{
+            .opcode = mode.opcode,
+            .value = @intFromBool(@field(flags, mode.name)),
+        });
+    }
+};
 
 fn applyMode(termios: *posix.termios, opcode: u8, value: u32) void {
     switch (opcode) {

@@ -1,10 +1,13 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
 const client_log = @import("../core/client_log.zig");
 const core_fds = @import("../core/fds.zig");
+const fixed_buffer = @import("../core/fixed_buffer.zig");
 const connection_event = @import("../diagnostics/connection_event.zig");
+const diagnostics_display = @import("../diagnostics/display.zig");
 const diagnostics_jsonl = @import("../diagnostics/jsonl.zig");
 const io = @import("../core/io.zig");
 const local_boot_time = @import("../core/local_boot_time.zig");
@@ -25,6 +28,9 @@ pub const Mode = enum {
 
 pub const TerminalTitleTracker = struct {
     const max_title_bytes = 512;
+    const OscCommand = fixed_buffer.FixedBuffer(8);
+    const Title = fixed_buffer.FixedBuffer(max_title_bytes);
+    const CsiBytes = fixed_buffer.FixedBuffer(32);
     const State = enum {
         ground,
         escape,
@@ -37,16 +43,12 @@ pub const TerminalTitleTracker = struct {
     };
 
     state: State = .ground,
-    osc_command: [8]u8 = [_]u8{0} ** 8,
-    osc_command_len: usize = 0,
+    osc_command: OscCommand = .{},
     tracking_title: bool = false,
-    title: [max_title_bytes]u8 = [_]u8{0} ** max_title_bytes,
-    title_len: usize = 0,
+    title: Title = .{},
     title_present: bool = false,
-    pending_title: [max_title_bytes]u8 = [_]u8{0} ** max_title_bytes,
-    pending_title_len: usize = 0,
-    csi_bytes: [32]u8 = [_]u8{0} ** 32,
-    csi_len: usize = 0,
+    pending_title: Title = .{},
+    csi_bytes: CsiBytes = .{},
     synchronized_update_active: bool = false,
 
     pub fn observe(self: *TerminalTitleTracker, bytes: []const u8) void {
@@ -66,7 +68,7 @@ pub const TerminalTitleTracker = struct {
     }
 
     pub fn titleSlice(self: *const TerminalTitleTracker) []const u8 {
-        return self.title[0..self.title_len];
+        return self.title.slice();
     }
 
     fn observeByte(self: *TerminalTitleTracker, byte: u8) void {
@@ -77,13 +79,13 @@ pub const TerminalTitleTracker = struct {
             .escape => switch (byte) {
                 '[' => {
                     self.state = .csi;
-                    self.csi_len = 0;
+                    self.csi_bytes.clear();
                 },
                 ']' => {
                     self.state = .osc_command;
-                    self.osc_command_len = 0;
+                    self.osc_command.clear();
                     self.tracking_title = false;
-                    self.pending_title_len = 0;
+                    self.pending_title.clear();
                 },
                 'P', '^', '_', 'X' => self.state = .string,
                 else => self.state = .ground,
@@ -94,10 +96,7 @@ pub const TerminalTitleTracker = struct {
                 } else if (byte >= 0x40 and byte <= 0x7e) {
                     self.finishCsi(byte);
                     self.state = .ground;
-                } else if (self.csi_len < self.csi_bytes.len) {
-                    self.csi_bytes[self.csi_len] = byte;
-                    self.csi_len += 1;
-                }
+                } else _ = self.csi_bytes.appendByteIfRoom(byte);
             },
             .osc_command => {
                 if (byte == 0x07) {
@@ -106,12 +105,9 @@ pub const TerminalTitleTracker = struct {
                     self.state = .osc_escape;
                 } else if (byte == ';') {
                     self.tracking_title = self.isTitleCommand();
-                    self.pending_title_len = 0;
+                    self.pending_title.clear();
                     self.state = .osc_text;
-                } else if (self.osc_command_len < self.osc_command.len) {
-                    self.osc_command[self.osc_command_len] = byte;
-                    self.osc_command_len += 1;
-                }
+                } else _ = self.osc_command.appendByteIfRoom(byte);
             },
             .osc_text => {
                 if (byte == 0x07) {
@@ -143,26 +139,23 @@ pub const TerminalTitleTracker = struct {
     }
 
     fn isTitleCommand(self: *const TerminalTitleTracker) bool {
-        const command = self.osc_command[0..self.osc_command_len];
+        const command = self.osc_command.slice();
         return std.mem.eql(u8, command, "0") or std.mem.eql(u8, command, "2");
     }
 
     fn appendPendingTitle(self: *TerminalTitleTracker, byte: u8) void {
         if (!self.tracking_title) return;
-        if (self.pending_title_len >= self.pending_title.len) return;
-        self.pending_title[self.pending_title_len] = byte;
-        self.pending_title_len += 1;
+        _ = self.pending_title.appendByteIfRoom(byte);
     }
 
     fn finishOsc(self: *TerminalTitleTracker) void {
         if (!self.tracking_title) return;
-        @memcpy(self.title[0..self.pending_title_len], self.pending_title[0..self.pending_title_len]);
-        self.title_len = self.pending_title_len;
+        self.title.setTruncate(self.pending_title.slice());
         self.title_present = true;
     }
 
     fn finishCsi(self: *TerminalTitleTracker, final_byte: u8) void {
-        const params = self.csi_bytes[0..self.csi_len];
+        const params = self.csi_bytes.slice();
         if (std.mem.eql(u8, params, "?2026")) {
             if (final_byte == 'h') self.synchronized_update_active = true;
             if (final_byte == 'l') self.synchronized_update_active = false;
@@ -178,11 +171,18 @@ pub const TerminalTitleTracker = struct {
 pub const Status = struct {
     const max_diagnostic_lines = 3;
     const max_title_fallback_bytes = 512;
+    const Line = fixed_buffer.FixedBuffer(96);
+    const TitleFallback = fixed_buffer.FixedBuffer(max_title_fallback_bytes);
+    pub const InitOptions = struct {
+        mode: Mode,
+        ctrl_r_enabled: bool = false,
+        title_fallback: []const u8 = "",
+        status_fd: c.fd_t = -1,
+    };
 
     fd: c.fd_t,
     mode: Mode,
-    line: [96]u8 = undefined,
-    line_len: usize = 0,
+    line: Line = .{},
     ctrl_r_enabled: bool,
     diagnostic_cursor: u64,
     live_diagnostic_start_seq: u64,
@@ -193,43 +193,23 @@ pub const Status = struct {
     append_only_retry_announced: bool = false,
     escape_help_pending: bool = false,
     title_tracker: TerminalTitleTracker = .{},
-    title_fallback: [max_title_fallback_bytes]u8 = [_]u8{0} ** max_title_fallback_bytes,
-    title_fallback_len: usize = 0,
+    title_fallback: TitleFallback = .{},
 
-    pub fn init(
-        mode: Mode,
-        ctrl_r_enabled: bool,
-        title_fallback: []const u8,
-        status_fd: c.fd_t,
-    ) Status {
+    pub fn init(options: InitOptions) Status {
         const displayed = client_log.displayedUserDiagnosticSeq();
         var status = Status{
-            .fd = if (status_fd >= 0) status_fd else switch (mode) {
-                .title => 1,
-                .line, .status_line, .jsonl => 2,
+            .fd = if (options.status_fd >= 0) options.status_fd else switch (options.mode) {
+                .title => posix.STDOUT_FILENO,
+                .line, .status_line, .jsonl => posix.STDERR_FILENO,
                 .client_control, .disabled => -1,
             },
-            .mode = mode,
-            .ctrl_r_enabled = ctrl_r_enabled,
+            .mode = options.mode,
+            .ctrl_r_enabled = options.ctrl_r_enabled,
             .diagnostic_cursor = displayed,
             .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
             .rendered_diagnostic_seq = displayed,
         };
-        status.title_fallback_len = copyTitle(&status.title_fallback, title_fallback);
-        return status;
-    }
-
-    pub fn initForTest(fd: c.fd_t, mode: Mode, ctrl_r_enabled: bool, title_fallback: []const u8) Status {
-        const displayed = client_log.displayedUserDiagnosticSeq();
-        var status = Status{
-            .fd = fd,
-            .mode = mode,
-            .ctrl_r_enabled = ctrl_r_enabled,
-            .diagnostic_cursor = displayed,
-            .live_diagnostic_start_seq = client_log.currentUserDiagnosticSeq(),
-            .rendered_diagnostic_seq = displayed,
-        };
-        status.title_fallback_len = copyTitle(&status.title_fallback, title_fallback);
+        status.title_fallback.setTruncate(options.title_fallback);
         return status;
     }
 
@@ -242,10 +222,10 @@ pub const Status = struct {
     }
 
     pub fn showRetry(self: *Status, delay_ms: u64) void {
-        const message = reconnect_title.retryStatus(&self.line, delay_ms, .{
+        const message = reconnect_title.retryStatus(self.line.storageSlice(), delay_ms, .{
             .ctrl_r = self.ctrl_r_enabled,
         }) catch return;
-        self.line_len = message.len;
+        self.line.assumeLen(message.len);
         self.connection_status_active = true;
         self.refreshDiagnostics();
         self.writeTitleRetry(delay_ms);
@@ -258,8 +238,7 @@ pub const Status = struct {
         const message = reconnect_title.reconnectingStatus(.{
             .ctrl_r = self.ctrl_r_enabled,
         });
-        @memcpy(self.line[0..message.len], message);
-        self.line_len = message.len;
+        self.line.setTruncate(message);
         self.connection_status_active = true;
         self.append_only_retry_announced = false;
         self.refreshDiagnostics();
@@ -327,13 +306,12 @@ pub const Status = struct {
                     io.writeAll(self.fd, "\r\n") catch return;
                 },
                 .status_line => {
-                    @memcpy(self.line[0.."sessh: bootstrapping...".len], "sessh: bootstrapping...");
-                    self.line_len = "sessh: bootstrapping...".len;
+                    self.line.setTruncate("sessh: bootstrapping...");
                     self.connection_status_active = true;
                     self.writeStatusLine();
                 },
                 .jsonl => self.writeJsonlConnectionEvent(.{ .binary_bootstrapping = .{} }),
-                .client_control => proxy_diagnostics.writeConnectionEvent(self.fd, .{ .binary_bootstrapping = .{} }) catch return,
+                .client_control => proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .binary_bootstrapping = .{} }) catch return,
                 .title, .disabled => {},
             },
             .daemon_connecting => self.showReconnecting(),
@@ -356,14 +334,14 @@ pub const Status = struct {
 
     fn writePlainStatusLine(self: *Status) void {
         if (self.mode != .line) return;
-        const message = self.line[0..self.line_len];
+        const message = self.line.slice();
         io.writeAll(self.fd, message) catch return;
         io.writeAll(self.fd, "\r\n") catch return;
     }
 
     fn writeStatusLine(self: *Status) void {
         if (self.mode != .status_line or self.fd < 0) return;
-        const message = self.line[0..self.line_len];
+        const message = self.line.slice();
         io.writeAll(self.fd, "\r\x1b[K") catch return;
         io.writeAll(self.fd, message) catch return;
         self.status_line_visible = true;
@@ -421,19 +399,19 @@ pub const Status = struct {
 
     fn writeClientRetry(self: *Status, delay_ms: u64) void {
         if (self.mode != .client_control or self.fd < 0) return;
-        proxy_diagnostics.writeConnectionEvent(self.fd, .{ .daemon_disconnected = .{
+        proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .daemon_disconnected = .{
             .retry_at_local_boot_time_ms = local_boot_time.nowMs() +| delay_ms,
         } }) catch return;
     }
 
     fn writeClientReconnecting(self: *Status) void {
         if (self.mode != .client_control or self.fd < 0) return;
-        proxy_diagnostics.writeConnectionEvent(self.fd, .{ .daemon_connecting = .{} }) catch return;
+        proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .daemon_connecting = .{} }) catch return;
     }
 
     fn writeClientClear(self: *Status) void {
         if (self.mode != .client_control or self.fd < 0) return;
-        proxy_diagnostics.writeConnectionEvent(self.fd, .{ .daemon_connected = .{} }) catch return;
+        proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .daemon_connected = .{} }) catch return;
     }
 
     fn canWriteTitle(self: *const Status) bool {
@@ -445,7 +423,7 @@ pub const Status = struct {
         const title = if (self.title_tracker.titlePresent())
             self.title_tracker.titleSlice()
         else
-            self.title_fallback[0..self.title_fallback_len];
+            self.title_fallback.slice();
         reconnect_title.writeTitle(self.fd, title) catch {};
         self.title_visible = false;
     }
@@ -465,11 +443,12 @@ pub const Status = struct {
             if (diagnostic.seq == 0) continue;
 
             var line_buf: [client_log.max_user_diagnostic_display_bytes]u8 = undefined;
-            const line = formatDiagnosticLine(
-                &line_buf,
-                diagnostic,
-                diagnostic.seq <= self.live_diagnostic_start_seq,
-            ) catch continue;
+            const line_len = diagnostics_display.formatDiagnostic(.{
+                .out = &line_buf,
+                .diagnostic = diagnostic,
+                .delayed = diagnostic.seq <= self.live_diagnostic_start_seq,
+            });
+            const line = line_buf[0..line_len];
             switch (self.mode) {
                 .status_line => {
                     self.clearStatusLine();
@@ -482,7 +461,7 @@ pub const Status = struct {
                     io.writeAll(self.fd, "\r\n") catch return;
                 },
                 .jsonl => self.writeJsonlDiagnostic(line),
-                .client_control => proxy_diagnostics.writeConnectionEvent(self.fd, .{ .ssh_stderr = .{ .data = line } }) catch return,
+                .client_control => proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .ssh_stderr = .{ .data = line } }) catch return,
                 .title, .disabled => unreachable,
             }
         }
@@ -514,39 +493,20 @@ fn nowUnixMs() u64 {
     return @intCast(ms);
 }
 
-fn copyTitle(dest: []u8, title: []const u8) usize {
-    const len = @min(dest.len, title.len);
-    @memcpy(dest[0..len], title[0..len]);
-    return len;
-}
-
-fn formatDiagnosticLine(
-    out: []u8,
-    diagnostic: *const client_log.UserDiagnosticLine,
-    delayed: bool,
-) ![]const u8 {
-    const prefix = if (delayed)
-        try std.fmt.bufPrint(out, "{s} ts_ms={}: ", .{ diagnostic.tag.label(), diagnostic.ts_ms })
-    else
-        try std.fmt.bufPrint(out, "{s}: ", .{diagnostic.tag.label()});
-    const message = diagnostic.slice();
-    if (prefix.len + message.len > out.len) return error.NoSpaceLeft;
-    @memcpy(out[prefix.len .. prefix.len + message.len], message);
-    return out[0 .. prefix.len + message.len];
-}
-
-fn readAllFromFd(allocator: std.mem.Allocator, fd: c.fd_t) ![]u8 {
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(allocator);
-    while (true) {
-        var buf: [128]u8 = undefined;
-        const n = c.read(fd, &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try output.appendSlice(allocator, buf[0..@intCast(n)]);
+const testing = if (builtin.is_test) struct {
+    fn readAllFromFd(allocator: std.mem.Allocator, fd: c.fd_t) ![]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+        while (true) {
+            var buf: [128]u8 = undefined;
+            const n = c.read(fd, &buf, buf.len);
+            if (n < 0) return error.ReadFailed;
+            if (n == 0) break;
+            try output.appendSlice(allocator, buf[0..@intCast(n)]);
+        }
+        return try output.toOwnedSlice(allocator);
     }
-    return try output.toOwnedSlice(allocator);
-}
+} else struct {};
 
 test "stream reconnect status uses plain stderr lines" {
     client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
@@ -554,14 +514,14 @@ test "stream reconnect status uses plain stderr lines" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.initForTest(fds[1], .line, false, "");
+    var status = Status.init(.{ .status_fd = fds[1], .mode = .line });
     status.showRetry(1_000);
     status.showRetry(500);
     status.showReconnecting();
     status.clear();
     posix.close(fds[1]);
 
-    const output = try readAllFromFd(std.testing.allocator, fds[0]);
+    const output = try testing.readAllFromFd(std.testing.allocator, fds[0]);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         "sessh: disconnected: Retry connecting 1sec\r\n" ++
@@ -576,13 +536,13 @@ test "stream reconnect status line redraws in place" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.initForTest(fds[1], .status_line, false, "");
+    var status = Status.init(.{ .status_fd = fds[1], .mode = .status_line });
     status.showRetry(2_000);
     status.showRetry(1_000);
     status.clear();
     posix.close(fds[1]);
 
-    const output = try readAllFromFd(std.testing.allocator, fds[0]);
+    const output = try testing.readAllFromFd(std.testing.allocator, fds[0]);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "\r\x1b[Ksessh: disconnected: Retry connecting 2sec") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\r\x1b[Ksessh: disconnected: Retry connecting 1sec") != null);
@@ -595,7 +555,7 @@ test "stream reconnect status emits one jsonl retry per wait" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.initForTest(fds[1], .jsonl, false, "");
+    var status = Status.init(.{ .status_fd = fds[1], .mode = .jsonl });
     status.handleConnectionEvent(.{ .event = .{ .daemon_disconnected = .{} } });
     status.handleConnectionEvent(.{ .event = .{ .unresponsive = .{} } });
     status.handleConnectionEvent(.{ .event = .{ .ssh_stderr = .{ .data = "ssh: noisy\n" } } });
@@ -603,7 +563,7 @@ test "stream reconnect status emits one jsonl retry per wait" {
     status.clear();
     posix.close(fds[1]);
 
-    const output = try readAllFromFd(std.testing.allocator, fds[0]);
+    const output = try testing.readAllFromFd(std.testing.allocator, fds[0]);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "\"event\":\"daemon_disconnected\""));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "\"event\":\"unresponsive\""));
@@ -619,7 +579,12 @@ test "disabled stream reconnect status emits no UI" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.initForTest(fds[1], .disabled, true, "test-host");
+    var status = Status.init(.{
+        .status_fd = fds[1],
+        .mode = .disabled,
+        .ctrl_r_enabled = true,
+        .title_fallback = "test-host",
+    });
     status.showRetry(1_000);
     status.showReconnecting();
     status.showEscapeHelp();
@@ -636,7 +601,11 @@ test "stream reconnect status emits client control messages" {
     defer posix.close(fds[0]);
     try core_fds.setNonBlocking(fds[0]);
 
-    var status = Status.initForTest(fds[1], .client_control, true, "");
+    var status = Status.init(.{
+        .status_fd = fds[1],
+        .mode = .client_control,
+        .ctrl_r_enabled = true,
+    });
     status.showRetry(1_000);
     status.showReconnecting();
     status.clear();
@@ -681,14 +650,19 @@ test "stream reconnect status restores tracked application title" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.initForTest(fds[1], .title, true, "test-host");
+    var status = Status.init(.{
+        .status_fd = fds[1],
+        .mode = .title,
+        .ctrl_r_enabled = true,
+        .title_fallback = "test-host",
+    });
     status.observeInbound("\x1b]2;remote");
     status.observeInbound("-title\x1b\\");
     status.showRetry(10_000);
     status.clear();
     posix.close(fds[1]);
 
-    const output = try readAllFromFd(std.testing.allocator, fds[0]);
+    const output = try testing.readAllFromFd(std.testing.allocator, fds[0]);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         "\x1b]2;10sec retry CTRL-R\x1b\\\x1b]2;remote-title\x1b\\",
@@ -700,12 +674,17 @@ test "stream reconnect status uses fallback title when app set none" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.initForTest(fds[1], .title, true, "test-host");
+    var status = Status.init(.{
+        .status_fd = fds[1],
+        .mode = .title,
+        .ctrl_r_enabled = true,
+        .title_fallback = "test-host",
+    });
     status.showRetry(10_000);
     status.clear();
     posix.close(fds[1]);
 
-    const output = try readAllFromFd(std.testing.allocator, fds[0]);
+    const output = try testing.readAllFromFd(std.testing.allocator, fds[0]);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         "\x1b]2;10sec retry CTRL-R\x1b\\\x1b]2;test-host\x1b\\",
@@ -717,7 +696,12 @@ test "stream reconnect status skips title while terminal parser is unsafe" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.initForTest(fds[1], .title, true, "test-host");
+    var status = Status.init(.{
+        .status_fd = fds[1],
+        .mode = .title,
+        .ctrl_r_enabled = true,
+        .title_fallback = "test-host",
+    });
     status.observeInbound("\x1b]2;partial-title");
     status.showRetry(10_000);
     status.clear();
@@ -733,7 +717,12 @@ test "stream escape help waits for terminal parser safe point" {
     defer posix.close(fds[0]);
     try core_fds.setNonBlocking(fds[0]);
 
-    var status = Status.initForTest(fds[1], .title, true, "test-host");
+    var status = Status.init(.{
+        .status_fd = fds[1],
+        .mode = .title,
+        .ctrl_r_enabled = true,
+        .title_fallback = "test-host",
+    });
     status.observeInbound("\x1b]2;partial-title");
     status.showEscapeHelp();
 
@@ -743,7 +732,7 @@ test "stream escape help waits for terminal parser safe point" {
     status.observeInbound("\x1b\\");
     posix.close(fds[1]);
 
-    const output = try readAllFromFd(std.testing.allocator, fds[0]);
+    const output = try testing.readAllFromFd(std.testing.allocator, fds[0]);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "Supported escape sequences") != null);
 }
@@ -752,7 +741,12 @@ test "stream reconnect status treats synchronized update as unsafe for title" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.initForTest(fds[1], .title, true, "test-host");
+    var status = Status.init(.{
+        .status_fd = fds[1],
+        .mode = .title,
+        .ctrl_r_enabled = true,
+        .title_fallback = "test-host",
+    });
     status.observeInbound("\x1b[?2026h");
     status.showRetry(10_000);
     status.clear();
@@ -761,7 +755,7 @@ test "stream reconnect status treats synchronized update as unsafe for title" {
     status.clear();
     posix.close(fds[1]);
 
-    const output = try readAllFromFd(std.testing.allocator, fds[0]);
+    const output = try testing.readAllFromFd(std.testing.allocator, fds[0]);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         "\x1b]2;10sec retry CTRL-R\x1b\\\x1b]2;test-host\x1b\\",
@@ -773,13 +767,13 @@ test "stream reconnect status renders ssh diagnostics before status" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.initForTest(fds[1], .line, false, "");
+    var status = Status.init(.{ .status_fd = fds[1], .mode = .line });
     client_log.appendSshStderr("control sequence: \x1b[31mred\n");
     status.showRetry(1_000);
     status.clear();
     posix.close(fds[1]);
 
-    const output = try readAllFromFd(std.testing.allocator, fds[0]);
+    const output = try testing.readAllFromFd(std.testing.allocator, fds[0]);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         "ssh: control sequence: ?[31mred\r\n" ++
@@ -793,13 +787,13 @@ test "stream reconnect status appends diagnostics after status line" {
     defer posix.close(fds[0]);
 
     client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
-    var status = Status.initForTest(fds[1], .line, false, "");
+    var status = Status.init(.{ .status_fd = fds[1], .mode = .line });
     status.showRetry(1_000);
     client_log.appendSshStderr("connection failed\n");
     status.flushDiagnostics();
     posix.close(fds[1]);
 
-    const output = try readAllFromFd(std.testing.allocator, fds[0]);
+    const output = try testing.readAllFromFd(std.testing.allocator, fds[0]);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         "sessh: disconnected: Retry connecting 1sec\r\n" ++

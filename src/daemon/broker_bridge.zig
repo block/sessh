@@ -24,7 +24,11 @@ pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args
     try daemon_client.ensureStartedForDirName(allocator, exe, dir_name);
     const fd = try daemon_client.connectForDirName(allocator, dir_name);
     defer _ = c.close(fd);
-    try forwardBrokerFramesToDaemon(allocator, std.posix.STDIN_FILENO, std.posix.STDOUT_FILENO, fd);
+    try forwardBrokerFramesToDaemon(allocator, .{
+        .stdin = std.posix.STDIN_FILENO,
+        .stdout = std.posix.STDOUT_FILENO,
+        .daemon = fd,
+    });
 }
 
 pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
@@ -40,33 +44,40 @@ pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args
     return daemon_executable.reexec(allocator, namespace_executables.broker, args);
 }
 
+const BrokerBridgeFds = struct {
+    stdin: c.fd_t,
+    stdout: c.fd_t,
+    daemon: c.fd_t,
+};
+
 fn forwardBrokerFramesToDaemon(
     allocator: std.mem.Allocator,
-    stdin_fd: c.fd_t,
-    stdout_fd: c.fd_t,
-    daemon_fd: c.fd_t,
+    fds: BrokerBridgeFds,
 ) !void {
     defer {
-        _ = c.shutdown(stdin_fd, c.SHUT.WR);
-        if (stdout_fd != stdin_fd) _ = c.shutdown(stdout_fd, c.SHUT.WR);
-        _ = c.shutdown(daemon_fd, c.SHUT.WR);
+        _ = c.shutdown(fds.stdin, c.SHUT.WR);
+        if (fds.stdout != fds.stdin) _ = c.shutdown(fds.stdout, c.SHUT.WR);
+        _ = c.shutdown(fds.daemon, c.SHUT.WR);
     }
 
-    try core_fds.setNonBlocking(stdin_fd);
-    try core_fds.setNonBlocking(stdout_fd);
-    try core_fds.setNonBlocking(daemon_fd);
+    try core_fds.setNonBlocking(fds.stdin);
+    try core_fds.setNonBlocking(fds.stdout);
+    try core_fds.setNonBlocking(fds.daemon);
 
     var client_to_daemon = BrokerFramePipe.init(allocator, .add_current_environment);
     defer client_to_daemon.deinit();
     var daemon_to_client = BrokerFramePipe.init(allocator, .none);
     defer daemon_to_client.deinit();
 
+    // PROCESS_EVENT_LOOP: sessh-broker is only a framed relay between OpenSSH
+    // and the local daemon. It has no daemon-owned state to service outside
+    // this bridge.
     var broker_dispatcher = try dispatcher.Dispatcher.init(allocator);
     defer broker_dispatcher.deinit();
     var bridge = BrokerBridge{
-        .stdin_fd = stdin_fd,
-        .stdout_fd = stdout_fd,
-        .daemon_fd = daemon_fd,
+        .stdin_fd = fds.stdin,
+        .stdout_fd = fds.stdout,
+        .daemon_fd = fds.daemon,
         .client_to_daemon = &client_to_daemon,
         .daemon_to_client = &daemon_to_client,
     };
@@ -102,9 +113,21 @@ const BrokerBridge = struct {
             .{ .bridge = self, .kind = .stdout },
             .{ .bridge = self, .kind = .daemon },
         };
-        self.stdin_watch = try broker_dispatcher.watchFd(self.stdin_fd, .{}, .{ .ctx = &self.watch_contexts[0], .callback = handleBrokerBridgeEvent });
-        self.stdout_watch = try broker_dispatcher.watchFd(self.stdout_fd, .{}, .{ .ctx = &self.watch_contexts[1], .callback = handleBrokerBridgeEvent });
-        self.daemon_watch = try broker_dispatcher.watchFd(self.daemon_fd, .{}, .{ .ctx = &self.watch_contexts[2], .callback = handleBrokerBridgeEvent });
+        self.stdin_watch = try broker_dispatcher.watchFd(.{
+            .fd = self.stdin_fd,
+            .events = .{},
+            .handler = .{ .ctx = &self.watch_contexts[0], .callback = handleBrokerBridgeEvent },
+        });
+        self.stdout_watch = try broker_dispatcher.watchFd(.{
+            .fd = self.stdout_fd,
+            .events = .{},
+            .handler = .{ .ctx = &self.watch_contexts[1], .callback = handleBrokerBridgeEvent },
+        });
+        self.daemon_watch = try broker_dispatcher.watchFd(.{
+            .fd = self.daemon_fd,
+            .events = .{},
+            .handler = .{ .ctx = &self.watch_contexts[2], .callback = handleBrokerBridgeEvent },
+        });
         try self.updateWatches(broker_dispatcher);
     }
 
@@ -118,8 +141,9 @@ const BrokerBridge = struct {
     }
 };
 
-fn handleBrokerBridgeEvent(ctx: *anyopaque, broker_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId, event: dispatcher.Event) !void {
-    _ = id;
+fn handleBrokerBridgeEvent(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    const broker_dispatcher = handler_event.dispatcher;
+    const event = handler_event.event;
     const watch: *BrokerWatchContext = @ptrCast(@alignCast(ctx));
     const fd_event = switch (event) {
         .fd => |fd| fd,

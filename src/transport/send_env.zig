@@ -13,22 +13,42 @@ pub fn allowsName(patterns: []const []const u8, name: []const u8) bool {
 }
 
 fn patternMatches(pattern: []const u8, name: []const u8) bool {
-    return patternMatchesFrom(pattern, 0, name, 0);
+    return patternMatchesFrom(.{
+        .pattern = pattern,
+        .name = name,
+    });
 }
 
-fn patternMatchesFrom(pattern: []const u8, pattern_index: usize, name: []const u8, name_index: usize) bool {
-    if (pattern_index == pattern.len) return name_index == name.len;
-    const char = pattern[pattern_index];
+const MatchState = struct {
+    pattern: []const u8,
+    pattern_index: usize = 0,
+    name: []const u8,
+    name_index: usize = 0,
+};
+
+fn patternMatchesFrom(state: MatchState) bool {
+    if (state.pattern_index == state.pattern.len) return state.name_index == state.name.len;
+    const char = state.pattern[state.pattern_index];
     if (char == '*') {
-        var index = name_index;
-        while (index <= name.len) : (index += 1) {
-            if (patternMatchesFrom(pattern, pattern_index + 1, name, index)) return true;
+        var index = state.name_index;
+        while (index <= state.name.len) : (index += 1) {
+            if (patternMatchesFrom(.{
+                .pattern = state.pattern,
+                .pattern_index = state.pattern_index + 1,
+                .name = state.name,
+                .name_index = index,
+            })) return true;
         }
         return false;
     }
-    if (name_index == name.len) return false;
-    if (char == '?' or char == name[name_index]) {
-        return patternMatchesFrom(pattern, pattern_index + 1, name, name_index + 1);
+    if (state.name_index == state.name.len) return false;
+    if (char == '?' or char == state.name[state.name_index]) {
+        return patternMatchesFrom(.{
+            .pattern = state.pattern,
+            .pattern_index = state.pattern_index + 1,
+            .name = state.name,
+            .name_index = state.name_index + 1,
+        });
     }
     return false;
 }

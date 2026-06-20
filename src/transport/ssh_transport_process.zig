@@ -4,15 +4,12 @@ const posix = std.posix;
 
 const config = @import("../core/config.zig");
 const core_fds = @import("../core/fds.zig");
+const process_wait = @import("../core/waitpid.zig");
 const daemon_log = @import("../daemon/log.zig");
 const ssh_opts = @import("ssh_options.zig");
 
 const appendTransportSshOptions = ssh_opts.appendTransportSshOptions;
 const transportSshOptionsLen = ssh_opts.transportSshOptionsLen;
-
-// POSIX WNOHANG. Zig 0.15 does not expose a portable constant, and our
-// supported Unix targets use the stable POSIX value.
-const wait_nohang: c_int = 1;
 
 pub const Target = struct {
     options: []const []const u8,
@@ -24,11 +21,11 @@ pub const Target = struct {
 };
 
 pub const SshTransportProcess = struct {
-    child: std.process.Child,
+    process: std.process.Child,
     stderr_fd: c.fd_t = -1,
 
     pub fn closeStdin(self: *SshTransportProcess) void {
-        closeChildStdin(&self.child);
+        closeProcessStdin(&self.process);
     }
 
     pub fn closeStderr(self: *SshTransportProcess) void {
@@ -38,16 +35,24 @@ pub const SshTransportProcess = struct {
         }
     }
 
+    pub fn stdinFd(self: *const SshTransportProcess) c.fd_t {
+        return self.process.stdin.?.handle;
+    }
+
+    pub fn stdoutFd(self: *const SshTransportProcess) c.fd_t {
+        return self.process.stdout.?.handle;
+    }
+
     pub fn wait(self: *SshTransportProcess) !std.process.Child.Term {
-        return self.child.wait();
+        return self.process.wait();
     }
 
     pub fn pollExit(self: *SshTransportProcess) ?std.process.Child.Term {
-        if (self.child.term) |term| {
+        if (self.process.term) |term| {
             return term catch .{ .Unknown = 0 };
         }
         var status: c_int = 0;
-        const result = c.waitpid(self.child.id, &status, wait_nohang);
+        const result = c.waitpid(self.process.id, &status, process_wait.nohang);
         if (result == 0) return null;
         if (result < 0) {
             return switch (posix.errno(result)) {
@@ -55,50 +60,46 @@ pub const SshTransportProcess = struct {
                 else => .{ .Unknown = 0 },
             };
         }
-        const term = waitStatusToTerm(@bitCast(status));
-        self.child.term = term;
-        self.child.id = undefined;
+        const term = process_wait.termFromStatus(@bitCast(status));
+        self.process.term = term;
+        self.process.id = undefined;
         return term;
     }
 
     pub fn terminate(self: *SshTransportProcess) void {
         self.closeStdin();
-        _ = self.child.kill() catch {
-            _ = self.child.wait() catch {};
+        _ = self.process.kill() catch {
+            _ = self.process.wait() catch {};
         };
         self.closeStderr();
     }
 };
 
-fn waitStatusToTerm(status: u32) std.process.Child.Term {
-    return if (posix.W.IFEXITED(status))
-        .{ .Exited = posix.W.EXITSTATUS(status) }
-    else if (posix.W.IFSIGNALED(status))
-        .{ .Signal = posix.W.TERMSIG(status) }
-    else if (posix.W.IFSTOPPED(status))
-        .{ .Stopped = posix.W.STOPSIG(status) }
-    else
-        .{ .Unknown = status };
-}
-
 pub fn defaultSshOptionsLen(target: Target) usize {
     return if (target.default_ipqos_option == null) 0 else 1;
 }
 
-pub fn appendDefaultSshOptions(ssh_argv: [][]const u8, arg_index: *usize, default_ipqos_option: ?[]const u8) void {
+pub fn appendDefaultSshOptions(ssh_argv: [][]const u8, start_index: usize, default_ipqos_option: ?[]const u8) usize {
+    var arg_index = start_index;
     if (default_ipqos_option) |option| {
-        ssh_argv[arg_index.*] = option;
-        arg_index.* += 1;
+        ssh_argv[arg_index] = option;
+        arg_index += 1;
     }
+    return arg_index;
 }
 
-pub fn spawnSshTransportProcess(
+pub const SpawnOptions = struct {
     allocator: std.mem.Allocator,
     target: Target,
     remote_command: []const u8,
     env_map: ?*const std.process.EnvMap,
     bootstrap: bool,
-) !SshTransportProcess {
+};
+
+pub fn spawnSshTransportProcess(options: SpawnOptions) !SshTransportProcess {
+    const allocator = options.allocator;
+    const target = options.target;
+    const remote_command = options.remote_command;
     const batch_mode_options: usize = 1;
     const default_options = defaultSshOptionsLen(target);
     const transport_options = transportSshOptionsLen(target.options);
@@ -111,34 +112,34 @@ pub fn spawnSshTransportProcess(
     // value it sees for many config keys.
     ssh_argv[arg_index] = "-oBatchMode=yes";
     arg_index += 1;
-    appendDefaultSshOptions(ssh_argv, &arg_index, target.default_ipqos_option);
-    appendTransportSshOptions(ssh_argv, &arg_index, target.options);
+    arg_index = appendDefaultSshOptions(ssh_argv, arg_index, target.default_ipqos_option);
+    arg_index = appendTransportSshOptions(ssh_argv, arg_index, target.options);
     ssh_argv[arg_index] = "-T";
     ssh_argv[arg_index + 1] = target.host;
     ssh_argv[ssh_argv.len - 1] = remote_command;
-    daemon_log.infof(allocator, "ssh transport starting host={s} bootstrap={}", .{ target.host, bootstrap });
+    daemon_log.infof(allocator, "ssh transport starting host={s} bootstrap={}", .{ target.host, options.bootstrap });
 
-    var child = std.process.Child.init(ssh_argv, allocator);
-    child.expand_arg0 = .expand;
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.env_map = env_map;
-    try child.spawn();
+    var process = std.process.Child.init(ssh_argv, allocator);
+    process.expand_arg0 = .expand;
+    process.stdin_behavior = .Pipe;
+    process.stdout_behavior = .Pipe;
+    process.stderr_behavior = .Pipe;
+    process.env_map = options.env_map;
+    try process.spawn();
     daemon_log.infof(allocator, "ssh transport started host={s}", .{target.host});
-    var connection = SshTransportProcess{ .child = child };
+    var connection = SshTransportProcess{ .process = process };
     errdefer connection.terminate();
-    const stderr_file = connection.child.stderr.?;
-    connection.child.stderr = null;
+    const stderr_file = connection.process.stderr.?;
+    connection.process.stderr = null;
     connection.stderr_fd = stderr_file.handle;
     try core_fds.setNonBlocking(connection.stderr_fd);
     return connection;
 }
 
-fn closeChildStdin(child: *std.process.Child) void {
-    if (child.stdin) |*stdin| {
+fn closeProcessStdin(process: *std.process.Child) void {
+    if (process.stdin) |*stdin| {
         stdin.close();
-        child.stdin = null;
+        process.stdin = null;
     }
 }
 
@@ -151,8 +152,7 @@ test "default ssh options append resolved interactive IPQoS value" {
     try std.testing.expectEqual(@as(usize, 1), defaultSshOptionsLen(parsed));
 
     var argv: [4][]const u8 = undefined;
-    var index: usize = 0;
-    appendDefaultSshOptions(&argv, &index, parsed.default_ipqos_option);
+    const index = appendDefaultSshOptions(&argv, 0, parsed.default_ipqos_option);
     try std.testing.expectEqual(@as(usize, 1), index);
     try std.testing.expectEqualStrings("-oIPQoS=af21", argv[0]);
 

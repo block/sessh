@@ -17,20 +17,12 @@ Daemons wake up every `cleanup-wakeup-interval-hours` to check if there are
 stale remote processes, enqueueing `RemoteProcessCleanupRequest` messages onto
 the same pooled transport machinery used by live sessh clients.
 
-During cleanup the daemon scans the global `state/procs/` dir. Each file within
-the procs dir is JSON, named `<guid>.json`; the filename is the resource
-identity.  The file mtime is the recorded-at timestamp used for
-`cleanup-retry-limit-hours`. The files are created atomically and are never
-mutated other than being deleted. Each contains:
-
-1. `local_pid`
-2. `local_start_time`
-3. `remote_user`
-4. `remote_host`
-5. `remote_port`
-6. `remote_pid`
-7. `remote_start_time`
-8. `remote_socket_path`
+During cleanup the daemon scans durable cleanup records in the state directory.
+Each record ties together three facts: the local process that originally owned
+the session, the remote host endpoint, and the exact remote process/socket
+identity that can be safely cleaned up later. The record is intentionally
+durable because the cleanup path must survive local daemon death and laptop
+reboot.
 
 The cleaner reads each file one by one. If the local process still exists, it
 skips ahead. Otherwise it makes sure there is a pooled transport for the remote
@@ -49,25 +41,20 @@ file.
 
 ### Avoiding duplicate work
 
-Daemons acquire a global flock and update the file timestamp so that only one
-does the work. Records older than `cleanup-retry-limit-hours` are abandoned:
-the local side deletes the record and stops trying to clean up that remote
-process.
+Daemons acquire a global flock so that only one does the work. Records older
+than `cleanup-retry-limit-hours` are abandoned: the local side deletes the
+record and stops trying to clean up that remote process.
 
-As long as cleanup is required, at least one daemon must stay alive. A daemon
-will shutdown when the following are satisfied:
+As long as cleanup is required, at least one daemon must stay alive. An idle
+daemon can shut down after it either loses the global cleanup flock to another
+daemon or finishes the cleanup work it acquired the flock to perform.
 
-1. It has no local client, and
-2. Either:
-   a) It has attempted, and failed, to acquire the global cleanup flock, or
-   b) It has acquired the global cleanup flock and finished cleanup work
-
-We'd prefer that we don't keep a daemon alive unnecessarily. If there is a
-daemon that has local clients, it's better for it to acquire the global cleanup
-flock. To achieve this, daemons with local client will attempt to acquire and
-hold the global cleanup flock as long as they have a live local client. Daemons
-without a live local client will give up the global cleanup flock as soon as
-they finish a round of cleanup attempts.
+Sessh avoids keeping idle daemons alive just to own cleanup. A daemon with live
+local clients is the best owner for the global cleanup flock because it is
+already doing useful work. Daemons with a local client therefore attempt to
+acquire and hold the flock while that client is live. Daemons without a live
+local client give up the flock as soon as they finish a round of cleanup
+attempts.
 
 ## Disconnected Timeout
 

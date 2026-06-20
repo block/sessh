@@ -60,7 +60,7 @@ pub fn socketPath(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, socket_filename });
 }
 
-pub fn dirPath(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
+fn dirPath(allocator: std.mem.Allocator, dir_name: []const u8) ![]u8 {
     try validateDirName(dir_name);
     const root = try socket_transport.sesshRuntimeDir(allocator);
     defer allocator.free(root);
