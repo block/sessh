@@ -4,6 +4,13 @@ When sending messages on my behalf (Slack, email, PR comments, etc.), always cle
 
 Follow the advice from [CONTRIBUTING.md](CONTRIBUTING.md)
 
+## Coding guidelines
+
+Favor small sets of arguments to functions. When possible, group variables into
+natural structs that make sense across functions/modules. When larger sets of
+arguments are unavoidable (say, 5+)   When larger sets of arguments (say, 5+)
+and the arguments are non-obvious, use named-parameter structs.
+
 ## Testing
 
 Before finishing code changes, run at least:
@@ -39,3 +46,12 @@ unless you are confident your additions fit the spirit.
 Comments and docs should not dwell on the past except when it pertains to
 backwards compatibility and/or lessons learned. They should describe the
 current state and/or plans for the future.
+
+Every directory within src (including src itself) should have a README.md that
+describes the purpose of the code within. Complex files should also have a
+comment block at the top explaining the purpose of the code within.
+
+TODO comments are encouraged. When you encounter some code that is problematic,
+but that it doesn't make sense to address in the moment, you should describe
+the problem in a `// TODO(agent): ...` style comment (the `agent` clarifies
+that the TODO was added by an AI agent).
