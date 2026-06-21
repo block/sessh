@@ -1,23 +1,29 @@
 const std = @import("std");
 const c = std.c;
 
+const core_blocking = @import("../core/blocking.zig");
+
 pub const DaemonIdentity = struct {
     pid: u64,
     start_time: []const u8,
     socket_path: []const u8,
 };
 
-pub fn current(allocator: std.mem.Allocator, socket_path: []const u8) !DaemonIdentity {
+pub fn current(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, socket_path: []const u8) !DaemonIdentity {
     const pid: u64 = @intCast(c.getpid());
     return .{
         .pid = pid,
-        .start_time = try processStartTime(allocator, pid),
+        .start_time = try processStartTimeBlocking(blocking, allocator, pid),
         .socket_path = socket_path,
     };
 }
 
 pub fn processStartTime(allocator: std.mem.Allocator, pid: u64) ![]u8 {
     return processStartTimeFromProc(allocator, pid) catch processStartTimeFromPs(allocator, pid);
+}
+
+fn processStartTimeBlocking(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, pid: u64) ![]u8 {
+    return processStartTimeFromProc(allocator, pid) catch processStartTimeFromPsBlocking(blocking, allocator, pid);
 }
 
 fn processStartTimeFromProc(allocator: std.mem.Allocator, pid: u64) ![]u8 {
@@ -44,15 +50,35 @@ fn procStatField(fields_from_state: []const u8, field_number: usize) ![]const u8
 }
 
 fn processStartTimeFromPs(allocator: std.mem.Allocator, pid: u64) ![]u8 {
+    const pid_arg = try std.fmt.allocPrint(allocator, "{}", .{pid});
+    defer allocator.free(pid_arg);
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "ps", "-p", pid_arg, "-o", "lstart=" },
+        .max_output_bytes = 4096,
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return error.ProcessStartTimeUnavailable,
+        else => return error.ProcessStartTimeUnavailable,
+    }
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (trimmed.len == 0) return error.ProcessStartTimeUnavailable;
+    return std.fmt.allocPrint(allocator, "ps-lstart:{s}", .{trimmed});
+}
+
+fn processStartTimeFromPsBlocking(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, pid: u64) ![]u8 {
     // Fallback process identity for platforms without a cheap `/proc` start
     // token. The value is opaque: cleanup only compares exact strings to avoid
     // signaling a process after pid reuse.
     const pid_arg = try std.fmt.allocPrint(allocator, "{}", .{pid});
     defer allocator.free(pid_arg);
 
-    // BLOCKING_WAIT: this is the portability fallback when `/proc` cannot
-    // provide a stable process start token. Cleanup records compare the opaque
-    // string exactly; it does not need to match another machine's clock format.
+    _ = blocking;
     const result = try std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "ps", "-p", pid_arg, "-o", "lstart=" },

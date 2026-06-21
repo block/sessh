@@ -4,6 +4,7 @@
 const std = @import("std");
 const c = std.c;
 
+const dispatch_io = @import("../core/dispatch_io.zig");
 const protocol = @import("../protocol/mod.zig");
 
 const pb = protocol.pb;
@@ -22,28 +23,29 @@ pub const BoundedFrame = struct {
 
 pub const FrameWriteQueue = struct {
     allocator: std.mem.Allocator,
-    pending_frames: std.ArrayList(protocol.FrameWriteState) = .empty,
+    sink: dispatch_io.FrameSink,
 
     pub fn init(allocator: std.mem.Allocator) FrameWriteQueue {
-        return .{ .allocator = allocator };
+        return .{
+            .allocator = allocator,
+            .sink = dispatch_io.FrameSink.init(.{
+                .allocator = allocator,
+                .fd = -1,
+            }),
+        };
     }
 
     pub fn deinit(self: *FrameWriteQueue) void {
-        for (self.pending_frames.items) |*frame| frame.deinit();
-        self.pending_frames.deinit(self.allocator);
+        self.sink.deinit();
         self.* = undefined;
     }
 
     pub fn hasPending(self: *const FrameWriteQueue) bool {
-        return self.pending_frames.items.len != 0;
+        return self.sink.hasPending();
     }
 
     pub fn queuedBytes(self: *const FrameWriteQueue) usize {
-        var total: usize = 0;
-        for (self.pending_frames.items) |frame| {
-            total += frame.bytes.len - frame.written;
-        }
-        return total;
+        return self.sink.queuedBytes();
     }
 
     pub fn queueFrame(
@@ -51,19 +53,28 @@ pub const FrameWriteQueue = struct {
         message_type: protocol.MessageType,
         payload: []const u8,
     ) !void {
-        var frame = try protocol.FrameWriteState.init(self.allocator, message_type, payload);
-        errdefer frame.deinit();
-        try self.pending_frames.append(self.allocator, frame);
+        try self.sink.queueFrame(message_type, payload);
     }
 
     pub fn queueFrameWithByteLimit(self: *FrameWriteQueue, frame_request: BoundedFrame) !void {
-        var frame = try protocol.FrameWriteState.init(self.allocator, frame_request.message_type, frame_request.payload);
-        errdefer frame.deinit();
-        const frame_len = frame.bytes.len - frame.written;
-        if (frame_len > frame_request.max_queued_bytes or self.queuedBytes() > frame_request.max_queued_bytes - frame_len) {
-            return error.FrameWriteQueueFull;
-        }
-        try self.pending_frames.append(self.allocator, frame);
+        try self.sink.queueFrameWithByteLimit(
+            frame_request.message_type,
+            frame_request.payload,
+            frame_request.max_queued_bytes,
+        );
+    }
+
+    pub fn queueOwnedFrame(self: *FrameWriteQueue, frame: *protocol.OwnedFrame) !void {
+        try self.sink.queueOwnedFrame(frame);
+    }
+
+    pub fn queueFrameWithScmRightsFd(
+        self: *FrameWriteQueue,
+        message_type: protocol.MessageType,
+        payload: []const u8,
+        passed_fd: c.fd_t,
+    ) !void {
+        try self.sink.queueFrameWithScmRightsFd(message_type, payload, passed_fd);
     }
 
     pub fn queueDaemonTunnelPayload(
@@ -99,20 +110,12 @@ pub const FrameWriteQueue = struct {
     }
 
     pub fn writeReady(self: *FrameWriteQueue, fd: c.fd_t) !WriteQueueStatus {
-        var made_progress = false;
-        while (self.pending_frames.items.len != 0) {
-            const write = &self.pending_frames.items[0];
-            switch (try write.writeReady(fd)) {
-                .blocked => return if (made_progress) .progress else .blocked,
-                .progress => return .progress,
-                .done => {
-                    made_progress = true;
-                    write.deinit();
-                    _ = self.pending_frames.orderedRemove(0);
-                },
-            }
-        }
-        return .drained;
+        self.sink.fd = fd;
+        return switch (try self.sink.writeReady()) {
+            .blocked => .blocked,
+            .progress => .progress,
+            .drained => .drained,
+        };
     }
 };
 

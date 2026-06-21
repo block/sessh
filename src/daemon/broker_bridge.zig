@@ -4,6 +4,7 @@
 const std = @import("std");
 const c = std.c;
 
+const core_blocking = @import("../core/blocking.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
@@ -16,7 +17,7 @@ const socket_namespace = @import("socket_namespace.zig");
 
 const pb = protocol.pb;
 
-pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+pub fn forwardBrokerToDaemon(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     if (args.len > 1) {
         try user_error.roleLine("sessh-broker", "accepts at most one daemon socket namespace");
         return error.InvalidBrokerArgs;
@@ -24,10 +25,10 @@ pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
     defer if (args.len == 0) allocator.free(dir_name);
 
-    try daemon_client.ensureStartedForDirName(allocator, exe, dir_name);
+    try daemon_client.ensureStartedForDirName(blocking, allocator, exe, dir_name);
     const fd = try daemon_client.connectForDirName(allocator, dir_name);
     defer _ = c.close(fd);
-    try forwardBrokerFramesToDaemon(allocator, .{
+    try forwardBrokerFramesToDaemon(blocking, allocator, .{
         .stdin = std.posix.STDIN_FILENO,
         .stdout = std.posix.STDOUT_FILENO,
         .daemon = fd,
@@ -54,6 +55,7 @@ const BrokerBridgeFds = struct {
 };
 
 fn forwardBrokerFramesToDaemon(
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     fds: BrokerBridgeFds,
 ) !void {
@@ -75,11 +77,9 @@ fn forwardBrokerFramesToDaemon(
     var daemon_to_client = BrokerFramePipe.init(allocator, .none);
     defer daemon_to_client.deinit();
 
-    // PROCESS_EVENT_LOOP: sessh-broker is only a framed relay between OpenSSH
-    // and the local daemon. It has no daemon-owned state to service outside
-    // this bridge.
-    var broker_dispatcher = try dispatcher.Dispatcher.init(allocator);
-    defer broker_dispatcher.deinit();
+    // sessh-broker is only a framed relay between OpenSSH
+    // and the local daemon. It registers that bridge on the process Dispatcher.
+    const broker_dispatcher = dispatcher.get();
     var bridge = BrokerBridge{
         .stdin_fd = fds.stdin,
         .stdout_fd = fds.stdout,
@@ -87,8 +87,8 @@ fn forwardBrokerFramesToDaemon(
         .client_to_daemon = &client_to_daemon,
         .daemon_to_client = &daemon_to_client,
     };
-    try bridge.watch(&broker_dispatcher);
-    try broker_dispatcher.run();
+    try bridge.watch(broker_dispatcher);
+    try blocking.runLoop();
 }
 
 const BrokerWatchKind = enum {

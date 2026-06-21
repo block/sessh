@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
@@ -16,7 +17,7 @@ pub const SplitEndpointFds = struct {
     write: c.fd_t,
 };
 
-pub fn forwardRawDuplex(left: SplitEndpointFds, right_fd: c.fd_t) !void {
+pub fn forwardRawDuplex(blocking: core_blocking.Blocking, left: SplitEndpointFds, right_fd: c.fd_t) !void {
     // Bridge two raw byte directions without interpreting sessh frames. This is
     // used after setup has handed one side to OpenSSH or another process that
     // expects an ordinary stream socket.
@@ -33,16 +34,15 @@ pub fn forwardRawDuplex(left: SplitEndpointFds, right_fd: c.fd_t) !void {
         .write_fd = left.write,
     };
 
-    // PROCESS_EVENT_LOOP: this process is only a byte bridge. There is no
-    // daemon dispatcher hidden behind this loop.
-    var raw_dispatcher = try dispatcher.Dispatcher.init(std.heap.page_allocator);
-    defer raw_dispatcher.deinit();
+    // this process is only a byte bridge. It uses the
+    // process Dispatcher initialized by main.
+    const raw_dispatcher = dispatcher.get();
     var bridge = RawBridge{
         .left_to_right = &left_to_right,
         .right_to_left = &right_to_left,
     };
-    try bridge.watch(&raw_dispatcher);
-    try raw_dispatcher.run();
+    try bridge.watch(raw_dispatcher);
+    try blocking.runLoop();
 }
 
 const DirectionId = enum {
@@ -206,6 +206,9 @@ const RawDirection = struct {
 };
 
 test "raw duplex propagates right-side eof to the left peer" {
+    try dispatcher.initGlobal(std.testing.allocator);
+    defer dispatcher.deinitGlobal();
+
     const left_input = try posix.pipe();
     posix.close(left_input[1]);
     defer posix.close(left_input[0]);
@@ -222,7 +225,8 @@ test "raw duplex propagates right-side eof to the left peer" {
     _ = c.close(right[1]);
     right[1] = -1;
 
-    try forwardRawDuplex(.{
+    const blocking = core_blocking.fromTest();
+    try forwardRawDuplex(blocking, .{
         .read = left_input[0],
         .write = left_output[0],
     }, right[0]);

@@ -6,6 +6,7 @@ const c = std.c;
 const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
+const core_blocking = @import("../core/blocking.zig");
 const visible_client = @import("../session/visible_client.zig");
 const client_config = @import("../session/client_config.zig");
 const client_log = @import("../core/client_log.zig");
@@ -145,6 +146,7 @@ fn remoteSessionConfig(
 }
 
 pub const RunRemoteNewSessionOptions = struct {
+    blocking: core_blocking.Blocking,
     exe: []const u8,
     ssh_options: []const []const u8,
     host: []const u8,
@@ -192,6 +194,7 @@ pub fn runRemoteNewSession(
         }
         try runProxyStreamSsh(.{
             .allocator = allocator,
+            .blocking = options.blocking,
             .exe = options.exe,
             .target = target,
             .common = session_config.common,
@@ -215,6 +218,7 @@ pub fn runRemoteNewSession(
 
     var transport = try openTerminalDaemonTransport(.{
         .allocator = allocator,
+        .blocking = options.blocking,
         .exe = options.exe,
         .target = target,
         .common = session_config.common,
@@ -260,6 +264,7 @@ pub fn runRemoteNewSession(
     defer session.deinit();
     session.setTitleFallback(target.host);
     try runVisibleRemoteClient(.{
+        .blocking = options.blocking,
         .allocator = allocator,
         .exe = options.exe,
         .target = target,
@@ -271,6 +276,7 @@ pub fn runRemoteNewSession(
 
 const TerminalDaemonTransportOpen = struct {
     allocator: std.mem.Allocator,
+    blocking: core_blocking.Blocking,
     exe: []const u8,
     target: SshTarget,
     common: CommonSessionOptions,
@@ -282,14 +288,15 @@ fn openTerminalDaemonTransport(options: TerminalDaemonTransportOpen) !TerminalTr
     // transport for a terminal-emulator session. The returned fd remains framed
     // client/remote protocol for the visible client.
     const allocator = options.allocator;
+    const blocking = options.blocking;
     const exe = options.exe;
     const target = options.target;
     const common = options.common;
     const daemon_dir_name = options.daemon_dir_name;
     const fd = if (daemon_dir_name) |dir_name|
-        try daemon_client.connectOrStartForDirName(allocator, exe, dir_name)
+        try daemon_client.connectOrStartForDirName(blocking, allocator, exe, dir_name)
     else
-        try daemon_client.connectOrStart(allocator, exe);
+        try daemon_client.connectOrStart(blocking, allocator, exe);
     var daemon_fd = core_fds.OwnedFd.init(fd);
     defer daemon_fd.deinit();
 
@@ -338,6 +345,7 @@ const TranscriptCapture = struct {
 // transport underneath it can be replaced during reconnect. Keep that state
 // bundle explicit so reconnect paths update the live transport in one place.
 const RemoteClientContext = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     exe: []const u8,
     target: SshTarget,
@@ -352,6 +360,7 @@ fn runVisibleRemoteClient(ctx: RemoteClientContext) !void {
     // the local daemon fails, or reconnect swaps in a fresh transport.
     while (true) {
         const end = visible_client.runVisibleClient(
+            ctx.blocking,
             .{
                 .read = ctx.transport.readFd(),
                 .write = ctx.transport.writeFd(),
@@ -373,7 +382,7 @@ fn runVisibleRemoteClient(ctx: RemoteClientContext) !void {
             },
             .client_hangup => {
                 client_log.debug("event=client_hangup host={s} session={s}", .{ ctx.target.host, ctx.session.idSlice() });
-                visible_client.drainLocalTransportDiagnostics(ctx.transport.readFd(), 100);
+                visible_client.drainLocalTransportDiagnostics(ctx.blocking, ctx.transport.readFd(), 100);
                 ctx.transport.terminate();
                 try finishHungUpSshSession(ctx.session);
                 return;
@@ -412,6 +421,7 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
     const diagnostics_terminal_fds = diagnostics_handle.terminalFdsOr(.{});
     const diagnostics_line_fd = diagnostics_handle.outputOr(posix.STDERR_FILENO);
     var reconnect_ui = try client_ui.ReconnectUi.beginWithOptions(
+        ctx.blocking,
         ctx.session.viewport_offset,
         .{
             .presentation = diagnostics_policy.terminalPresentation(.{
@@ -452,6 +462,7 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
 
         var replacement = openTerminalDaemonTransport(.{
             .allocator = ctx.allocator,
+            .blocking = ctx.blocking,
             .exe = ctx.exe,
             .target = ctx.target,
             .common = ctx.session_config.common,
@@ -693,6 +704,7 @@ const DaemonStreamClientTransport = struct {
 
 const DaemonStreamClientStarter = struct {
     allocator: std.mem.Allocator,
+    blocking: core_blocking.Blocking,
     exe: []const u8,
     target: SshTarget,
     bootstrap: bool,
@@ -703,9 +715,9 @@ const DaemonStreamClientStarter = struct {
         // terminal sessions, but the foreground client will speak proxy-stream
         // protocol over the resulting fd.
         const fd = if (self.daemon_dir_name) |dir_name|
-            try daemon_client.connectOrStartForDirName(self.allocator, self.exe, dir_name)
+            try daemon_client.connectOrStartForDirName(self.blocking, self.allocator, self.exe, dir_name)
         else
-            try daemon_client.connectOrStart(self.allocator, self.exe);
+            try daemon_client.connectOrStart(self.blocking, self.allocator, self.exe);
         var daemon_fd = core_fds.OwnedFd.init(fd);
         defer daemon_fd.deinit();
 
@@ -731,6 +743,7 @@ const DaemonStreamClientStarter = struct {
 
 const OpenProxyDiagnosticsOptions = struct {
     allocator: std.mem.Allocator,
+    blocking: core_blocking.Blocking,
     exe: []const u8,
     guid: []const u8,
     daemon_dir_name: ?[]const u8,
@@ -739,9 +752,9 @@ const OpenProxyDiagnosticsOptions = struct {
 fn openProxyDiagnostics(options: OpenProxyDiagnosticsOptions) !c.fd_t {
     const allocator = options.allocator;
     const fd = if (options.daemon_dir_name) |dir_name|
-        try daemon_client.connectOrStartForDirName(allocator, options.exe, dir_name)
+        try daemon_client.connectOrStartForDirName(options.blocking, allocator, options.exe, dir_name)
     else
-        try daemon_client.connectOrStart(allocator, options.exe);
+        try daemon_client.connectOrStart(options.blocking, allocator, options.exe);
     var daemon_fd = core_fds.OwnedFd.init(fd);
     defer daemon_fd.deinit();
     try sendClientDaemonPayloadForeground(allocator, daemon_fd.get(), .{ .proxy_diagnostics_open = .{
@@ -758,6 +771,7 @@ fn openProxyDiagnostics(options: OpenProxyDiagnosticsOptions) !c.fd_t {
 // connection to sshd on the remote machine.
 const ProxyStreamSshOptions = struct {
     allocator: std.mem.Allocator,
+    blocking: core_blocking.Blocking,
     exe: []const u8,
     target: SshTarget,
     common: CommonSessionOptions,
@@ -796,6 +810,7 @@ fn runProxyStreamSsh(options: ProxyStreamSshOptions) !noreturn {
         diagnostics_guid = try guid_ref.generateProxyGuid(options.allocator);
         client_control_fd = core_fds.OwnedFd.init(try openProxyDiagnostics(.{
             .allocator = options.allocator,
+            .blocking = options.blocking,
             .exe = options.exe,
             .guid = diagnostics_guid.?,
             .daemon_dir_name = options.daemon_dir_name,
@@ -816,7 +831,7 @@ fn runProxyStreamSsh(options: ProxyStreamSshOptions) !noreturn {
     const proxy_client_ctrl_r = diagnostics_plan.client_ctrl_r;
     const proxy_daemon_dir_name = options.daemon_dir_name orelse try daemon_socket_namespace.defaultDirName(options.allocator);
     defer if (options.daemon_dir_name == null) options.allocator.free(proxy_daemon_dir_name);
-    try daemon_client.ensureStartedForDirName(options.allocator, options.exe, proxy_daemon_dir_name);
+    try daemon_client.ensureStartedForDirName(options.blocking, options.allocator, options.exe, proxy_daemon_dir_name);
     var namespace_executables = try daemon_executable.namespaceExecutablePaths(options.allocator, proxy_daemon_dir_name);
     defer namespace_executables.deinit();
 
@@ -882,7 +897,7 @@ fn runProxyStreamSsh(options: ProxyStreamSshOptions) !noreturn {
 // role-shaped proxy flags, then either hands a raw fd to the shared daemon or
 // runs a process-isolated proxy bridge that keeps diagnostics/control separate
 // from OpenSSH's byte stream.
-pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+pub fn runProxyStream(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     var invocation = proxy_entry.parse(allocator, args) catch |err| {
         try proxy_entry.printArgError(err);
         return process_exit.request(64);
@@ -908,6 +923,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
     if (invocation.use_fd_pass) {
         try runProxyStreamFdPass(.{
             .allocator = allocator,
+            .blocking = blocking,
             .exe = exe,
             .invocation = invocation,
             .stream_target = stream_target,
@@ -918,6 +934,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
     }
     var starter = DaemonStreamClientStarter{
         .allocator = allocator,
+        .blocking = blocking,
         .exe = exe,
         .target = stream_target,
         .bootstrap = invocation.bootstrap,
@@ -941,7 +958,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
         .diagnostics_output_is_tty = diagnostics_output_is_tty,
     });
 
-    const exit_status = proxy_worker.runLocalStream(allocator, &starter, .{
+    const exit_status = proxy_worker.runLocalStream(blocking, allocator, &starter, .{
         .guid = proxy_guid,
         .proxy_host = "localhost",
         .proxy_port = proxy_port,
@@ -965,6 +982,7 @@ pub fn runProxyStream(allocator: std.mem.Allocator, exe: []const u8, args: []con
 
 const ProxyStreamFdPassOptions = struct {
     allocator: std.mem.Allocator,
+    blocking: core_blocking.Blocking,
     exe: []const u8,
     invocation: proxy_entry.Invocation,
     stream_target: SshTarget,
@@ -977,9 +995,9 @@ fn runProxyStreamFdPass(options: ProxyStreamFdPassOptions) !void {
     // command asks sesshd to acquire the SSH transport, passes one socketpair end
     // with SCM_RIGHTS, and gives the other end to OpenSSH.
     var daemon_fd = core_fds.OwnedFd.init(if (options.invocation.daemon_dir_name) |dir_name|
-        try daemon_client.connectOrStartForDirName(options.allocator, options.exe, dir_name)
+        try daemon_client.connectOrStartForDirName(options.blocking, options.allocator, options.exe, dir_name)
     else
-        try daemon_client.connectOrStart(options.allocator, options.exe));
+        try daemon_client.connectOrStart(options.blocking, options.allocator, options.exe));
     defer daemon_fd.deinit();
 
     var transport = pb.ClientDaemonItem.SshTransportAcquire{

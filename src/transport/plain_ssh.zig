@@ -309,7 +309,7 @@ const SshProcessDiagnosticsWait = struct {
     fn deinit(_: *SshProcessDiagnosticsWait) void {}
 
     fn run(self: *SshProcessDiagnosticsWait) !void {
-        // PROCESS_EVENT_LOOP: foreground plain-ssh fallback wait. The loop owns
+        // foreground plain-ssh fallback wait. The loop owns
         // only the ssh process status timer and optional diagnostics fd; it
         // does not run inside sesshd or a pooled transport.
         while (true) {
@@ -398,7 +398,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
         diagnostics.deinit();
     }
 
-    // PROCESS_EVENT_LOOP: this foreground process is only relaying the local
+    // this foreground process is only relaying the local
     // PTY, user input, and diagnostics for one visible ssh invocation.
     while (true) {
         refreshLocalPtySize(local_pty.master_fd, &size);
@@ -416,7 +416,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
                 },
                 .would_block => {},
                 .eof => {
-                    // BLOCKING_WAIT: foreground local-PTY relay exit. The PTY
+                    // foreground local-PTY relay exit. The PTY
                     // has closed and this process is only collecting ssh status.
                     const term = local_pty.wait();
                     local_pty.closeMaster();
@@ -427,7 +427,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
         }
         if (poll.pty_event) |event| {
             if ((event.hangup or event.error_event or event.invalid) and !event.readable) {
-                // BLOCKING_WAIT: foreground local-PTY relay exit. The PTY has
+                // foreground local-PTY relay exit. The PTY has
                 // closed and this process is only collecting ssh status.
                 const term = local_pty.wait();
                 local_pty.closeMaster();
@@ -468,7 +468,7 @@ const LocalPtyRelayPoll = struct {
     fn deinit(_: *LocalPtyRelayPoll) void {}
 
     fn run(self: *LocalPtyRelayPoll) !void {
-        // PROCESS_EVENT_LOOP: foreground local-PTY relay; no daemon work is
+        // foreground local-PTY relay; no daemon work is
         // serviced by this process while this loop is running.
         var poll_set = LocalPtyRelayPollSet{};
         poll_set.add(self.pty_fd, posix.POLL.IN, .pty);
@@ -565,7 +565,7 @@ pub fn runArgv(allocator: std.mem.Allocator, ssh_args: []const []const u8, diagn
     ssh_process.stderr_behavior = .Inherit;
     try ssh_process.spawn();
 
-    // BLOCKING_WAIT: foreground plain-ssh path. At this point the spawned
+    // foreground plain-ssh path. At this point the spawned
     // `ssh` process owns the user-visible session and there is no sessh daemon
     // workload in this process to keep responsive.
     const term = try ssh_process.wait();

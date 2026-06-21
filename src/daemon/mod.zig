@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 
 const config = @import("../core/config.zig");
+const core_blocking = @import("../core/blocking.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
 const io = @import("../core/io.zig");
@@ -39,12 +40,12 @@ pub fn connect(allocator: std.mem.Allocator) !c.fd_t {
     return daemon_client.connect(allocator);
 }
 
-pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
-    return daemon_client.ensureStarted(allocator, exe);
+pub fn ensureStarted(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8) !void {
+    return daemon_client.ensureStarted(blocking, allocator, exe);
 }
 
-pub fn forwardBrokerToDaemon(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
-    return daemon_broker_bridge.forwardBrokerToDaemon(allocator, exe, args);
+pub fn forwardBrokerToDaemon(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+    return daemon_broker_bridge.forwardBrokerToDaemon(blocking, allocator, exe, args);
 }
 
 pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
@@ -68,7 +69,7 @@ pub fn reexecDaemonOrRun(allocator: std.mem.Allocator, exe: []const u8, args: []
 /// lock until the listening socket, role symlinks, cleanup scheduler, and single
 /// process-wide dispatcher are all installed, then exits only after idle
 /// shutdown sees no clients, mux tunnels, or cleanup work.
-pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     var ready_fd = daemon_startup.inheritedReadyFd();
     var startup_lock_fd = daemon_startup.inheritedStartupLockFd();
     defer {
@@ -87,7 +88,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     socket_transport.publishSesshRuntimeDirSymlinkOnce(allocator);
     const path = try socketPathForDirName(allocator, dir_name);
     defer allocator.free(path);
-    const identity = try daemon_identity.current(allocator, path);
+    const identity = try daemon_identity.current(blocking, allocator, path);
     defer allocator.free(identity.start_time);
 
     var daemon_lock = try acquireDaemonSocketLock(allocator, dir_name, path);
@@ -102,11 +103,10 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     daemon_startup.closeStartupLockFd(&startup_lock_fd);
     daemon_log.infof(allocator, "daemon started socket={s}", .{path});
 
-    // PROCESS_DISPATCHER: sesshd has exactly one Dispatcher. Daemon helpers
-    // receive this pointer when they need fd/timer events; they should not
-    // construct nested dispatchers.
-    var daemon_dispatcher = try dispatcher.Dispatcher.init(allocator);
-    defer daemon_dispatcher.deinit();
+    // sesshd has exactly one Dispatcher, initialized by
+    // main before role dispatch. Daemon helpers receive this pointer when they
+    // need fd/timer events; they should not construct nested dispatchers.
+    const daemon_dispatcher = dispatcher.get();
 
     var accept_context = daemon_accept.Context{
         .allocator = allocator,
@@ -119,7 +119,7 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
     const file_config = client_config.loadFileConfig(allocator) catch client_config.FileConfig{};
     var cleanup_context = daemon_cleanup_scheduler.Context{
         .allocator = allocator,
-        .daemon_dispatcher = &daemon_dispatcher,
+        .daemon_dispatcher = daemon_dispatcher,
         .cleanup_wakeup_interval_ms = file_config.cleanup_wakeup_interval_ms orelse config.default_cleanup_wakeup_interval_ms,
         .cleanup_retry_limit_ms = file_config.cleanup_retry_limit_ms orelse config.default_cleanup_retry_limit_ms,
     };
@@ -138,8 +138,8 @@ pub fn run(allocator: std.mem.Allocator, exe: []const u8, args: []const []const 
             .callback = daemon_accept.acceptDaemonClient,
         },
     });
-    try daemon_shutdown.watchIdle(&idle_context, &daemon_dispatcher);
-    try daemon_dispatcher.run();
+    try daemon_shutdown.watchIdle(&idle_context, daemon_dispatcher);
+    try blocking.runLoop();
 }
 
 const DaemonSocketLock = struct {

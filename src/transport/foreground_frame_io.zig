@@ -25,7 +25,7 @@ pub fn readFrame(options: ReadOptions) !protocol.OwnedFrame {
     var reader = protocol.FrameReader.init(options.allocator);
     defer reader.deinit();
 
-    // PROCESS_EVENT_LOOP: foreground setup/reconnect reads are process-local
+    // foreground setup/reconnect reads are process-local
     // waits before a richer relay loop owns the fd. Use direct `poll(2)` here
     // instead of allocating a helper Dispatcher; the Dispatcher abstraction is
     // reserved for whole-process event loops.
@@ -154,7 +154,7 @@ fn writeBufferWithFdProgress(fd: c.fd_t, progress: *fd_passing.SendBufferWithFdP
 }
 
 fn waitForegroundWritable(fd: c.fd_t) !void {
-    // BLOCKING_POLL: this module is only used by short setup paths before a
+    // this module is only used by short setup paths before a
     // dispatcher-owned relay loop exists. Keep the synchronous wait local and
     // auditable instead of letting foreground callers each grow their own poll
     // loop.

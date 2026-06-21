@@ -398,7 +398,7 @@ fn readBootstrapLine(
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
 
-    // BLOCKING_POLL: foreground SSH bootstrap read. With reconnect UI active,
+    // foreground SSH bootstrap read. With reconnect UI active,
     // the finite timeout lets local cancellation interleave with pipe reads.
     while (line.items.len < 4096) {
         var pollfds = [_]posix.pollfd{.{

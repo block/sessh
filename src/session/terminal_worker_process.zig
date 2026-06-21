@@ -2,13 +2,14 @@ const std = @import("std");
 const c = std.c;
 
 const app_allocator = @import("../core/app_allocator.zig");
+const core_blocking = @import("../core/blocking.zig");
 const guid_ref = @import("../core/guid.zig");
 const terminal_worker = @import("terminal_worker.zig");
 const worker_process = @import("../core/worker_process.zig");
 
 var terminal_remote_socket_sequence: u64 = 0;
 
-pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
+pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, args: []const []const u8) !void {
     var listener = try worker_process.prepareInheritedListener(allocator, .{
         .args = args,
         .expected_arg_count = 3,
@@ -17,7 +18,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer listener.deinit();
     const session_guid = args[2];
 
-    try terminal_worker.runTerminalWorkerLoop(session_guid, listener.fd);
+    try terminal_worker.runTerminalWorkerLoop(blocking, session_guid, listener.fd);
 }
 
 pub fn start(allocator: std.mem.Allocator, exe: []const u8, session_guid: []const u8) !*terminal_worker.TerminalWorkerHandle {

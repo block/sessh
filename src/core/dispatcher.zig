@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
+const dispatch_io = @import("dispatch_io.zig");
 const NonSuspendingTimer = @import("non_suspending_timer.zig").NonSuspendingTimer;
 
 /// A small single-threaded event dispatcher built on `poll(2)`.
@@ -11,8 +12,9 @@ const NonSuspendingTimer = @import("non_suspending_timer.zig").NonSuspendingTime
 /// in a deadline min-heap, so finding the next timeout is O(1) and cancellation
 /// is O(log n) without making `poll(2)` scan timer-only entries.
 ///
-/// Production code should treat a Dispatcher as the process event loop, owned
-/// by the process entrypoint and passed to helpers. Helpers should not allocate
+/// Production code should treat a Dispatcher as the process event loop.
+/// Entrypoints initialize the global Dispatcher before dispatching to role code;
+/// helpers get that existing loop with `dispatcher.get()` instead of allocating
 /// short-lived Dispatchers to emulate sleeps, timeouts, or one-off polling.
 pub const FdWatchId = struct {
     index: usize,
@@ -24,9 +26,19 @@ pub const TimerWatchId = struct {
     generation: u64,
 };
 
+pub const DispatchTaskId = struct {
+    index: usize,
+    generation: u64,
+};
+
 pub const WatchId = union(enum) {
     fd: FdWatchId,
     timer: TimerWatchId,
+};
+
+pub const LoopExit = enum {
+    explicit,
+    implicit,
 };
 
 pub const FdEvents = struct {
@@ -100,10 +112,40 @@ const TimerWatchSlot = struct {
     heap_index: ?usize = null,
 };
 
+const DispatchTaskSlot = struct {
+    generation: u64 = 0,
+    active: bool = false,
+    task: dispatch_io.DispatchTask = undefined,
+};
+
 const PendingEvent = struct {
     id: WatchId,
     event: Event,
 };
+
+const TaskPollRef = union(enum) {
+    source: dispatch_io.Source,
+    sink: dispatch_io.Sink,
+};
+
+var global_dispatcher: ?Dispatcher = null;
+
+pub fn initGlobal(allocator: std.mem.Allocator) !void {
+    if (global_dispatcher != null) @panic("global Dispatcher initialized twice");
+    global_dispatcher = try Dispatcher.init(allocator);
+}
+
+pub fn get() *Dispatcher {
+    if (global_dispatcher == null) @panic("global Dispatcher used before initialization");
+    return &global_dispatcher.?;
+}
+
+pub fn deinitGlobal() void {
+    if (global_dispatcher) |*instance| {
+        instance.deinit();
+        global_dispatcher = null;
+    }
+}
 
 pub const Dispatcher = struct {
     allocator: std.mem.Allocator,
@@ -114,12 +156,19 @@ pub const Dispatcher = struct {
     timer_watches: std.ArrayList(TimerWatchSlot) = .empty,
     free_timer_watches: std.ArrayList(usize) = .empty,
     timer_heap: std.ArrayList(TimerWatchId) = .empty,
+    dispatch_tasks: std.ArrayList(DispatchTaskSlot) = .empty,
+    free_dispatch_tasks: std.ArrayList(usize) = .empty,
     pending_events: std.ArrayList(PendingEvent) = .empty,
+    poll_scratch: std.ArrayList(posix.pollfd) = .empty,
+    task_poll_refs: std.ArrayList(TaskPollRef) = .empty,
     next_fd_dispatch_index: usize = 0,
+    next_task_dispatch_index: usize = 0,
     active_count: usize = 0,
+    active_task_count: usize = 0,
     running: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !Dispatcher {
+        if (global_dispatcher != null) @panic("Dispatcher.init called while global Dispatcher is initialized");
         return .{
             .allocator = allocator,
             .clock = try NonSuspendingTimer.start(),
@@ -127,7 +176,11 @@ pub const Dispatcher = struct {
     }
 
     pub fn deinit(self: *Dispatcher) void {
+        self.task_poll_refs.deinit(self.allocator);
+        self.poll_scratch.deinit(self.allocator);
         self.pending_events.deinit(self.allocator);
+        self.free_dispatch_tasks.deinit(self.allocator);
+        self.dispatch_tasks.deinit(self.allocator);
         self.timer_heap.deinit(self.allocator);
         self.free_timer_watches.deinit(self.allocator);
         self.timer_watches.deinit(self.allocator);
@@ -255,11 +308,39 @@ pub const Dispatcher = struct {
         self.running = false;
     }
 
-    pub fn run(self: *Dispatcher) !void {
+    pub fn scheduleTask(self: *Dispatcher, task: dispatch_io.DispatchTask) !DispatchTaskId {
+        const reused = self.free_dispatch_tasks.items.len != 0;
+        const index = if (reused) self.free_dispatch_tasks.items[self.free_dispatch_tasks.items.len - 1] else self.dispatch_tasks.items.len;
+        if (!reused) {
+            try self.free_dispatch_tasks.ensureTotalCapacity(self.allocator, index + 1);
+        }
+        const generation = if (reused) self.dispatch_tasks.items[index].generation else 0;
+        if (reused) {
+            _ = self.free_dispatch_tasks.pop();
+        } else {
+            try self.dispatch_tasks.append(self.allocator, .{});
+            errdefer _ = self.dispatch_tasks.pop();
+        }
+        self.dispatch_tasks.items[index] = .{
+            .generation = generation,
+            .active = true,
+            .task = task,
+        };
+        self.active_task_count += 1;
+        return .{
+            .index = index,
+            .generation = generation,
+        };
+    }
+
+    pub fn loopForBlocking(self: *Dispatcher) !LoopExit {
+        if (self.running) return error.DispatcherAlreadyRunning;
         self.running = true;
-        while (self.running and self.active_count != 0) {
+        defer self.running = false;
+        while (self.running and self.activeWatchCount() != 0) {
             _ = try self.runOnce();
         }
+        return if (self.running) .implicit else .explicit;
     }
 
     /// Wait for fd readiness or the nearest timer deadline, collect the ready
@@ -267,14 +348,17 @@ pub const Dispatcher = struct {
     /// first makes callback-side cancellation safe and rotates the fd start index
     /// so a constantly-ready low-numbered fd cannot starve later watches.
     pub fn runOnce(self: *Dispatcher) !usize {
-        if (self.active_count == 0) return 0;
+        if (self.activeWatchCount() == 0) return 0;
 
         const now_before_poll = self.nowMs();
-        const nearest_deadline = self.nearestTimerDeadline();
+        const nearest_deadline = minOptionalDeadline(self.nearestTimerDeadline(), self.nearestTaskDeadline());
+        const task_ready = self.anyTaskReady(now_before_poll);
         const timeout_ms = pollTimeoutMs(now_before_poll, nearest_deadline);
-        if (self.pollfds.items.len == 0 and timeout_ms < 0) return 0;
+        try self.rebuildPollScratch(now_before_poll);
+        if (self.poll_scratch.items.len == 0 and timeout_ms < 0 and !task_ready) return 0;
         for (self.pollfds.items) |*pollfd| pollfd.revents = 0;
-        const ready = try posix.poll(self.pollfds.items, timeout_ms);
+        for (self.poll_scratch.items) |*pollfd| pollfd.revents = 0;
+        const ready = try posix.poll(self.poll_scratch.items, if (task_ready) 0 else timeout_ms);
         const now_after_poll = self.nowMs();
 
         self.pending_events.clearRetainingCapacity();
@@ -285,7 +369,7 @@ pub const Dispatcher = struct {
             var offset: usize = 0;
             while (offset < pollfd_count) : (offset += 1) {
                 const index = (self.next_fd_dispatch_index + offset) % pollfd_count;
-                const pollfd = self.pollfds.items[index];
+                const pollfd = self.poll_scratch.items[index];
                 if (pollfd.revents == 0) continue;
                 if (first_ready_index == null) first_ready_index = index;
                 const fd_id = self.fdWatchIdForIndex(index);
@@ -299,6 +383,7 @@ pub const Dispatcher = struct {
             if (first_ready_index) |index| {
                 self.next_fd_dispatch_index = (index + 1) % pollfd_count;
             }
+            try self.dispatchReadyTaskIo(self.poll_scratch.items[pollfd_count..]);
         }
 
         while (self.peekExpiredTimer(now_after_poll)) |timer_id| {
@@ -332,6 +417,7 @@ pub const Dispatcher = struct {
             }
             dispatched += 1;
         }
+        dispatched += try self.dispatchReadyTasks(now_after_poll);
         return dispatched;
     }
 
@@ -363,6 +449,14 @@ pub const Dispatcher = struct {
         slot.heap_index = null;
         self.active_count -= 1;
         self.free_timer_watches.appendAssumeCapacity(index);
+    }
+
+    fn cancelTask(self: *Dispatcher, id: DispatchTaskId) void {
+        const slot = self.taskSlotForId(id) orelse return;
+        slot.active = false;
+        slot.generation += 1;
+        self.active_task_count -= 1;
+        self.free_dispatch_tasks.appendAssumeCapacity(id.index);
     }
 
     fn nearestTimerDeadline(self: *const Dispatcher) ?u64 {
@@ -431,6 +525,124 @@ pub const Dispatcher = struct {
         if (!slot.active) return null;
         if (slot.generation != id.generation) return null;
         return slot;
+    }
+
+    fn taskSlotForId(self: *Dispatcher, id: DispatchTaskId) ?*DispatchTaskSlot {
+        if (id.index >= self.dispatch_tasks.items.len) return null;
+        const slot = &self.dispatch_tasks.items[id.index];
+        if (!slot.active) return null;
+        if (slot.generation != id.generation) return null;
+        return slot;
+    }
+
+    fn activeWatchCount(self: *const Dispatcher) usize {
+        return self.active_count + self.active_task_count;
+    }
+
+    fn rebuildPollScratch(self: *Dispatcher, now_ms: u64) !void {
+        self.poll_scratch.clearRetainingCapacity();
+        self.task_poll_refs.clearRetainingCapacity();
+        try self.poll_scratch.appendSlice(self.allocator, self.pollfds.items);
+
+        for (self.dispatch_tasks.items) |slot| {
+            if (!slot.active) continue;
+            const task = slot.task;
+            for (task.sinks) |sink| {
+                if (!sink.hasQueuedBytes()) continue;
+                try self.task_poll_refs.append(self.allocator, .{ .sink = sink });
+                try self.poll_scratch.append(self.allocator, .{
+                    .fd = sink.fd(),
+                    .events = posix.POLL.OUT,
+                    .revents = 0,
+                });
+            }
+            if (task.not_before_ms) |deadline| {
+                if (deadline > now_ms) continue;
+            }
+            var sinks_ready = true;
+            for (task.sinks) |sink| {
+                if (!sink.belowWatermark()) {
+                    sinks_ready = false;
+                    break;
+                }
+            }
+            if (!sinks_ready) continue;
+            for (task.sources) |source| {
+                if (source.hasReadyUnit()) continue;
+                try self.task_poll_refs.append(self.allocator, .{ .source = source });
+                try self.poll_scratch.append(self.allocator, .{
+                    .fd = source.fd(),
+                    .events = posix.POLL.IN,
+                    .revents = 0,
+                });
+            }
+        }
+    }
+
+    fn dispatchReadyTaskIo(self: *Dispatcher, task_pollfds: []const posix.pollfd) !void {
+        for (task_pollfds, self.task_poll_refs.items) |pollfd, ref| {
+            if (pollfd.revents == 0) continue;
+            switch (ref) {
+                .source => |source| {
+                    if ((pollfd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+                        _ = try source.readReady();
+                    }
+                },
+                .sink => |sink| {
+                    if ((pollfd.revents & (posix.POLL.OUT | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+                        _ = try sink.writeReady();
+                    }
+                },
+            }
+        }
+    }
+
+    fn dispatchReadyTasks(self: *Dispatcher, now_ms: u64) !usize {
+        if (self.active_task_count == 0) return 0;
+
+        const dispatch_limit = self.active_task_count;
+        var dispatched: usize = 0;
+        while (dispatched < dispatch_limit) {
+            const index = self.nextReadyTaskIndex(now_ms) orelse break;
+            const id = DispatchTaskId{
+                .index = index,
+                .generation = self.dispatch_tasks.items[index].generation,
+            };
+            const task = self.dispatch_tasks.items[index].task;
+            self.next_task_dispatch_index = (index + 1) % self.dispatch_tasks.items.len;
+            switch (try task.run()) {
+                .done => self.cancelTask(id),
+                .pending => {},
+            }
+            dispatched += 1;
+        }
+        return dispatched;
+    }
+
+    fn nextReadyTaskIndex(self: *Dispatcher, now_ms: u64) ?usize {
+        if (self.dispatch_tasks.items.len == 0) return null;
+        var offset: usize = 0;
+        while (offset < self.dispatch_tasks.items.len) : (offset += 1) {
+            const index = (self.next_task_dispatch_index + offset) % self.dispatch_tasks.items.len;
+            const slot = self.dispatch_tasks.items[index];
+            if (!slot.active) continue;
+            if (slot.task.readyAt(now_ms)) return index;
+        }
+        return null;
+    }
+
+    fn anyTaskReady(self: *Dispatcher, now_ms: u64) bool {
+        return self.nextReadyTaskIndex(now_ms) != null;
+    }
+
+    fn nearestTaskDeadline(self: *const Dispatcher) ?u64 {
+        var nearest: ?u64 = null;
+        for (self.dispatch_tasks.items) |slot| {
+            if (!slot.active) continue;
+            const deadline = slot.task.not_before_ms orelse continue;
+            nearest = minOptionalDeadline(nearest, deadline);
+        }
+        return nearest;
     }
 
     fn removeTimerHeapIndex(self: *Dispatcher, heap_index: usize) void {
@@ -538,6 +750,14 @@ fn pollTimeoutMs(now_ms: u64, nearest_deadline: ?u64) i32 {
     return @intCast(@min(deadline - now_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
 }
 
+fn minOptionalDeadline(lhs: ?u64, rhs: ?u64) ?u64 {
+    if (lhs) |lhs_value| {
+        if (rhs) |rhs_value| return @min(lhs_value, rhs_value);
+        return lhs_value;
+    }
+    return rhs;
+}
+
 test "dispatcher fires timer watch" {
     const Context = struct {
         fired: bool = false,
@@ -560,8 +780,43 @@ test "dispatcher fires timer watch" {
     defer dispatcher.deinit();
     var context = Context{};
     _ = try dispatcher.watchTimerAfter(1, .{ .ctx = &context, .callback = Context.onTimer });
-    try dispatcher.run();
+    _ = try dispatcher.loopForBlocking();
     try std.testing.expect(context.fired);
+}
+
+test "dispatcher runs DispatchTask when its source has bytes" {
+    const Context = struct {
+        source: *dispatch_io.ByteSource,
+        value: []const u8 = &.{},
+
+        fn run(ctx: *anyopaque) !dispatch_io.DispatchTaskStatus {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.value = self.source.queuedBytes();
+            return .done;
+        }
+    };
+
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var source = try dispatch_io.ByteSource.init(std.testing.allocator, fds[0], 8);
+    defer source.deinit();
+
+    var context = Context{ .source = &source };
+    var sources = [_]dispatch_io.Source{source.source()};
+
+    var dispatcher = try Dispatcher.init(std.testing.allocator);
+    defer dispatcher.deinit();
+    _ = try dispatcher.scheduleTask(.{
+        .ctx = &context,
+        .sources = &sources,
+        .runFn = Context.run,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], "x"));
+    try std.testing.expectEqual(LoopExit.implicit, try dispatcher.loopForBlocking());
+    try std.testing.expectEqualStrings("x", context.value);
 }
 
 test "dispatcher dispatches fd readability and supports cancellation" {
@@ -602,7 +857,7 @@ test "dispatcher dispatches fd readability and supports cancellation" {
         .handler = .{ .ctx = &context, .callback = Context.onReadable },
     });
     try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], "x"));
-    try dispatcher.run();
+    _ = try dispatcher.loopForBlocking();
     try std.testing.expectEqual(@as(u8, 'x'), context.read_byte);
     try std.testing.expectEqual(@as(usize, 0), dispatcher.active_count);
     try std.testing.expectEqual(@as(c.fd_t, -1), dispatcher.pollfds.items[0].fd);
@@ -742,7 +997,7 @@ test "dispatcher timer heap fires earliest timer first without scanning pollfds"
     _ = try dispatcher.watchTimerAt(now + 1, .{ .ctx = &context, .callback = Context.onTimer });
 
     try std.testing.expectEqual(@as(usize, 0), dispatcher.pollfds.items.len);
-    try dispatcher.run();
+    _ = try dispatcher.loopForBlocking();
     try std.testing.expectEqual(@as(usize, 2), context.fired.items.len);
     try std.testing.expect(context.fired.items[0] <= context.fired.items[1]);
 }

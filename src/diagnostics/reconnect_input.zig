@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const io_helpers = @import("../core/io.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const terminal = @import("../tty/terminal.zig");
@@ -35,6 +36,7 @@ pub const State = struct {
 
     pub fn poll(
         self: *State,
+        blocking: core_blocking.Blocking,
         options: PollOptions,
     ) !Decision {
         // Reconnect UI is intentionally local to the visible client process. It
@@ -54,10 +56,7 @@ pub const State = struct {
             },
         };
         const poll_count: usize = if (options.diagnostic_notify_read_fd >= 0) 2 else 1;
-        // BLOCKING_POLL: visible-client reconnect UI wait. This process has no
-        // daemon dispatcher work to service while disconnected; the timeout is
-        // the UI refresh cadence for overlay/status updates.
-        const ready = try posix.poll(
+        const ready = try blocking.poll(
             pollfds[0..poll_count],
             self.effectivePollTimeout(options.timeout_ms, options.overlay_presentation, options.now_ms),
         );
@@ -165,7 +164,7 @@ test "reconnect input returns reconnect_now for ctrl-r" {
     var state = State{};
     try std.testing.expectEqual(
         Decision.reconnect_now,
-        try state.poll(.{
+        try state.poll(core_blocking.fromTest(), .{
             .terminal_fds = .{
                 .input = input[0],
                 .output = output[1],
@@ -193,7 +192,7 @@ test "reconnect input records ordinary input during disconnect" {
     var state = State{};
     try std.testing.expectEqual(
         Decision.wait_elapsed,
-        try state.poll(.{
+        try state.poll(core_blocking.fromTest(), .{
             .terminal_fds = .{
                 .input = input[0],
                 .output = output[1],

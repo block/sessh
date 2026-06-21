@@ -3,6 +3,7 @@
 // screen/repaint state back through daemon-owned mux streams.
 const std = @import("std");
 const app_allocator = @import("../core/app_allocator.zig");
+const core_blocking = @import("../core/blocking.zig");
 const c = std.c;
 const posix = std.posix;
 
@@ -347,23 +348,22 @@ pub fn startTerminalWorkerInDaemon(
     return control;
 }
 
-pub fn runTerminalWorkerLoop(session_guid: []const u8, listen_fd: c.fd_t) !void {
+pub fn runTerminalWorkerLoop(blocking: core_blocking.Blocking, session_guid: []const u8, listen_fd: c.fd_t) !void {
     var worker = DispatcherTerminalWorker{
         .allocator = app_allocator.allocator(),
         .terminal_worker = .{
             .fixed_session_id = session_guid,
         },
     };
-    // PROCESS_EVENT_LOOP: process-isolated terminal worker. When isolation mode
-    // puts the terminal worker outside sesshd, this Dispatcher owns the worker
-    // listen socket, PTY, and visible-client connection for that process.
-    var worker_dispatcher = try dispatcher.Dispatcher.init(app_allocator.allocator());
-    defer worker_dispatcher.deinit();
-    defer worker.deinit(&worker_dispatcher);
+    // process-isolated terminal worker. When isolation mode
+    // puts the terminal worker outside sesshd, the process Dispatcher owns the
+    // worker listen socket, PTY, and visible-client connection.
+    const worker_dispatcher = dispatcher.get();
+    defer worker.deinit(worker_dispatcher);
 
-    try worker.watchListenFd(&worker_dispatcher, listen_fd);
-    try worker.updateWatches(&worker_dispatcher);
-    try worker_dispatcher.run();
+    try worker.watchListenFd(worker_dispatcher, listen_fd);
+    try worker.updateWatches(worker_dispatcher);
+    try blocking.runLoop();
 }
 
 fn connectTerminalWorkerHandle(allocator: std.mem.Allocator, guid: []const u8) !c.fd_t {

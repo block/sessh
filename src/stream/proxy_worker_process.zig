@@ -1,9 +1,10 @@
 const std = @import("std");
 
+const core_blocking = @import("../core/blocking.zig");
 const proxy_worker = @import("proxy_worker.zig");
 const worker_process = @import("../core/worker_process.zig");
 
-pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
+pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, args: []const []const u8) !void {
     var listener = try worker_process.prepareInheritedListener(allocator, .{
         .args = args,
         .expected_arg_count = 5,
@@ -15,6 +16,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const proxy_port = try std.fmt.parseInt(u16, args[4], 10);
 
     try proxy_worker.runRemoteWorker(.{
+        .blocking = blocking,
         .allocator = allocator,
         .guid = guid,
         .replacement_listen_fd = listener.fd,
@@ -24,5 +26,5 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 test "proxy worker process rejects invalid argv" {
-    try std.testing.expectError(error.InvalidProxyRemoteArgs, run(std.testing.allocator, &.{}));
+    try std.testing.expectError(error.InvalidProxyRemoteArgs, run(core_blocking.fromTest(), std.testing.allocator, &.{}));
 }

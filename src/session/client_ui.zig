@@ -7,6 +7,7 @@ const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
 const client_log = @import("../core/client_log.zig");
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const fixed_buffer = @import("../core/fixed_buffer.zig");
 const client_renderer = @import("renderer.zig");
@@ -120,21 +121,23 @@ pub const ReconnectUi = struct {
     resize_generation: u64 = 0,
     forwarded_resize_generation: u64 = 0,
     append_only_retry_announced: bool = false,
+    blocking: core_blocking.Blocking,
 
-    pub fn begin(viewport_offset: i32) !ReconnectUi {
-        return beginWithPresentation(viewport_offset, .overlay);
+    pub fn begin(blocking: core_blocking.Blocking, viewport_offset: i32) !ReconnectUi {
+        return beginWithPresentation(blocking, viewport_offset, .overlay);
     }
 
-    pub fn beginWithPresentation(viewport_offset: i32, presentation: ReconnectPresentation) !ReconnectUi {
-        return beginWithOptions(viewport_offset, .{ .presentation = presentation });
+    pub fn beginWithPresentation(blocking: core_blocking.Blocking, viewport_offset: i32, presentation: ReconnectPresentation) !ReconnectUi {
+        return beginWithOptions(blocking, viewport_offset, .{ .presentation = presentation });
     }
 
-    pub fn beginWithOptions(viewport_offset: i32, options: ReconnectUiOptions) !ReconnectUi {
+    pub fn beginWithOptions(blocking: core_blocking.Blocking, viewport_offset: i32, options: ReconnectUiOptions) !ReconnectUi {
         // Reconnect UI temporarily owns the diagnostics terminal: raw mode is
         // needed for Ctrl-R/~. controls, while title/status/overlay rendering
         // depends on whether the diagnostics destination is a tty.
         const title_enabled = (options.presentation == .overlay or options.presentation == .title) and c.isatty(options.terminal_fds.output) != 0;
         var ui = ReconnectUi{
+            .blocking = blocking,
             .mode_guard = try terminal.TerminalModeGuard.enable(options.terminal_fds.input),
             .clock = try NonSuspendingTimer.start(),
             .terminal_fds = options.terminal_fds,
@@ -346,7 +349,7 @@ pub const ReconnectUi = struct {
     }
 
     fn pollInput(self: *ReconnectUi, timeout_ms: i32) !ReconnectDecision {
-        return self.reconnect_input_state.poll(.{
+        return self.reconnect_input_state.poll(self.blocking, .{
             .terminal_fds = self.terminal_fds,
             .diagnostic_notify_read_fd = self.diagnostic_notify_pipe.readFd(),
             .timeout_ms = timeout_ms,
@@ -636,6 +639,7 @@ test "DiagnosticNotifyPipe receives user diagnostic wakeup" {
 
 test "ReconnectUi records resize event for terminal worker forwarding" {
     var ui = ReconnectUi{
+        .blocking = core_blocking.fromTest(),
         .mode_guard = undefined,
         .presentation = .none,
         .last_size = .{ .rows = 0, .cols = 0 },
@@ -652,6 +656,7 @@ test "ReconnectUi writes append-only diagnostics to configured line fd" {
     defer posix.close(fds[0]);
 
     var ui = ReconnectUi{
+        .blocking = core_blocking.fromTest(),
         .mode_guard = undefined,
         .presentation = .line,
         .line_fd = fds[1],
@@ -683,6 +688,7 @@ test "ReconnectUi reads reconnect controls from configured input fd" {
     try io_helpers.writeAll(fds[1], &.{reconnect_control.ctrl_r});
 
     var ui = ReconnectUi{
+        .blocking = core_blocking.fromTest(),
         .mode_guard = undefined,
         .presentation = .none,
         .terminal_fds = .{ .input = fds[0], .output = -1 },
@@ -694,7 +700,7 @@ test "ReconnectUi reads reconnect controls from configured input fd" {
 }
 
 test "reconnect switch disposition distinguishes typing paste and unresponsive" {
-    var ui = ReconnectUi{ .mode_guard = undefined };
+    var ui = ReconnectUi{ .blocking = core_blocking.fromTest(), .mode_guard = undefined };
     try std.testing.expectEqual(
         ReconnectSwitchDisposition.automatic,
         ui.reconnectSwitchDisposition(.{}),

@@ -1,11 +1,12 @@
 const std = @import("std");
 
+const core_blocking = @import("../core/blocking.zig");
 const process_exit = @import("../core/process_exit.zig");
 const transport_ssh = @import("../transport/ssh.zig");
 const user_error = @import("../core/user_error.zig");
 const sessh_cli = @import("cli.zig");
 
-pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
+pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Public sessh is an ssh-shaped CLI adapter. After parsing, all real work
     // goes through the transport/session path that owns daemon startup,
     // bootstrap, proxy routing, and terminal emulation.
@@ -21,6 +22,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     return transport_ssh.runRemoteNewSession(allocator, .{
+        .blocking = blocking,
         .exe = args[0],
         .ssh_options = parsed.ssh_options,
         .host = parsed.host,

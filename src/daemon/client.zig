@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const io = @import("../core/io.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
@@ -31,30 +32,30 @@ pub fn connect(allocator: std.mem.Allocator) !c.fd_t {
     return connectForDirName(allocator, dir_name);
 }
 
-pub fn ensureStarted(allocator: std.mem.Allocator, exe: []const u8) !void {
-    var fd = core_fds.OwnedFd.init(try connectOrStart(allocator, exe));
+pub fn ensureStarted(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8) !void {
+    var fd = core_fds.OwnedFd.init(try connectOrStart(blocking, allocator, exe));
     defer fd.deinit();
 }
 
-pub fn ensureStartedForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
-    var fd = core_fds.OwnedFd.init(try connectOrStartForDirName(allocator, exe, dir_name));
+pub fn ensureStartedForDirName(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !void {
+    var fd = core_fds.OwnedFd.init(try connectOrStartForDirName(blocking, allocator, exe, dir_name));
     defer fd.deinit();
 }
 
-pub fn connectOrStart(allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
+pub fn connectOrStart(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8) !c.fd_t {
     const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
-    return connectOrStartForDirName(allocator, exe, dir_name);
+    return connectOrStartForDirName(blocking, allocator, exe, dir_name);
 }
 
 // Foreground startup path shared by sessh, sesshd reexec helpers, and proxy
 // roles. It owns the daemon startup lock/ready-pipe choreography so daemon
 // daemon client code does not duplicate client-side spawn behavior.
-pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
+pub fn connectOrStartForDirName(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
     if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
 
     var startup_lock = (try daemon_startup.tryAcquireStartupLock(allocator, dir_name)) orelse {
-        try daemon_startup.waitForStartupLockRelease(allocator, dir_name);
+        try daemon_startup.waitForStartupLockRelease(blocking, allocator, dir_name);
         return connectAndHandshakeForDirName(allocator, dir_name);
     };
     defer startup_lock.deinit();
@@ -73,7 +74,7 @@ pub fn connectOrStartForDirName(allocator: std.mem.Allocator, exe: []const u8, d
         return error.DaemonDidNotStart;
     }
     pipe.closeWrite();
-    switch (try daemon_startup.waitForReady(&pipe)) {
+    switch (try daemon_startup.waitForReady(blocking, &pipe)) {
         .ready => return connectAndHandshakeForDirName(allocator, dir_name),
         .closed, .timed_out => return error.DaemonDidNotStart,
     }
@@ -112,19 +113,19 @@ fn spawnDaemonIfNamespaceUnlocked(options: DaemonSpawnOptions) !bool {
     return true;
 }
 
-pub fn printDaemonLog(allocator: std.mem.Allocator, exe: []const u8) !void {
+pub fn printDaemonLog(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8) !void {
     const dir_name = try socket_namespace.selectedDirName(allocator);
     defer allocator.free(dir_name);
     const path = try socketPathForDirName(allocator, dir_name);
     defer allocator.free(path);
 
-    const fd = try connectOrStartForDirName(allocator, exe, dir_name);
+    const fd = try connectOrStartForDirName(blocking, allocator, exe, dir_name);
     defer _ = c.close(fd);
     try io.writeAll(posix.STDOUT_FILENO, "daemon socket ");
     try io.writeAll(posix.STDOUT_FILENO, path);
     try io.writeAll(posix.STDOUT_FILENO, "\n");
 
-    var subscriber = try DaemonLogSubscriber.init(allocator, fd, posix.STDOUT_FILENO);
+    var subscriber = try DaemonLogSubscriber.init(blocking, allocator, fd, posix.STDOUT_FILENO);
     defer subscriber.deinit();
     try subscriber.run();
 }
@@ -136,8 +137,9 @@ fn daemonLogRequestWriter(allocator: std.mem.Allocator) !protocol.FrameWriteStat
 }
 
 const DaemonLogSubscriber = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
-    dispatcher: dispatcher.Dispatcher,
+    dispatcher: *dispatcher.Dispatcher,
     daemon_fd: c.fd_t,
     output_fd: c.fd_t,
     reader: protocol.FrameReader,
@@ -145,15 +147,16 @@ const DaemonLogSubscriber = struct {
     watch_id: ?dispatcher.FdWatchId = null,
     err: ?anyerror = null,
 
-    fn init(allocator: std.mem.Allocator, daemon_fd: c.fd_t, output_fd: c.fd_t) !DaemonLogSubscriber {
+    fn init(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, daemon_fd: c.fd_t, output_fd: c.fd_t) !DaemonLogSubscriber {
         var request_writer = try daemonLogRequestWriter(allocator);
         errdefer request_writer.deinit();
         return .{
+            .blocking = blocking,
             .allocator = allocator,
-            // PROCESS_EVENT_LOOP: `sessh --daemon-log` is a foreground
-            // subscriber. This Dispatcher owns only its daemon socket and
-            // stdout writes; it is not the long-lived sesshd dispatcher.
-            .dispatcher = try dispatcher.Dispatcher.init(allocator),
+            // `sessh --daemon-log` is a foreground
+            // subscriber. It registers daemon-socket readiness on the process
+            // Dispatcher; it is not the long-lived sesshd process.
+            .dispatcher = dispatcher.get(),
             .daemon_fd = daemon_fd,
             .output_fd = output_fd,
             .reader = protocol.FrameReader.init(allocator),
@@ -163,7 +166,6 @@ const DaemonLogSubscriber = struct {
 
     fn deinit(self: *DaemonLogSubscriber) void {
         if (self.request_writer) |*writer| writer.deinit();
-        self.dispatcher.deinit();
         self.reader.deinit();
         self.* = undefined;
     }
@@ -177,7 +179,7 @@ const DaemonLogSubscriber = struct {
                 .callback = handleDaemonLogEvent,
             },
         });
-        try self.dispatcher.run();
+        _ = try self.blocking.loop();
         if (self.err) |err| return err;
     }
 
@@ -345,6 +347,9 @@ test "daemon log timestamp uses readable milliseconds" {
 }
 
 test "daemon log subscriber reads frames with dispatcher" {
+    try dispatcher.initGlobal(std.testing.allocator);
+    defer dispatcher.deinitGlobal();
+
     const protocol_test_helpers = @import("../protocol/test_helpers.zig");
     const allocator = std.testing.allocator;
     var daemon_pair: [2]c.fd_t = undefined;
@@ -407,7 +412,7 @@ test "daemon log subscriber reads frames with dispatcher" {
         peer_thread.join();
     }
 
-    var subscriber = try DaemonLogSubscriber.init(allocator, daemon_pair[0], output_pipe[1]);
+    var subscriber = try DaemonLogSubscriber.init(core_blocking.fromTest(), allocator, daemon_pair[0], output_pipe[1]);
     defer subscriber.deinit();
     try subscriber.run();
     if (peer.err) |err| return err;

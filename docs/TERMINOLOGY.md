@@ -68,31 +68,19 @@ callbacks. A daemon callback must not enter its own blocking wait, because that
 would stop unrelated clients, tunnels, cleanup work, and log subscribers from
 making progress.
 
-`PROCESS_DISPATCHER` marks the one dispatcher loop owned by a long-lived
-process. In `sesshd`, helpers receive that dispatcher when they need fd or
-timer events; they should not create nested dispatchers.
-
-`PROCESS_EVENT_LOOP` marks a direct `poll(2)` loop that is the whole foreground
-process. Examples include a visible terminal client, a raw proxy bridge, or a
-remote worker process that has no daemon dispatcher of its own. These loops are
-allowed to block because there is no broader daemon workload hidden behind
-them.
+`Blocking` is the explicit capability for a foreground blocking wait. Main and
+tests create it; code that needs to wait synchronously must accept it in its
+signature instead of quietly calling `poll(2)`, `sleep`, `waitpid`, or
+`Child.run`.
 
 `PROCESS_GLOBAL_REGISTRY` marks process-global state that is intentionally owned
 by one single-threaded process. These registries let dispatcher callbacks,
 cleanup, and idle shutdown observe the same live work without passing a large
 registry object through every callback.
 
-`BLOCKING_POLL` marks a short foreground wait helper. These helpers are allowed
-only when the current process has no dispatcher work to service or when the
-helper is part of an explicitly foreground UI wait.
-
-`BLOCKING_WAIT` marks a synchronous non-dispatcher wait, such as a process
-wait, an OpenSSH config query, or bounded foreground daemon-start lock
-contention. These waits are allowed only when the process has no daemon
-dispatcher work to service, when collecting the final status of a foreground
-process, or during cleanup after the fd that drives the foreground relay has
-already closed.
+The process dispatcher is initialized by the entrypoint and accessed with
+`dispatcher.get()`. Helpers should register fd/timer work on that dispatcher
+instead of creating nested dispatchers.
 
 Protocol frame IO should be dispatcher-owned or explicit foreground setup IO.
 Daemon-owned protocol fds use `FrameReader`, `FrameWriteState`, or a queue from

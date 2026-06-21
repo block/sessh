@@ -127,7 +127,7 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) !void {
 }
 
 fn waitReadable(fd: c.fd_t) !void {
-    // BLOCKING_POLL: used only by the blocking helpers above. Long-lived
+    // used only by the blocking helpers above. Long-lived
     // daemon/session callbacks should use dispatcher-driven FrameReader state
     // instead of reaching this helper.
     var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
@@ -140,7 +140,7 @@ fn waitReadable(fd: c.fd_t) !void {
 }
 
 fn waitWritable(fd: c.fd_t) !void {
-    // BLOCKING_POLL: used only by the blocking helpers above. Long-lived
+    // used only by the blocking helpers above. Long-lived
     // daemon/session callbacks should use dispatcher-owned write state instead
     // of reaching this helper.
     var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};

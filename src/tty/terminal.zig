@@ -396,7 +396,7 @@ fn readTerminalProbeResponses(input_fd: c.fd_t, probe: *TerminalProbe, target: P
     // them to the probe parser until the requested facts are known or timeout.
     var bytes = TerminalProbeBytes{};
     const deadline_ms = terminalProbeNowMs() + terminal_query_timeout_ms;
-    // BLOCKING_POLL: foreground local-terminal probe. It runs before the
+    // foreground local-terminal probe. It runs before the
     // visible client enters its main terminal loop and has no daemon dispatcher
     // work to service.
     while (true) {

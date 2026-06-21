@@ -7,6 +7,7 @@ const c = std.c;
 const posix = std.posix;
 
 const io = @import("../core/io.zig");
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const poll_sets = @import("../core/poll_set.zig");
@@ -121,6 +122,7 @@ fn sinkWithFd(stdin_fd: c.fd_t, close_fd_on_eof: ?*c.fd_t) StreamSink {
 }
 
 const StreamActiveClientOptions = struct {
+    blocking: core_blocking.Blocking,
     source: StreamSource = .{},
     sink: StreamSink = .{},
     reconnect_input_fd: c.fd_t = -1,
@@ -495,9 +497,6 @@ const StreamActiveClient = struct {
     }
 };
 
-// PROCESS_EVENT_LOOP: process-isolated proxy worker wait. The watch set changes
-// after each state-machine step because transport backpressure, source EOF, and
-// replacement-client readiness all change which fds should be observed.
 const StreamActiveClientStepPoll = struct {
     client: *StreamActiveClient,
     transport_event: ?dispatcher.FdEvent = null,
@@ -554,7 +553,7 @@ const StreamActiveClientStepPoll = struct {
             poll_set.add(self.client.interrupt_fd, posix.POLL.IN, .interrupt);
         }
         if (poll_set.count == 0 and timeout_ms < 0) return;
-        const ready = try posix.poll(poll_set.fdSlice(), timeout_ms);
+        const ready = try self.client.options.blocking.poll(poll_set.fdSlice(), timeout_ms);
         if (ready == 0) return;
         for (poll_set.fdSlice(), poll_set.kindSlice()) |pollfd, kind| {
             if (pollfd.revents == 0) continue;
@@ -693,8 +692,9 @@ const ProxyEndpoint = struct {
         };
     }
 
-    fn activeClientOptions(self: *ProxyEndpoint, replacement_listen_fd: c.fd_t) StreamActiveClientOptions {
+    fn activeClientOptions(self: *ProxyEndpoint, blocking: core_blocking.Blocking, replacement_listen_fd: c.fd_t) StreamActiveClientOptions {
         return .{
+            .blocking = blocking,
             .source = .{ .fd = self.fd },
             .sink = .{
                 .fd = self.fd,
@@ -714,6 +714,7 @@ const ProxyEndpoint = struct {
 };
 
 pub const RemoteWorkerOptions = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     guid: []const u8,
     replacement_listen_fd: c.fd_t,
@@ -725,6 +726,7 @@ pub const RemoteWorkerOptions = struct {
 /// socket. When the daemon tunnel drops, the worker keeps StreamState and waits
 /// for a replacement local-daemon connection so unacknowledged bytes can resume.
 pub fn runRemoteWorker(options: RemoteWorkerOptions) !void {
+    _ = options.blocking;
     const allocator = options.allocator;
     const replacement_listen_fd = options.replacement_listen_fd;
     var endpoint = try ProxyEndpoint.connect(allocator, options.proxy_host, options.proxy_port);
@@ -740,7 +742,7 @@ pub fn runRemoteWorker(options: RemoteWorkerOptions) !void {
     defer transport_fd.deinit();
     while (true) {
         if (transport_fd.get() < 0) {
-            var disconnected_options = endpoint.activeClientOptions(replacement_listen_fd);
+            var disconnected_options = endpoint.activeClientOptions(options.blocking, replacement_listen_fd);
             transport_fd = core_fds.OwnedFd.init(try waitForReplacementWhileDisconnected(&state, replacement_listen_fd, &disconnected_options));
         }
 
@@ -751,7 +753,7 @@ pub fn runRemoteWorker(options: RemoteWorkerOptions) !void {
                 .read = connected_fd,
                 .write = connected_fd,
             },
-            endpoint.activeClientOptions(replacement_listen_fd),
+            endpoint.activeClientOptions(options.blocking, replacement_listen_fd),
         );
         switch (outcome) {
             .complete => return,
@@ -793,7 +795,7 @@ fn waitForReplacementWhileDisconnected(
     }
 }
 
-// PROCESS_EVENT_LOOP: disconnected process-isolated proxy worker wait. While no
+// disconnected process-isolated proxy worker wait. While no
 // transport is connected, the worker still drains the local source into durable
 // byte offsets and waits for a replacement transport.
 const DisconnectedReplacementPoll = struct {
@@ -826,7 +828,7 @@ const DisconnectedReplacementPoll = struct {
             poll_set.add(source.fd, source_poll_events, .source);
         }
 
-        const ready = try posix.poll(poll_set.fdSlice(), -1);
+        const ready = try self.options.blocking.poll(poll_set.fdSlice(), -1);
         if (ready == 0) return;
         for (poll_set.fdSlice(), poll_set.kindSlice()) |pollfd, kind| {
             if (pollfd.revents == 0) continue;
@@ -859,6 +861,7 @@ fn acceptWorkerClient(listen_fd: c.fd_t) ?c.fd_t {
 /// ssh transports to the remote host; this loop owns local stdin/stdout and the
 /// reconnect policy.
 pub fn runLocalStream(
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     start_transport: anytype,
     options: LocalStreamOptions,
@@ -891,6 +894,7 @@ pub fn runLocalStream(
     var local_interrupt = try LocalStreamInterrupt.install();
     defer local_interrupt.deinit();
     var reconnect_context = ProxyReconnectControlContext.init(.{
+        .blocking = blocking,
         .state = &state,
         .source_fd = options.stream_fds.source,
         .reconnect_input_fd = options.reconnect_input_fd,
@@ -915,7 +919,7 @@ pub fn runLocalStream(
                 reconnect_status.flushDiagnostics();
                 return err;
             }
-            if (try disconnectedSourceClosed(&state, options.stream_fds.source, &input_control)) return 0;
+            if (try disconnectedSourceClosed(blocking, &state, options.stream_fds.source, &input_control)) return 0;
             const delay_ms = reconnect.delayMs(attempt);
             const action = waitBeforeReconnect(&reconnect_status, delay_ms, &reconnect_context);
             if (options.reset_on_source_eof and state.source_eof) return 0;
@@ -938,6 +942,7 @@ pub fn runLocalStream(
                     .write = transport.writeFd(),
                 },
                 .{
+                    .blocking = blocking,
                     .source = .{
                         .fd = options.stream_fds.source,
                         .input_control = &input_control,
@@ -1009,7 +1014,7 @@ pub fn runLocalStream(
                         if (options.status_mode == .client_control and options.control_fd < 0 and options.status_fd < 0) {
                             reconnect_status.setFd(-1);
                         }
-                        if (try disconnectedSourceClosed(&state, options.stream_fds.source, &input_control)) return 0;
+                        if (try disconnectedSourceClosed(blocking, &state, options.stream_fds.source, &input_control)) return 0;
                         break :transport_loop;
                     },
                     .interrupted => {
@@ -1060,12 +1065,14 @@ pub fn runLocalStream(
 }
 
 fn disconnectedSourceClosed(
+    blocking: core_blocking.Blocking,
     state: *StreamState,
     source_fd: c.fd_t,
     input_control: *StreamInputControl,
 ) !bool {
     if (source_fd < 0) return false;
     var options = StreamActiveClientOptions{
+        .blocking = blocking,
         .source = .{
             .fd = source_fd,
             .input_control = input_control,
@@ -1377,6 +1384,7 @@ fn remainingDelayMs(deadline_ms: u64, now_ms: u64) ?u64 {
 }
 
 const ProxyReconnectControlContext = struct {
+    blocking: core_blocking.Blocking,
     state: *StreamState,
     source_fd: c.fd_t,
     reconnect_input_fd: c.fd_t,
@@ -1386,6 +1394,7 @@ const ProxyReconnectControlContext = struct {
     interrupt: ?*LocalStreamInterrupt,
 
     const Init = struct {
+        blocking: core_blocking.Blocking,
         state: *StreamState,
         source_fd: c.fd_t,
         reconnect_input_fd: c.fd_t,
@@ -1396,6 +1405,7 @@ const ProxyReconnectControlContext = struct {
 
     fn init(init_options: Init) ProxyReconnectControlContext {
         return .{
+            .blocking = init_options.blocking,
             .state = init_options.state,
             .source_fd = init_options.source_fd,
             .reconnect_input_fd = init_options.reconnect_input_fd,
@@ -1450,7 +1460,7 @@ fn pollReconnectInput(
     return poll.result;
 }
 
-// PROCESS_EVENT_LOOP: foreground proxy reconnect UI wait. It observes local
+// foreground proxy reconnect UI wait. It observes local
 // control input and diagnostics while the process is between transport
 // attempts, outside sesshd's daemon Dispatcher.
 const ReconnectInputDispatcherPoll = struct {
@@ -1487,7 +1497,7 @@ const ReconnectInputDispatcherPoll = struct {
             poll_set.add(self.control.control_fd.*, posix.POLL.IN, .control);
         }
         if (poll_set.count == 0 and timeout_ms < 0) return;
-        const ready = try posix.poll(poll_set.fdSlice(), timeout_ms);
+        const ready = try self.control.blocking.poll(poll_set.fdSlice(), timeout_ms);
         if (ready == 0) {
             self.finish(self.control.input_control.consumeAction());
             return;
@@ -1722,13 +1732,13 @@ const test_support = if (builtin.is_test) struct {
         }
     }
 
-    fn expectNoReadable(fd: c.fd_t) !void {
+    fn expectNoReadable(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
         var pollfds = [_]posix.pollfd{.{
             .fd = fd,
             .events = posix.POLL.IN,
             .revents = 0,
         }};
-        try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pollfds, 0));
+        try std.testing.expectEqual(@as(usize, 0), try blocking.poll(&pollfds, 0));
     }
 
     fn streamState() StreamState {
@@ -1762,7 +1772,7 @@ test "stream ping receives pong without changing offsets" {
     var state = test_support.streamState();
     defer state.deinit();
     const payload = try protocol.encodeDaemonTunnelPayload(std.testing.allocator, .{ .ping = .{} });
-    const options = StreamActiveClientOptions{};
+    const options = StreamActiveClientOptions{ .blocking = core_blocking.fromTest() };
     var active_client = try test_support.activeClient(&state, fds[1], options);
     defer active_client.deinit();
 
@@ -1819,7 +1829,7 @@ test "stream receiver keeps suffix from overlapping data frame" {
         .offset = 0,
         .data = "firstsecond",
     });
-    var options = StreamActiveClientOptions{};
+    var options = StreamActiveClientOptions{ .blocking = core_blocking.fromTest() };
     options.sink = .{ .fd = sink[1] };
     var active_client = try test_support.activeClient(&state, ack[1], options);
     defer active_client.deinit();
@@ -1853,7 +1863,7 @@ test "stream receiver ACK waits for blocked sink delivery" {
         .offset = 0,
         .data = "hello",
     });
-    var options = StreamActiveClientOptions{};
+    var options = StreamActiveClientOptions{ .blocking = core_blocking.fromTest() };
     options.sink = .{ .fd = sink[1] };
     var active_client = try test_support.activeClient(&state, ack[1], options);
     defer active_client.deinit();
@@ -1864,7 +1874,7 @@ test "stream receiver ACK waits for blocked sink delivery" {
 
     try std.testing.expectEqual(@as(u64, 0), state.inbound.recv_next_offset);
     try std.testing.expectEqualStrings("hello", state.pendingInboundData());
-    try test_support.expectNoReadable(ack[0]);
+    try test_support.expectNoReadable(core_blocking.fromTest(), ack[0]);
 
     var drain: [8192]u8 = undefined;
     _ = c.read(sink[0], &drain, drain.len);
@@ -1900,6 +1910,7 @@ test "stream inbound eof can complete without generated outbound eof ack" {
         .transport_reader = protocol.FrameReader.init(std.testing.allocator),
         .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
         .options = .{
+            .blocking = core_blocking.fromTest(),
             .close_outbound_on_inbound_eof = true,
         },
         .liveness = StreamLiveness.init(1_000),
@@ -1943,6 +1954,7 @@ test "stream source eof can reset proxy stream" {
         .transport_reader = protocol.FrameReader.init(std.testing.allocator),
         .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
         .options = .{
+            .blocking = core_blocking.fromTest(),
             .source = .{ .fd = source[0] },
             .reset_on_source_eof = true,
         },
@@ -1963,7 +1975,7 @@ test "disconnected proxy stream notices source eof before retry" {
     defer state.deinit();
     var input_control = StreamInputControl{ .enabled = false };
 
-    try std.testing.expect(try disconnectedSourceClosed(&state, source[0], &input_control));
+    try std.testing.expect(try disconnectedSourceClosed(core_blocking.fromTest(), &state, source[0], &input_control));
     try std.testing.expect(state.source_eof);
     try std.testing.expect(state.outbound.outbound_eof);
 }
@@ -1993,7 +2005,7 @@ test "stream reset completes proxy stream" {
         },
         .transport_reader = protocol.FrameReader.init(std.testing.allocator),
         .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
-        .options = .{},
+        .options = .{ .blocking = core_blocking.fromTest() },
         .liveness = StreamLiveness.init(1_000),
     };
     defer active_client.deinit();
@@ -2019,7 +2031,7 @@ test "proxy mux close queues startup reset through dispatcher" {
         .send_startup_failed = true,
         .daemon_dispatcher = &d,
     });
-    try d.run();
+    _ = try d.loopForBlocking();
 
     try test_support.expectResetFrame(fds[0], "STARTUP_FAILED");
 }
@@ -2057,7 +2069,7 @@ test "stream completion waits for eof acknowledgement" {
     try std.testing.expect(!state.complete());
 
     const payload = try encodeMuxAckPayload(std.testing.allocator, 0);
-    const options = StreamActiveClientOptions{};
+    const options = StreamActiveClientOptions{ .blocking = core_blocking.fromTest() };
     var active_client = try test_support.activeClient(&state, -1, options);
     defer active_client.deinit();
     try handleTransportFrame(&active_client, &options, .{
@@ -2081,6 +2093,7 @@ test "stream inbound eof can complete outbound when caller closes outbound on in
 
     const payload = try encodeMuxProxyEofPayload(std.testing.allocator, 0);
     const options = StreamActiveClientOptions{
+        .blocking = core_blocking.fromTest(),
         .sink = .{ .fd = sink[1] },
         .close_outbound_on_inbound_eof = true,
     };

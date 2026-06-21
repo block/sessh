@@ -89,7 +89,7 @@ fn querySshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8,
     argv[arg_index] = "-G";
     argv[arg_index + 1] = host;
 
-    // BLOCKING_WAIT: OpenSSH is the source of truth for config parsing here.
+    // OpenSSH is the source of truth for config parsing here.
     // The resolved user/host/port/IPQoS define the transport pool key, and
     // SendEnv controls which client environment entries are forwarded. Keeping
     // the subprocess query isolated here prevents that policy from leaking into

@@ -897,7 +897,7 @@ test "terminal mux close queues hangup through dispatcher when available" {
         .send_hangup = true,
         .daemon_dispatcher = &d,
     });
-    try d.run();
+    _ = try d.loopForBlocking();
 
     var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, fds[0]);
     defer frame.deinit(std.testing.allocator);

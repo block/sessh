@@ -5,7 +5,9 @@ const std = @import("std");
 const posix = std.posix;
 
 const app_allocator = @import("core/app_allocator.zig");
+const core_blocking = @import("core/blocking.zig");
 const config = @import("core/config.zig");
+const dispatcher = @import("core/dispatcher.zig");
 const daemon = @import("daemon/mod.zig");
 const daemon_client = @import("daemon/client.zig");
 const io = @import("core/io.zig");
@@ -21,8 +23,11 @@ const transport_ssh = @import("transport/ssh.zig");
 
 pub fn main() !void {
     terminal.setSigpipe(posix.SIG.IGN);
+    try dispatcher.initGlobal(app_allocator.allocator());
+    const blocking = core_blocking.fromMain();
 
-    runMain() catch |err| {
+    runMain(blocking) catch |err| {
+        dispatcher.deinitGlobal();
         app_allocator.deinit();
         if (process_exit.is(err)) {
             const exit_code = process_exit.code();
@@ -32,10 +37,11 @@ pub fn main() !void {
         user_error.printLine("error: {t}", .{err}) catch {};
         std.process.exit(1);
     };
+    dispatcher.deinitGlobal();
     app_allocator.deinit();
 }
 
-fn runMain() !void {
+fn runMain(blocking: core_blocking.Blocking) !void {
     // The installed binary is shared by every role. Normal packaging creates
     // role-named symlinks (`sesshd`, `sessh-broker`, etc.), while the colon
     // commands remain explicit internal entry points for bootstrap paths that
@@ -51,19 +57,19 @@ fn runMain() !void {
 
     const exe_name = std.fs.path.basename(args[0]);
     if (std.mem.eql(u8, exe_name, "sesshd")) {
-        return daemon.run(allocator, args[0], args[1..]);
+        return daemon.run(blocking, allocator, args[0], args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-broker")) {
-        return daemon.forwardBrokerToDaemon(allocator, args[0], args[1..]);
+        return daemon.forwardBrokerToDaemon(blocking, allocator, args[0], args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-proxy")) {
-        return transport_ssh.runProxyStream(allocator, args[0], args[1..]);
+        return transport_ssh.runProxyStream(blocking, allocator, args[0], args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-terminal-remote")) {
-        return terminal_worker_process.run(allocator, args[1..]);
+        return terminal_worker_process.run(blocking, allocator, args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-proxy-remote")) {
-        return proxy_worker_process.run(allocator, args[1..]);
+        return proxy_worker_process.run(blocking, allocator, args[1..]);
     }
 
     if (args.len == 1) return usage(0);
@@ -77,11 +83,11 @@ fn runMain() !void {
     }
 
     if (std.mem.eql(u8, args[1], ":terminal-remote:")) {
-        return terminal_worker_process.run(allocator, args[2..]);
+        return terminal_worker_process.run(blocking, allocator, args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":proxy-remote:")) {
-        return proxy_worker_process.run(allocator, args[2..]);
+        return proxy_worker_process.run(blocking, allocator, args[2..]);
     }
 
     if (topLevelArgIs(args, &.{ "--help", "-h" })) return usage(0);
@@ -89,9 +95,9 @@ fn runMain() !void {
         try io.writeAll(posix.STDOUT_FILENO, "sessh " ++ config.version ++ "\n");
         return;
     }
-    if (topLevelArgIs(args, &.{"--daemon-log"})) return daemon_client.printDaemonLog(allocator, args[0]);
+    if (topLevelArgIs(args, &.{"--daemon-log"})) return daemon_client.printDaemonLog(blocking, allocator, args[0]);
 
-    return sessh_run.run(allocator, args);
+    return sessh_run.run(blocking, allocator, args);
 }
 
 test "sessh top-level options do not match remote command arguments" {
@@ -213,8 +219,10 @@ fn sshShortOptionConsumesValueForVersionScan(option: u8) bool {
 
 test {
     _ = @import("core/app_allocator.zig");
+    _ = @import("core/blocking.zig");
     _ = @import("core/client_log.zig");
     _ = @import("core/config.zig");
+    _ = @import("core/dispatch_io.zig");
     _ = @import("core/dispatcher.zig");
     _ = @import("core/fd_passing.zig");
     _ = @import("core/guid.zig");

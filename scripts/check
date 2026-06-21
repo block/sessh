@@ -200,6 +200,7 @@ export SESSH_PROTOC=$protoc_bin
 
 case "$mode" in
   fast)
+    run python3 scripts/check_blocking.py
     run "$zig_bin" build install-dev
     setup_isolation
     trap cleanup_isolation EXIT
@@ -211,7 +212,8 @@ case "$mode" in
 
     run "$zig_bin" build gen-proto
     run sh -n scripts/build scripts/check scripts/download-ghostty-deps scripts/install
-    run python3 -m py_compile scripts/release
+    run python3 -m py_compile scripts/release scripts/check_blocking.py
+    run python3 scripts/check_blocking.py
     run "$zig_bin" fmt --check build.zig build.zig.zon src/*.zig
     run "$zig_bin" build
     run "$zig_bin" build install-dev

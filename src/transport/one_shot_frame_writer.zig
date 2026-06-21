@@ -110,7 +110,7 @@ test "one-shot frame writer flushes frame and closes fd" {
         .message_type = .error_message,
         .payload = payload,
     });
-    try d.run();
+    _ = try d.loopForBlocking();
 
     var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, pipe[0]);
     defer frame.deinit(std.testing.allocator);

@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
 const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
@@ -90,10 +91,7 @@ pub fn tryAcquireStartupLock(allocator: std.mem.Allocator, dir_name: []const u8)
 /// A one-second wait is intentionally strict; longer means the startup owner
 /// died or wedged before the daemon became ready.
 ///
-/// BLOCKING_WAIT: this runs before the caller has a daemon connection or any
-/// process event loop work to service. A simple bounded sleep loop is more
-/// direct than building a one-off Dispatcher for this foreground startup path.
-pub fn waitForStartupLockRelease(allocator: std.mem.Allocator, dir_name: []const u8) !void {
+pub fn waitForStartupLockRelease(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, dir_name: []const u8) !void {
     var timer = try NonSuspendingTimer.start();
     while (true) {
         if (try tryAcquireStartupLock(allocator, dir_name)) |lock_value| {
@@ -107,21 +105,18 @@ pub fn waitForStartupLockRelease(allocator: std.mem.Allocator, dir_name: []const
 
         const remaining_ms = startup_lock_wait_timeout_ms - elapsed_ms;
         const sleep_ms: u64 = @min(startup_lock_retry_ms, remaining_ms);
-        posix.nanosleep(0, sleep_ms * std.time.ns_per_ms);
+        blocking.sleepMs(sleep_ms);
     }
 }
 
-/// BLOCKING_POLL: foreground daemon startup waits for one byte on the inherited
-/// ready pipe. This is not daemon event-loop work; it is the caller waiting for the
-/// daemon process it just spawned to begin listening.
-pub fn waitForReady(pipe: *const ReadyPipe) !WaitResult {
+pub fn waitForReady(blocking: core_blocking.Blocking, pipe: *const ReadyPipe) !WaitResult {
     var pollfds = [_]posix.pollfd{.{
         .fd = pipe.read_fd,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
 
-    const ready = try posix.poll(&pollfds, daemon_ready_wait_timeout_ms);
+    const ready = try blocking.poll(&pollfds, daemon_ready_wait_timeout_ms);
     if (ready == 0) return .timed_out;
 
     if ((pollfds[0].revents & posix.POLL.IN) != 0) {

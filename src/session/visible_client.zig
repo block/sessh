@@ -17,6 +17,7 @@ const client_renderer = @import("renderer.zig");
 const client_ui = @import("client_ui.zig");
 const connection_event = @import("../diagnostics/connection_event.zig");
 const connection_monitor_mod = @import("connection_monitor.zig");
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher_mod = @import("../core/dispatcher.zig");
 const error_payload = @import("error_payload.zig");
@@ -130,6 +131,9 @@ test "resize repaint timeout clears stale visible client display and enters unre
 }
 
 test "visible client drains pending session end before monitor timeout" {
+    try dispatcher_mod.initGlobal(app_allocator.allocator());
+    defer dispatcher_mod.deinitGlobal();
+
     const input = try posix.pipe();
     defer posix.close(input[0]);
     defer posix.close(input[1]);
@@ -151,6 +155,7 @@ test "visible client drains pending session end before monitor timeout" {
     try std.testing.expectEqual(
         VisibleClientEnd.session_ended,
         try runVisibleTerminal(.{
+            .blocking = core_blocking.fromTest(),
             .input_fd = input[0],
             .worker_fds = .{
                 .read = remote_to_client[0],
@@ -163,6 +168,9 @@ test "visible client drains pending session end before monitor timeout" {
 }
 
 test "visible client treats input write failure as transport closed" {
+    try dispatcher_mod.initGlobal(app_allocator.allocator());
+    defer dispatcher_mod.deinitGlobal();
+
     const input = try posix.pipe();
     defer posix.close(input[0]);
     defer posix.close(input[1]);
@@ -178,6 +186,7 @@ test "visible client treats input write failure as transport closed" {
     try std.testing.expectEqual(
         VisibleClientEnd.transport_closed,
         try runVisibleTerminal(.{
+            .blocking = core_blocking.fromTest(),
             .input_fd = input[0],
             .worker_fds = .{
                 .read = remote_to_client[0],
@@ -253,7 +262,7 @@ test "recovery polling stores visible-client exit restore bytes from draw" {
         .visible_client_end_restore_bytes = "restore-primary",
     } });
 
-    try std.testing.expectEqual(TerminalWorkerRecovery.recovered, (try pollTerminalWorkerRecovery(fds[0], &session, 0)).?);
+    try std.testing.expectEqual(TerminalWorkerRecovery.recovered, (try pollTerminalWorkerRecovery(core_blocking.fromTest(), fds[0], &session, 0)).?);
     try std.testing.expectEqualStrings("restore-primary", session.visible_client_end_restore.items);
 }
 
@@ -271,7 +280,7 @@ test "recovery polling ignores draw while repaint is outstanding" {
         .draw_bytes = "",
     } });
 
-    try std.testing.expectEqual(@as(?TerminalWorkerRecovery, null), try pollTerminalWorkerRecovery(fds[0], &session, 0));
+    try std.testing.expectEqual(@as(?TerminalWorkerRecovery, null), try pollTerminalWorkerRecovery(core_blocking.fromTest(), fds[0], &session, 0));
     try std.testing.expectEqual(@as(usize, 0), session.scrollback_cursor.len);
     try std.testing.expectEqual(@as(i32, 0), session.viewport_offset);
     try std.testing.expect(session.pending_repaint.active());
@@ -290,7 +299,7 @@ test "recovery polling waits for resize repaint after input ack" {
         .input_seq = 1,
     } });
 
-    try std.testing.expectEqual(@as(?TerminalWorkerRecovery, null), try pollTerminalWorkerRecovery(fds[0], &session, 0));
+    try std.testing.expectEqual(@as(?TerminalWorkerRecovery, null), try pollTerminalWorkerRecovery(core_blocking.fromTest(), fds[0], &session, 0));
     try std.testing.expect(session.pending_repaint.requiresRepaintForRecovery());
 
     try protocol_test_helpers.sendTerminalEmulatorPayloadFrameBlocking(app_allocator.allocator(), fds[1], .{ .repaint_response = .{
@@ -302,7 +311,7 @@ test "recovery polling waits for resize repaint after input ack" {
         },
     } });
 
-    try std.testing.expectEqual(TerminalWorkerRecovery.recovered, (try pollTerminalWorkerRecovery(fds[0], &session, 0)).?);
+    try std.testing.expectEqual(TerminalWorkerRecovery.recovered, (try pollTerminalWorkerRecovery(core_blocking.fromTest(), fds[0], &session, 0)).?);
     try std.testing.expect(!session.pending_repaint.active());
     try std.testing.expectEqualStrings("fresh-cursor", session.scrollback_cursor.slice());
 }
@@ -556,11 +565,13 @@ fn finishReconnectRepaintInner(
 }
 
 pub fn runVisibleClient(
+    blocking: core_blocking.Blocking,
     worker_fds: TerminalWorkerFds,
     session: *VisibleClientSessionState,
     options: VisibleClientOptions,
 ) !VisibleClientEnd {
     return runVisibleClientLoop(
+        blocking,
         worker_fds,
         session,
         .{
@@ -570,10 +581,10 @@ pub fn runVisibleClient(
     );
 }
 
-pub fn drainLocalTransportDiagnostics(read_fd: c.fd_t, timeout_ms: u64) void {
+pub fn drainLocalTransportDiagnostics(blocking: core_blocking.Blocking, read_fd: c.fd_t, timeout_ms: u64) void {
     var context = LocalTransportDiagnosticsDrain.init(read_fd);
     defer context.deinit();
-    context.run(timeout_ms) catch {};
+    context.run(blocking, timeout_ms) catch {};
 }
 
 const LocalTransportDiagnosticsDrain = struct {
@@ -581,10 +592,6 @@ const LocalTransportDiagnosticsDrain = struct {
     reader: protocol.FrameReader,
 
     fn init(read_fd: c.fd_t) LocalTransportDiagnosticsDrain {
-        // PROCESS_EVENT_LOOP: this is a short foreground drain after the
-        // visible client leaves its main loop. There is no daemon-owned work in
-        // this process, so direct `poll(2)` keeps the timeout explicit without
-        // allocating a helper Dispatcher.
         return .{
             .read_fd = read_fd,
             .reader = protocol.FrameReader.init(app_allocator.allocator()),
@@ -595,10 +602,7 @@ const LocalTransportDiagnosticsDrain = struct {
         self.reader.deinit();
     }
 
-    fn run(self: *LocalTransportDiagnosticsDrain, timeout_ms: u64) !void {
-        // Give the local daemon a short chance to deliver terminal diagnostics
-        // after the main session loop has ended. This keeps final error text
-        // from being lost without making normal exit depend on daemon liveness.
+    fn run(self: *LocalTransportDiagnosticsDrain, blocking: core_blocking.Blocking, timeout_ms: u64) !void {
         var clock = try NonSuspendingTimer.start();
         const deadline_ms = visibleClientNowMs(&clock) +| timeout_ms;
         while (true) {
@@ -608,7 +612,7 @@ const LocalTransportDiagnosticsDrain = struct {
                 .revents = 0,
             }};
             const timeout = visibleClientPollTimeoutMs(&clock, deadline_ms);
-            const ready = try posix.poll(pollfds[0..], timeout);
+            const ready = try blocking.poll(pollfds[0..], timeout);
             if (ready == 0) return;
 
             const revents = pollfds[0].revents;
@@ -652,19 +656,17 @@ fn visibleClientPollTimeoutMs(clock: *NonSuspendingTimer, deadline_ms: u64) i32 
 }
 
 fn pollTerminalWorkerRecovery(
+    blocking: core_blocking.Blocking,
     read_fd: c.fd_t,
     session: *VisibleClientSessionState,
     timeout_ms: i32,
 ) !?TerminalWorkerRecovery {
-    // PROCESS_EVENT_LOOP: foreground reconnect recovery wait. This process owns
-    // only the visible client, so a direct `poll(2)` wait is the whole event
-    // loop for this recovery step.
     var pollfds = [_]posix.pollfd{.{
         .fd = read_fd,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
-    const ready = try posix.poll(pollfds[0..], timeout_ms);
+    const ready = try blocking.poll(pollfds[0..], timeout_ms);
     if (ready == 0) return null;
 
     const revents = pollfds[0].revents;
@@ -973,6 +975,7 @@ fn readSessionEndedOrError(conn: c.fd_t) !bool {
 // raw-ish local input, install presentation cleanup, run the event loop, and
 // restore terminal state before returning the ssh-shaped end reason.
 fn runVisibleClientLoop(
+    blocking: core_blocking.Blocking,
     worker_fds: TerminalWorkerFds,
     session: *VisibleClientSessionState,
     options: VisibleClientOptions,
@@ -999,6 +1002,7 @@ fn runVisibleClientLoop(
     defer presentation_guard.restore();
 
     const end = try runVisibleTerminal(.{
+        .blocking = blocking,
         .input_fd = posix.STDIN_FILENO,
         .worker_fds = worker_fds,
         .session = session,
@@ -1009,6 +1013,7 @@ fn runVisibleClientLoop(
 }
 
 const VisibleTerminalRun = struct {
+    blocking: core_blocking.Blocking,
     input_fd: c.fd_t,
     worker_fds: TerminalWorkerFds,
     session: *VisibleClientSessionState,
@@ -1021,13 +1026,14 @@ const VisibleTerminalLoop = struct {
         escape_help,
     };
 
+    blocking: core_blocking.Blocking,
     input_fd: c.fd_t,
     worker_fds: TerminalWorkerFds,
     session: *VisibleClientSessionState,
     read_fd_flags_guard: ?core_fds.StatusFlagsGuard = null,
     write_fd_flags_guard: ?core_fds.StatusFlagsGuard = null,
     mode: Mode = .normal,
-    dispatcher: dispatcher_mod.Dispatcher,
+    dispatcher: *dispatcher_mod.Dispatcher,
     input_watch_id: ?dispatcher_mod.FdWatchId = null,
     worker_watch_id: ?dispatcher_mod.FdWatchId = null,
     worker_write_watch_id: ?dispatcher_mod.FdWatchId = null,
@@ -1044,8 +1050,8 @@ const VisibleTerminalLoop = struct {
 
     fn init(params: VisibleTerminalRun) !VisibleTerminalLoop {
         // The visible terminal loop owns local stdin/stdout and one worker
-        // transport. Put the worker fds in nonblocking mode here because the
-        // dispatcher is the only place allowed to wait.
+        // transport. Put the worker fds in nonblocking mode before the
+        // dispatcher watches them.
         var read_fd_flags_guard = try core_fds.StatusFlagsGuard.setNonBlocking(params.worker_fds.read);
         errdefer read_fd_flags_guard.restore();
         var write_fd_flags_guard = if (params.worker_fds.write == params.worker_fds.read)
@@ -1053,17 +1059,14 @@ const VisibleTerminalLoop = struct {
         else
             core_fds.StatusFlagsGuard.setNonBlocking(params.worker_fds.write) catch null;
         errdefer if (write_fd_flags_guard) |*guard| guard.restore();
-        // PROCESS_EVENT_LOOP: main visible-client terminal loop. It owns stdin,
-        // stdout presentation, and the terminal-worker fd for this foreground
-        // sessh process; it is intentionally separate from sesshd.
         return .{
+            .blocking = params.blocking,
             .input_fd = params.input_fd,
             .worker_fds = params.worker_fds,
             .session = params.session,
             .read_fd_flags_guard = read_fd_flags_guard,
             .write_fd_flags_guard = write_fd_flags_guard,
-            // PROCESS_EVENT_LOOP: see foreground visible-client comment above.
-            .dispatcher = try dispatcher_mod.Dispatcher.init(app_allocator.allocator()),
+            .dispatcher = dispatcher_mod.get(),
             .last_size = terminal.currentWindowSize(),
             .connection_monitor = .{
                 .enabled = params.options.monitor_connection,
@@ -1076,7 +1079,6 @@ const VisibleTerminalLoop = struct {
 
     fn deinit(self: *VisibleTerminalLoop) void {
         self.worker_write_queue.deinit();
-        self.dispatcher.deinit();
         self.worker_reader.deinit();
         if (self.write_fd_flags_guard) |*guard| guard.restore();
         if (self.read_fd_flags_guard) |*guard| guard.restore();
@@ -1112,7 +1114,7 @@ const VisibleTerminalLoop = struct {
         });
         try self.updateFdInterests();
         try self.updateTimer();
-        try self.dispatcher.run();
+        _ = try self.blocking.loop();
         return self.end orelse .transport_closed;
     }
 

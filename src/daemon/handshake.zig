@@ -55,7 +55,7 @@ pub fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
     return protocol.helloRequestIsCompatible(hello, config.min_protocol_major, config.min_protocol_minor);
 }
 
-// PROCESS_EVENT_LOOP: foreground daemon client handshakes happen before the
+// foreground daemon client handshakes happen before the
 // caller enters its long-lived daemon protocol. Keep the synchronous handshake
 // shape, but route all frame IO through the shared foreground helpers so this
 // setup-only poll loop stays explicit and auditable.
