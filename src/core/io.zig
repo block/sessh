@@ -29,20 +29,15 @@ pub fn noteWrite(fd: c.fd_t, bytes: []const u8) void {
     if (write_hook) |hook| hook(fd, bytes);
 }
 
-// Blocking convenience helpers. These are appropriate for foreground command
-// setup, terminal restoration, tests, and other paths where the current process
-// has no dispatcher work to service while waiting. Long-lived daemon/session
-// callbacks must keep read/write progress in their own state machines instead;
-// otherwise one stalled fd can freeze unrelated clients sharing the process.
+// Convenience helpers for callers that know their fd is ready or blocking is
+// acceptable at the syscall itself. The wait loops live in core/blocking.zig so
+// foreground blocking remains visible through a Blocking token.
 pub fn readExact(fd: c.fd_t, buf: []u8) !void {
     var offset: usize = 0;
     while (offset < buf.len) {
         const n = c.read(fd, buf[offset..].ptr, buf.len - offset);
         if (n < 0) switch (posix.errno(n)) {
-            .AGAIN => {
-                try waitReadable(fd);
-                continue;
-            },
+            .AGAIN => return error.WouldBlock,
             .INTR => continue,
             else => return error.ReadFailed,
         };
@@ -57,10 +52,7 @@ pub fn writeAll(fd: c.fd_t, bytes: []const u8) !void {
     while (offset < bytes.len) {
         const n = c.write(fd, bytes[offset..].ptr, bytes.len - offset);
         if (n < 0) switch (posix.errno(n)) {
-            .AGAIN => {
-                try waitWritable(fd);
-                continue;
-            },
+            .AGAIN => return error.WouldBlock,
             .INTR => continue,
             else => return error.WriteFailed,
         };
@@ -124,32 +116,6 @@ pub fn stderrPrint(comptime fmt: []const u8, args: anytype) !void {
     var buf: [1024]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, fmt, args);
     try writeAll(posix.STDERR_FILENO, text);
-}
-
-fn waitReadable(fd: c.fd_t) !void {
-    // used only by the blocking helpers above. Long-lived
-    // daemon/session callbacks should use dispatcher-driven FrameReader state
-    // instead of reaching this helper.
-    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    while (true) {
-        pollfds[0].revents = 0;
-        _ = posix.poll(pollfds[0..], -1) catch return error.ReadFailed;
-        if ((pollfds[0].revents & posix.POLL.IN) != 0) return;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.ReadFailed;
-    }
-}
-
-fn waitWritable(fd: c.fd_t) !void {
-    // used only by the blocking helpers above. Long-lived
-    // daemon/session callbacks should use dispatcher-owned write state instead
-    // of reaching this helper.
-    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-    while (true) {
-        pollfds[0].revents = 0;
-        _ = posix.poll(pollfds[0..], -1) catch return error.WriteFailed;
-        if ((pollfds[0].revents & posix.POLL.OUT) != 0) return;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
-    }
 }
 
 test "readSomeNonBlocking reports bytes, would-block, and eof" {

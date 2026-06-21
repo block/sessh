@@ -341,7 +341,7 @@ pub const ReconnectUi = struct {
         if (self.presentation != .overlay or c.isatty(self.terminal_fds.output) == 0) return;
 
         const renderer = client_renderer.Renderer.init(self.terminal_fds.output);
-        try renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(self.terminal_fds));
+        try renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(self.blocking, self.terminal_fds));
         try renderer.clearVisible();
         self.overlay_state = null;
         self.viewport_offset = 0;

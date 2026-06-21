@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = std.c;
 
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const daemon_identity = @import("identity.zig");
@@ -9,6 +10,7 @@ const client_router = @import("client_router.zig");
 const socket_transport = @import("../transport/socket.zig");
 
 pub const Context = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     terminal_remote_exe: []const u8,
     proxy_remote_exe: []const u8,
@@ -42,6 +44,7 @@ pub fn acceptDaemonClient(ctx: *anyopaque, handler_event: dispatcher.HandlerEven
     try core_fds.setNonBlocking(owned_client_fd.get());
     try client_router.registerAcceptedClient(.{
         .allocator = accept_context.allocator,
+        .blocking = accept_context.blocking,
         .daemon_dispatcher = daemon_dispatcher,
         .client_fd = owned_client_fd.get(),
         .terminal_remote_exe = accept_context.terminal_remote_exe,

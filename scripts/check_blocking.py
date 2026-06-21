@@ -5,8 +5,6 @@ The policy is intentionally simple:
 
 * raw blocking syscalls live in src/core/blocking.zig;
 * the process Dispatcher may call poll(2) because it is the event loop;
-* a small set of existing boundary modules still expose foreground blocking
-  behavior while they are migrated to Source/Sink/DispatchTask;
 * tests may block freely;
 
 That keeps new blocking work auditable while the codebase migrates toward the
@@ -69,14 +67,6 @@ def allowed_file(path: Path) -> bool:
     return rel in {
         "src/core/blocking.zig",
         "src/core/dispatcher.zig",
-        "src/core/io.zig",
-        "src/daemon/identity.zig",
-        "src/transport/bootstrap.zig",
-        "src/transport/foreground_frame_io.zig",
-        "src/transport/plain_ssh.zig",
-        "src/transport/ssh_options.zig",
-        "src/tty/pty_process.zig",
-        "src/tty/terminal.zig",
     }
 
 

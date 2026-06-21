@@ -206,7 +206,7 @@ pub fn runRemoteNewSession(
     const shell_command = try shellCommandFromRemoteArgs(allocator, options.new.shell_command_args);
     defer if (shell_command) |command| allocator.free(command);
 
-    var local_terminal_probe = visible_client.LocalTerminalProbe.start();
+    var local_terminal_probe = visible_client.LocalTerminalProbe.start(options.blocking);
     defer local_terminal_probe.deinit();
 
     var transcript_capture = TranscriptCapture{};
@@ -229,6 +229,7 @@ pub fn runRemoteNewSession(
     defer local_terminal.deinit();
 
     var session = visible_client.startNewSessionOnTerminalWorker(.{
+        .blocking = options.blocking,
         .worker_fds = .{
             .read = transport.readFd(),
             .write = transport.writeFd(),
@@ -250,11 +251,11 @@ pub fn runRemoteNewSession(
                 try user_error.line("remote command recovery requires a compatible sessh remote");
                 return process_exit.request(1);
             }
-            try runPlainSshFallbackAfterVersionMismatch(allocator, target);
+            try runPlainSshFallbackAfterVersionMismatch(options.blocking, allocator, target);
         }
         if (err == error.UnsupportedRemotePlatform and options.failure_policy.allow_plain_ssh_fallback) {
             transport.close();
-            try runPlainSshFallback(allocator, target, null);
+            try runPlainSshFallback(options.blocking, allocator, target, null);
         }
         waitAfterTerminalWorkerConnectionFailure(&transport, "start");
         if (process_exit.is(err)) return err;
@@ -312,7 +313,7 @@ fn openTerminalDaemonTransport(options: TerminalDaemonTransportOpen) !TerminalTr
     try ssh_transport_acquire.appendCurrentProcess(allocator, &request);
     try ssh_transport_acquire.appendCurrentEnvironment(allocator, &request);
 
-    try sendClientDaemonPayloadForeground(allocator, daemon_fd.get(), .{ .ssh_transport_acquire = request });
+    try sendClientDaemonPayloadForeground(blocking, allocator, daemon_fd.get(), .{ .ssh_transport_acquire = request });
     return .{ .fd = daemon_fd.take() };
 }
 
@@ -484,6 +485,7 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
 
         ctx.session.viewport_offset = reconnect_ui.currentViewportOffset();
         visible_client.reconnectSessionOnTerminalWorkerCancellable(
+            ctx.blocking,
             .{
                 .read = replacement.readFd(),
                 .write = replacement.writeFd(),
@@ -533,6 +535,7 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
         ctx.session.discardPendingInputAcks();
         ctx.session.viewport_offset = try reconnect_ui.clearOverlay();
         visible_client.finishReconnectRepaint(
+            ctx.blocking,
             replacement.readFd(),
             ctx.session,
         ) catch |err| switch (err) {
@@ -731,7 +734,7 @@ const DaemonStreamClientStarter = struct {
         try ssh_transport_acquire.appendCurrentSshAgent(self.allocator, &request);
         try ssh_transport_acquire.appendCurrentProcess(self.allocator, &request);
 
-        try sendClientDaemonPayloadForeground(self.allocator, daemon_fd.get(), .{ .ssh_transport_acquire = request });
+        try sendClientDaemonPayloadForeground(self.blocking, self.allocator, daemon_fd.get(), .{ .ssh_transport_acquire = request });
         return .{ .fd = daemon_fd.take() };
     }
 
@@ -757,7 +760,7 @@ fn openProxyDiagnostics(options: OpenProxyDiagnosticsOptions) !c.fd_t {
         try daemon_client.connectOrStart(options.blocking, allocator, options.exe);
     var daemon_fd = core_fds.OwnedFd.init(fd);
     defer daemon_fd.deinit();
-    try sendClientDaemonPayloadForeground(allocator, daemon_fd.get(), .{ .proxy_diagnostics_open = .{
+    try sendClientDaemonPayloadForeground(options.blocking, allocator, daemon_fd.get(), .{ .proxy_diagnostics_open = .{
         .proxy_guid = options.guid,
     } });
     return daemon_fd.take();
@@ -874,6 +877,7 @@ fn runProxyStreamSsh(options: ProxyStreamSshOptions) !noreturn {
     if (diagnostics_plan.wrap_visible_ssh and client_control_fd.get() >= 0) {
         const fd = client_control_fd.take();
         try plain_ssh.runArgvUnderLocalPty(.{
+            .blocking = options.blocking,
             .allocator = options.allocator,
             .ssh_args = ssh_args,
             .control_fd = fd,
@@ -884,13 +888,14 @@ fn runProxyStreamSsh(options: ProxyStreamSshOptions) !noreturn {
     if (diagnostics_plan.use_daemon_control and client_control_fd.get() >= 0) {
         const fd = client_control_fd.take();
         try plain_ssh.runArgvWithDiagnostics(.{
+            .blocking = options.blocking,
             .allocator = options.allocator,
             .ssh_args = ssh_args,
             .control_fd = fd,
             .diagnostic_name = "proxy-stream",
         });
     }
-    try plain_ssh.runArgv(options.allocator, ssh_args, "proxy-stream");
+    try plain_ssh.runArgv(options.blocking, options.allocator, ssh_args, "proxy-stream");
 }
 
 // Entry point for the generated ProxyCommand process. It parses only the
@@ -1012,6 +1017,7 @@ fn runProxyStreamFdPass(options: ProxyStreamFdPassOptions) !void {
 
     try proxy_entry.runFdPassSetup(.{
         .allocator = options.allocator,
+        .blocking = options.blocking,
         .daemon_fd = daemon_fd.get(),
         .transport = transport,
         .proxy_guid = options.proxy_guid,
@@ -1020,6 +1026,7 @@ fn runProxyStreamFdPass(options: ProxyStreamFdPassOptions) !void {
 }
 
 fn sendClientDaemonPayloadForeground(
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     payload: protocol.ClientDaemonPayload,
@@ -1027,6 +1034,7 @@ fn sendClientDaemonPayloadForeground(
     const encoded = try protocol.encodeClientDaemonPayload(allocator, payload);
     defer allocator.free(encoded);
     try foreground_frame_io.writeFrame(.{
+        .blocking = blocking,
         .allocator = allocator,
         .fd = fd,
         .message_type = .client_daemon,
@@ -1034,12 +1042,12 @@ fn sendClientDaemonPayloadForeground(
     });
 }
 
-fn runPlainSshFallbackAfterVersionMismatch(allocator: std.mem.Allocator, target: SshTarget) !noreturn {
+fn runPlainSshFallbackAfterVersionMismatch(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, target: SshTarget) !noreturn {
     try user_error.line("existing remote sessh is incompatible; falling back to plain ssh without sessh recovery");
-    try runPlainSshFallbackArgv(allocator, target);
+    try runPlainSshFallbackArgv(blocking, allocator, target);
 }
 
-fn runPlainSshFallback(allocator: std.mem.Allocator, target: SshTarget, platform: ?Platform) !noreturn {
+fn runPlainSshFallback(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, target: SshTarget, platform: ?Platform) !noreturn {
     if (platform) |remote_platform| {
         try user_error.printLine(
             "no matching sessh binary for remote platform {s} {s}; falling back to plain ssh without sessh recovery",
@@ -1049,16 +1057,16 @@ fn runPlainSshFallback(allocator: std.mem.Allocator, target: SshTarget, platform
         try user_error.line("remote platform is unsupported and no matching sessh binary is available; falling back to plain ssh without sessh recovery");
     }
 
-    try runPlainSshFallbackArgv(allocator, target);
+    try runPlainSshFallbackArgv(blocking, allocator, target);
 }
 
-fn runPlainSshFallbackArgv(allocator: std.mem.Allocator, target: SshTarget) !noreturn {
+fn runPlainSshFallbackArgv(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, target: SshTarget) !noreturn {
     const ssh_argv = try allocator.alloc([]const u8, target.options.len + 1);
     defer allocator.free(ssh_argv);
     @memcpy(ssh_argv[0..target.options.len], target.options);
     ssh_argv[ssh_argv.len - 1] = target.host;
 
-    try plain_ssh.runArgv(allocator, ssh_argv, "plain-ssh-fallback");
+    try plain_ssh.runArgv(blocking, allocator, ssh_argv, "plain-ssh-fallback");
 }
 
 pub fn printSshArgError(err: anyerror) !void {

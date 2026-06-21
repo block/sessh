@@ -3,6 +3,7 @@ const c = std.c;
 const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
+const core_blocking = @import("../core/blocking.zig");
 const client_log = @import("../core/client_log.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
@@ -29,16 +30,18 @@ pub const State = struct {
 };
 
 pub const Probe = struct {
+    blocking: core_blocking.Blocking,
     state: ?State = null,
 
-    pub fn start() Probe {
+    pub fn start(blocking: core_blocking.Blocking) Probe {
         return .{
-            .state = capture(),
+            .blocking = blocking,
+            .state = capture(blocking),
         };
     }
 
     pub fn finish(self: *Probe) State {
-        const state = self.state orelse return capture();
+        const state = self.state orelse return capture(self.blocking);
         self.state = null;
         return state;
     }
@@ -50,7 +53,7 @@ pub const Probe = struct {
     }
 };
 
-pub fn capture() State {
+pub fn capture(blocking: core_blocking.Blocking) State {
     // Capture everything the remote terminal worker needs from the visible
     // terminal before the session starts. The worker gets tty modes, size,
     // cursor/viewport position, default colors, and initial kitty keyboard flags.
@@ -67,7 +70,7 @@ pub fn capture() State {
 
     if (c.isatty(posix.STDIN_FILENO) == 0 or c.isatty(posix.STDOUT_FILENO) == 0) return state;
 
-    const probe = terminal.queryTerminalProbe(.{}) catch {
+    const probe = terminal.queryTerminalProbe(blocking, .{}) catch {
         state.viewport_offset = unknown_viewport_offset;
         return state;
     };

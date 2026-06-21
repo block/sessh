@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const fd_passing = @import("../core/fd_passing.zig");
 const protocol = @import("../protocol/mod.zig");
@@ -12,6 +13,7 @@ const protocol = @import("../protocol/mod.zig");
 const cancellation_poll_ms: i32 = 50;
 
 pub const ReadOptions = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     cancelled: ?*const bool = null,
@@ -38,7 +40,7 @@ pub fn readFrame(options: ReadOptions) !protocol.OwnedFrame {
             .revents = 0,
         }};
         const timeout_ms: i32 = if (options.cancelled == null) -1 else cancellation_poll_ms;
-        _ = try posix.poll(pollfds[0..], timeout_ms);
+        _ = try options.blocking.poll(pollfds[0..], timeout_ms);
         if (isCancelled(options.cancelled)) return options.cancel_error;
 
         const revents = pollfds[0].revents;
@@ -64,6 +66,7 @@ fn isCancelled(cancelled: ?*const bool) bool {
 }
 
 pub const WriteOptions = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     message_type: protocol.MessageType,
@@ -80,7 +83,7 @@ pub fn writeFrame(options: WriteOptions) !void {
     defer flags_guard.restore();
 
     while (true) {
-        try waitForegroundWritable(options.fd);
+        try waitForegroundWritable(options.blocking, options.fd);
         switch (writer.writeReady(options.fd) catch return error.WriteFailed) {
             .blocked, .progress => {},
             .done => return,
@@ -89,6 +92,7 @@ pub fn writeFrame(options: WriteOptions) !void {
 }
 
 pub const ScmRightsWriteOptions = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     message_type: protocol.MessageType,
@@ -124,36 +128,36 @@ pub fn writeFrameWithScmRightsFd(options: ScmRightsWriteOptions) !void {
     // single marker byte together with SCM_RIGHTS so the receiver can
     // correlate the descriptor with this explicit frame.
     var prefix = fd_passing.SendByteProgress.init(frame[0..attached_start]);
-    try writeByteProgress(options.fd, &prefix);
+    try writeByteProgress(options.blocking, options.fd, &prefix);
 
     var fd_progress = fd_passing.SendBufferWithFdProgress.init(frame[attached_start..], owned_fd.take());
     defer fd_progress.deinit();
-    try writeBufferWithFdProgress(options.fd, &fd_progress);
+    try writeBufferWithFdProgress(options.blocking, options.fd, &fd_progress);
 }
 
-fn writeByteProgress(fd: c.fd_t, progress: *fd_passing.SendByteProgress) !void {
+fn writeByteProgress(blocking: core_blocking.Blocking, fd: c.fd_t, progress: *fd_passing.SendByteProgress) !void {
     while (true) {
         switch (try fd_passing.sendByteProgress(fd, progress)) {
             .complete => return,
             .progress => continue,
-            .blocked => try waitForegroundWritable(fd),
+            .blocked => try waitForegroundWritable(blocking, fd),
             .eof => unreachable,
         }
     }
 }
 
-fn writeBufferWithFdProgress(fd: c.fd_t, progress: *fd_passing.SendBufferWithFdProgress) !void {
+fn writeBufferWithFdProgress(blocking: core_blocking.Blocking, fd: c.fd_t, progress: *fd_passing.SendBufferWithFdProgress) !void {
     while (true) {
         switch (try fd_passing.sendBufferWithFdProgress(fd, progress)) {
             .complete => return,
             .progress => continue,
-            .blocked => try waitForegroundWritable(fd),
+            .blocked => try waitForegroundWritable(blocking, fd),
             .eof => unreachable,
         }
     }
 }
 
-fn waitForegroundWritable(fd: c.fd_t) !void {
+fn waitForegroundWritable(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
     // this module is only used by short setup paths before a
     // dispatcher-owned relay loop exists. Keep the synchronous wait local and
     // auditable instead of letting foreground callers each grow their own poll
@@ -164,7 +168,7 @@ fn waitForegroundWritable(fd: c.fd_t) !void {
             .events = posix.POLL.OUT,
             .revents = 0,
         }};
-        _ = try posix.poll(pollfds[0..], -1);
+        _ = try blocking.poll(pollfds[0..], -1);
         const revents = pollfds[0].revents;
         if ((revents & posix.POLL.OUT) != 0) return;
         if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
@@ -185,6 +189,7 @@ test "foreground frame io writes and reads one frame" {
     defer std.testing.allocator.free(payload);
 
     try writeFrame(.{
+        .blocking = core_blocking.fromTest(),
         .allocator = std.testing.allocator,
         .fd = pipe[1],
         .message_type = .client_daemon,
@@ -213,6 +218,7 @@ test "foreground frame io writes frame with SCM_RIGHTS fd" {
     defer std.testing.allocator.free(payload);
 
     try writeFrameWithScmRightsFd(.{
+        .blocking = core_blocking.fromTest(),
         .allocator = std.testing.allocator,
         .fd = control[0],
         .message_type = .client_daemon,
@@ -242,6 +248,7 @@ test "foreground frame read honors cancellation before polling" {
 
     var cancelled = true;
     try std.testing.expectError(error.TestCancelled, readFrame(.{
+        .blocking = core_blocking.fromTest(),
         .allocator = std.testing.allocator,
         .fd = pipe[0],
         .cancelled = &cancelled,

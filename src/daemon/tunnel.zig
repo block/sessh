@@ -222,6 +222,7 @@ fn handleMuxConnectionFrame(
         .remote_process_cleanup_request => |request| {
             try daemon_cleanup.handleRemoteProcessCleanupRequestQueued(.{
                 .allocator = connection.allocator,
+                .daemon_dispatcher = daemon_dispatcher,
                 .mux_writer = &connection.mux_writer,
                 .identity = connection.identity,
                 .request = request,

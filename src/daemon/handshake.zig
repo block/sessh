@@ -4,13 +4,14 @@
 const std = @import("std");
 const c = std.c;
 
+const core_blocking = @import("../core/blocking.zig");
 const config = @import("../core/config.zig");
 const protocol = @import("../protocol/mod.zig");
 const foreground_frame_io = @import("../transport/foreground_frame_io.zig");
 
 const hpb = protocol.hpb;
 
-fn sendHelloRequestForeground(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+fn sendHelloRequestForeground(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, fd: c.fd_t) !void {
     const payload = try protocol.encodePayload(allocator, hpb.HelloRequest{
         .protocol_major = config.protocol_major,
         .protocol_minor = config.protocol_minor,
@@ -18,6 +19,7 @@ fn sendHelloRequestForeground(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     });
     defer allocator.free(payload);
     try foreground_frame_io.writeFrame(.{
+        .blocking = blocking,
         .allocator = allocator,
         .fd = fd,
         .message_type = .hello_request,
@@ -25,10 +27,11 @@ fn sendHelloRequestForeground(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     });
 }
 
-fn sendHelloOkForeground(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+fn sendHelloOkForeground(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, fd: c.fd_t) !void {
     const payload = try protocol.encodePayload(allocator, hpb.HelloOk{});
     defer allocator.free(payload);
     try foreground_frame_io.writeFrame(.{
+        .blocking = blocking,
         .allocator = allocator,
         .fd = fd,
         .message_type = .hello_ok,
@@ -36,7 +39,7 @@ fn sendHelloOkForeground(allocator: std.mem.Allocator, fd: c.fd_t) !void {
     });
 }
 
-fn sendHelloErrorForeground(allocator: std.mem.Allocator, fd: c.fd_t, info: protocol.ErrorInfo) !void {
+fn sendHelloErrorForeground(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, fd: c.fd_t, info: protocol.ErrorInfo) !void {
     const payload = try protocol.encodePayload(allocator, hpb.HelloError{
         .code = info.code,
         .message = info.message,
@@ -44,6 +47,7 @@ fn sendHelloErrorForeground(allocator: std.mem.Allocator, fd: c.fd_t, info: prot
     });
     defer allocator.free(payload);
     try foreground_frame_io.writeFrame(.{
+        .blocking = blocking,
         .allocator = allocator,
         .fd = fd,
         .message_type = .hello_error,
@@ -59,34 +63,34 @@ pub fn helloRequestIsCompatible(hello: hpb.HelloRequest) bool {
 // caller enters its long-lived daemon protocol. Keep the synchronous handshake
 // shape, but route all frame IO through the shared foreground helpers so this
 // setup-only poll loop stays explicit and auditable.
-pub fn initiateForegroundClientHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    try sendHelloRequestForeground(allocator, fd);
-    var hello_error = try readHelloReply(allocator, fd);
+pub fn initiateForegroundClientHandshake(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, fd: c.fd_t) !void {
+    try sendHelloRequestForeground(blocking, allocator, fd);
+    var hello_error = try readHelloReply(blocking, allocator, fd);
     defer if (hello_error) |*err| err.deinit(allocator);
     if (hello_error) |err| {
         if (std.mem.eql(u8, err.code, "VERSION_MISMATCH")) return error.VersionMismatch;
         return error.DaemonHandshakeFailed;
     }
-    var peer_hello = try readHelloRequest(allocator, fd);
+    var peer_hello = try readHelloRequest(blocking, allocator, fd);
     defer peer_hello.deinit(allocator);
     if (!helloRequestIsCompatible(peer_hello)) {
-        try sendHelloErrorForeground(allocator, fd, .{
+        try sendHelloErrorForeground(blocking, allocator, fd, .{
             .code = "VERSION_MISMATCH",
             .message = "sesshd is incompatible with this client",
         });
         return error.VersionMismatch;
     }
-    try sendHelloOkForeground(allocator, fd);
+    try sendHelloOkForeground(blocking, allocator, fd);
 }
 
-fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest {
+fn readHelloRequest(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest {
     while (true) {
-        var frame = try readFrameForForegroundHandshake(allocator, fd);
+        var frame = try readFrameForForegroundHandshake(blocking, allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_request => return protocol.decodePayload(hpb.HelloRequest, allocator, frame.payload),
             else => {
-                try sendHelloErrorForeground(allocator, fd, .{
+                try sendHelloErrorForeground(blocking, allocator, fd, .{
                     .code = "PROTOCOL_ERROR",
                     .message = "expected HELLO_REQUEST",
                 });
@@ -96,9 +100,9 @@ fn readHelloRequest(allocator: std.mem.Allocator, fd: c.fd_t) !hpb.HelloRequest 
     }
 }
 
-fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
+fn readHelloReply(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
     while (true) {
-        var frame = try readFrameForForegroundHandshake(allocator, fd);
+        var frame = try readFrameForForegroundHandshake(blocking, allocator, fd);
         defer frame.deinit(allocator);
         switch (frame.message_type) {
             .hello_ok => {
@@ -115,8 +119,9 @@ fn readHelloReply(allocator: std.mem.Allocator, fd: c.fd_t) !?hpb.HelloError {
     }
 }
 
-fn readFrameForForegroundHandshake(allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
+fn readFrameForForegroundHandshake(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, fd: c.fd_t) !protocol.OwnedFrame {
     return foreground_frame_io.readFrame(.{
+        .blocking = blocking,
         .allocator = allocator,
         .fd = fd,
     });
@@ -132,6 +137,7 @@ test "foreground client handshake uses hello exchange" {
 
     const TestPeer = struct {
         fd: c.fd_t,
+        blocking: core_blocking.Blocking,
         err: ?anyerror = null,
 
         fn run(peer: *@This()) void {
@@ -145,8 +151,8 @@ test "foreground client handshake uses hello exchange" {
             defer client_hello.deinit(std.testing.allocator);
             if (client_hello.message_type != .hello_request) return error.UnexpectedFrame;
 
-            try sendHelloOkForeground(std.testing.allocator, peer.fd);
-            try sendHelloRequestForeground(std.testing.allocator, peer.fd);
+            try sendHelloOkForeground(peer.blocking, std.testing.allocator, peer.fd);
+            try sendHelloRequestForeground(peer.blocking, std.testing.allocator, peer.fd);
 
             var client_ok = try protocol_test_helpers.readFrameForTest(std.testing.allocator, peer.fd);
             defer client_ok.deinit(std.testing.allocator);
@@ -154,10 +160,11 @@ test "foreground client handshake uses hello exchange" {
         }
     };
 
-    var peer = TestPeer{ .fd = fds[1] };
+    const blocking = core_blocking.fromTest();
+    var peer = TestPeer{ .fd = fds[1], .blocking = blocking };
     var peer_thread = try std.Thread.spawn(.{}, TestPeer.run, .{&peer});
     defer peer_thread.join();
 
-    try initiateForegroundClientHandshake(std.testing.allocator, fds[0]);
+    try initiateForegroundClientHandshake(blocking, std.testing.allocator, fds[0]);
     if (peer.err) |err| return err;
 }

@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 
 const core_config = @import("../core/config.zig");
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const protocol = @import("../protocol/mod.zig");
@@ -23,6 +24,7 @@ const pb = protocol.pb;
 
 pub const RegisterAcceptedClientOptions = struct {
     allocator: std.mem.Allocator,
+    blocking: core_blocking.Blocking,
     daemon_dispatcher: *dispatcher.Dispatcher,
     client_fd: c.fd_t,
     terminal_remote_exe: []const u8,
@@ -40,6 +42,7 @@ pub fn registerAcceptedClient(options: RegisterAcceptedClientOptions) !void {
     errdefer allocator.destroy(context);
     context.* = .{
         .allocator = allocator,
+        .blocking = options.blocking,
         .terminal_remote_exe = options.terminal_remote_exe,
         .proxy_remote_exe = options.proxy_remote_exe,
         .identity = options.identity,
@@ -73,6 +76,7 @@ const ClientStage = enum {
 
 const ClientContext = struct {
     allocator: std.mem.Allocator,
+    blocking: core_blocking.Blocking,
     terminal_remote_exe: []const u8,
     proxy_remote_exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
@@ -268,7 +272,7 @@ fn handleDaemonClientFrame(
                 .close => return .close,
             }
             if (try event.rejectPassedFd(context, "unexpected passed file descriptor")) return .close;
-            return if (try handleClientFrameAfterHandshake(context, frame.*))
+            return if (try handleClientFrameAfterHandshake(context, daemon_dispatcher, frame.*))
                 .consumed
             else
                 .close;
@@ -370,7 +374,7 @@ fn transferInitialRequestToDispatcherOwner(
     if (frame.message_type == .daemon_tunnel) {
         if (try event.rejectPassedFd(context, "passed file descriptor is only valid for proxy fd-pass open")) return .close;
         if (try handleTransportControlFrameQueued(context, frame.message_type, frame.payload)) return .consumed;
-        if (try handleDaemonTunnelControlFrame(context, frame.*)) return .consumed;
+        if (try handleDaemonTunnelControlFrame(context, daemon_dispatcher, frame.*)) return .consumed;
         var initial_frames = [_]protocol.OwnedFrame{frame.*};
         daemon_dispatcher.cancel(event.watch_id);
         try daemon_tunnel.registerMuxConnectionFromDaemon(context.allocator, daemon_dispatcher, .{
@@ -394,6 +398,7 @@ fn transferInitialRequestToDispatcherOwner(
             daemon_log.infof(context.allocator, "ssh transport requested", .{});
             daemon_dispatcher.cancel(event.watch_id);
             try transport_ssh.registerPooledSshTransportFromDaemon(.{
+                .blocking = context.blocking,
                 .allocator = context.allocator,
                 .daemon_dispatcher = daemon_dispatcher,
                 .client_fd = context.fd,
@@ -432,6 +437,7 @@ fn transferInitialRequestToDispatcherOwner(
             }
             daemon_dispatcher.cancel(event.watch_id);
             try transport_ssh.registerProxyFdPassOpenFromDaemon(.{
+                .blocking = context.blocking,
                 .allocator = context.allocator,
                 .daemon_dispatcher = daemon_dispatcher,
                 .setup_fd = context.fd,
@@ -463,7 +469,11 @@ fn closeDaemonClient(context: *ClientContext, daemon_dispatcher: *dispatcher.Dis
 // Handle post-handshake frames that stayed with the generic router. Most
 // long-lived traffic should never reach this point; this is the guardrail that
 // keeps role-specific protocols from running without their owning dispatcher.
-fn handleClientFrameAfterHandshake(context: *ClientContext, frame: protocol.OwnedFrame) !bool {
+fn handleClientFrameAfterHandshake(
+    context: *ClientContext,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    frame: protocol.OwnedFrame,
+) !bool {
     switch (frame.message_type) {
         .client_remote => {
             var item = try protocol.decodeClientRemoteTerminalEmulatorItem(context.allocator, frame.payload);
@@ -492,7 +502,7 @@ fn handleClientFrameAfterHandshake(context: *ClientContext, frame: protocol.Owne
         },
         .daemon_tunnel => {
             if (try handleTransportControlFrameQueued(context, frame.message_type, frame.payload)) return true;
-            if (try handleDaemonTunnelControlFrame(context, frame)) return true;
+            if (try handleDaemonTunnelControlFrame(context, daemon_dispatcher, frame)) return true;
             try queueProtocolError(context, "daemon tunnel must be dispatcher-owned");
             return false;
         },
@@ -538,6 +548,7 @@ fn handleClientFrameAfterHandshake(context: *ClientContext, frame: protocol.Owne
 // daemon tunnel control connection.
 fn handleDaemonTunnelControlFrame(
     context: *ClientContext,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     frame: protocol.OwnedFrame,
 ) !bool {
     if (frame.message_type != .daemon_tunnel) return false;
@@ -548,6 +559,7 @@ fn handleDaemonTunnelControlFrame(
         .remote_process_cleanup_request => |request| {
             try daemon_cleanup.handleRemoteProcessCleanupRequestQueued(.{
                 .allocator = context.allocator,
+                .daemon_dispatcher = daemon_dispatcher,
                 .mux_writer = &context.writer,
                 .identity = context.identity,
                 .request = request,

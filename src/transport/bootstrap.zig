@@ -7,6 +7,7 @@ const c = std.c;
 const posix = std.posix;
 
 const client_ui = @import("../session/client_ui.zig");
+const core_blocking = @import("../core/blocking.zig");
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
 
@@ -388,6 +389,7 @@ fn isLowerSha256Hex(value: []const u8) bool {
 }
 
 fn readBootstrapLine(
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     reconnect_io: ReconnectIoContext,
@@ -406,7 +408,7 @@ fn readBootstrapLine(
             .events = posix.POLL.IN,
             .revents = 0,
         }};
-        const ready = try posix.poll(&pollfds, if (reconnect_io.reconnect_ui == null) -1 else 50);
+        const ready = try blocking.poll(&pollfds, if (reconnect_io.reconnect_ui == null) -1 else 50);
         if (try reconnect_io.shouldCancel()) return error.ReconnectCancelled;
         if (ready == 0) continue;
         if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and
@@ -437,7 +439,7 @@ test "readBootstrapLine returns the first line without the newline" {
     defer _ = c.close(fds[1]);
 
     try io.writeAll(fds[1], "MISSING linux x86_64\nextra\n");
-    const line = try readBootstrapLine(std.testing.allocator, fds[0], .{});
+    const line = try readBootstrapLine(core_blocking.fromTest(), std.testing.allocator, fds[0], .{});
     defer std.testing.allocator.free(line);
 
     try std.testing.expectEqualStrings("MISSING linux x86_64", line);

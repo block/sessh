@@ -10,7 +10,6 @@ const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const frame_forwarder = @import("../transport/frame_forwarder.zig");
 const frame_write_queue = @import("../transport/frame_write_queue.zig");
-const foreground_frame_io = @import("../transport/foreground_frame_io.zig");
 const one_shot_frame_writer = @import("../transport/one_shot_frame_writer.zig");
 const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_identity = @import("../daemon/identity.zig");
@@ -245,7 +244,6 @@ pub fn closeTerminalMuxStream(options: CloseTerminalMuxStreamOptions) void {
                 if (options.stream.session_guid.len != 0) options.allocator.free(options.stream.session_guid);
                 return;
             }
-            sendTerminalHangupToRemoteForeground(options.allocator, moved_stream.endpoint.fd) catch {};
         }
     }
     moved_stream.endpoint.close(options.daemon_dispatcher);
@@ -693,17 +691,6 @@ fn queueTerminalHangupAndCloseEndpoint(
     _ = fd.take();
 }
 
-fn sendTerminalHangupToRemoteForeground(allocator: std.mem.Allocator, fd: c.fd_t) !void {
-    const payload = try protocol.encodeTerminalEmulatorItemPayload(allocator, .{ .payload = .{ .session_hangup_request = .{} } });
-    defer allocator.free(payload);
-    try foreground_frame_io.writeFrame(.{
-        .allocator = allocator,
-        .fd = fd,
-        .message_type = .client_remote,
-        .payload = payload,
-    });
-}
-
 fn connectTerminalWorkerForOpen(
     allocator: std.mem.Allocator,
     request: pb.TerminalEmulatorItem.Open,
@@ -855,8 +842,7 @@ const OneShotErrorClient = struct {
     }
 };
 
-test "terminal mux close hangs up unrecorded remote process" {
-    const protocol_test_helpers = @import("../protocol/test_helpers.zig");
+test "terminal mux close without dispatcher closes endpoint without blocking hangup" {
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
 
@@ -871,12 +857,8 @@ test "terminal mux close hangs up unrecorded remote process" {
         .daemon_dispatcher = null,
     });
 
-    var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, fds[0]);
-    defer frame.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.MessageType.client_remote, frame.message_type);
-    var item = try protocol.decodeClientRemoteTerminalEmulatorItem(std.testing.allocator, frame.payload);
-    defer item.deinit(std.testing.allocator);
-    try std.testing.expectEqual(protocol.TerminalEmulatorPayload{ .session_hangup_request = .{} }, item.payload.?);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), c.read(fds[0], &byte, byte.len));
 }
 
 test "terminal mux close queues hangup through dispatcher when available" {

@@ -3,6 +3,7 @@
 // compatibility, and remote command shape.
 const std = @import("std");
 
+const core_blocking = @import("../core/blocking.zig");
 const client_log = @import("../core/client_log.zig");
 const config = @import("../core/config.zig");
 const string_list = @import("../core/string_list.zig");
@@ -43,8 +44,13 @@ pub const ResolvedSshConfig = struct {
     }
 };
 
-pub fn resolveSshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) !ResolvedSshConfig {
-    const output = querySshConfig(allocator, ssh_options, host) catch |err| {
+pub fn resolveSshConfig(
+    blocking: core_blocking.Blocking,
+    allocator: std.mem.Allocator,
+    ssh_options: []const []const u8,
+    host: []const u8,
+) !ResolvedSshConfig {
+    const output = querySshConfig(blocking, allocator, ssh_options, host) catch |err| {
         client_log.debug("event=ssh_config_query_failed host={s} error={t}", .{ host, err });
         return fallbackResolvedSshConfig(allocator, ssh_options, host);
     };
@@ -78,7 +84,12 @@ fn fallbackSshUser(allocator: std.mem.Allocator) ![]u8 {
     };
 }
 
-fn querySshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8, host: []const u8) ![]u8 {
+fn querySshConfig(
+    blocking: core_blocking.Blocking,
+    allocator: std.mem.Allocator,
+    ssh_options: []const []const u8,
+    host: []const u8,
+) ![]u8 {
     // Ask OpenSSH to expand Host aliases/config. sessh uses this resolved view
     // for pooling and SendEnv policy instead of reimplementing ssh_config.
     const transport_options = transportSshOptionsLen(ssh_options);
@@ -94,7 +105,7 @@ fn querySshConfig(allocator: std.mem.Allocator, ssh_options: []const []const u8,
     // SendEnv controls which client environment entries are forwarded. Keeping
     // the subprocess query isolated here prevents that policy from leaking into
     // the daemon routing code.
-    const result = try std.process.Child.run(.{
+    const result = try blocking.childRun(.{
         .allocator = allocator,
         .argv = argv,
         .max_output_bytes = ssh_config_query_max_output_bytes,

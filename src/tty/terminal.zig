@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const fixed_buffer = @import("../core/fixed_buffer.zig");
 const io = @import("../core/io.zig");
 const non_suspending_timer = @import("../core/non_suspending_timer.zig");
@@ -325,7 +326,7 @@ pub fn currentWindowSize() WindowSize {
     return .{};
 }
 
-fn queryKittyKeyboardFlags(fds: TerminalFds) !?u5 {
+fn queryKittyKeyboardFlags(blocking: core_blocking.Blocking, fds: TerminalFds) !?u5 {
     if (cached_probe != null and
         cached_probe_fds.eql(fds) and
         cached_probe.?.kitty_keyboard_flags != null)
@@ -340,7 +341,7 @@ fn queryKittyKeyboardFlags(fds: TerminalFds) !?u5 {
     defer guard.restore();
 
     try io.writeAll(fds.output, kitty_keyboard_query);
-    try readTerminalProbeResponses(fds.input, &probe, .kitty_keyboard_flags);
+    try readTerminalProbeResponses(blocking, fds.input, &probe, .kitty_keyboard_flags);
     mergeCachedProbe(fds, probe);
     return probe.kitty_keyboard_flags;
 }
@@ -352,7 +353,7 @@ const InitialKittyKeyboardFlags = struct {
 
 var cached_initial_kitty_keyboard_flags: ?InitialKittyKeyboardFlags = null;
 
-pub fn queryInitialKittyKeyboardFlags(fds: TerminalFds) u5 {
+pub fn queryInitialKittyKeyboardFlags(blocking: core_blocking.Blocking, fds: TerminalFds) u5 {
     if (cached_initial_kitty_keyboard_flags) |cached| {
         if (cached.fds.eql(fds)) return cached.flags;
     }
@@ -360,7 +361,7 @@ pub fn queryInitialKittyKeyboardFlags(fds: TerminalFds) u5 {
     // Reconnects keep using the same outer terminal. Querying it again after
     // the reconnect overlay clears can race with typed-ahead input and consume
     // those bytes as probe responses.
-    const flags = (queryKittyKeyboardFlags(fds) catch null) orelse 0;
+    const flags = (queryKittyKeyboardFlags(blocking, fds) catch null) orelse 0;
     cached_initial_kitty_keyboard_flags = .{
         .fds = fds,
         .flags = flags,
@@ -368,7 +369,7 @@ pub fn queryInitialKittyKeyboardFlags(fds: TerminalFds) u5 {
     return flags;
 }
 
-pub fn queryTerminalProbe(fds: TerminalFds) !TerminalProbe {
+pub fn queryTerminalProbe(blocking: core_blocking.Blocking, fds: TerminalFds) !TerminalProbe {
     if (cached_probe != null and cached_probe_fds.eql(fds)) return cached_probe.?;
     var probe = TerminalProbe{};
     if (c.isatty(fds.input) == 0 or c.isatty(fds.output) == 0) return probe;
@@ -378,7 +379,7 @@ pub fn queryTerminalProbe(fds: TerminalFds) !TerminalProbe {
 
     try io.writeAll(fds.output, terminal_probe_request);
 
-    try readTerminalProbeResponses(fds.input, &probe, .complete);
+    try readTerminalProbeResponses(blocking, fds.input, &probe, .complete);
 
     cached_probe = probe;
     cached_probe_fds = fds;
@@ -390,7 +391,7 @@ const ProbeReadTarget = enum {
     kitty_keyboard_flags,
 };
 
-fn readTerminalProbeResponses(input_fd: c.fd_t, probe: *TerminalProbe, target: ProbeReadTarget) !void {
+fn readTerminalProbeResponses(blocking: core_blocking.Blocking, input_fd: c.fd_t, probe: *TerminalProbe, target: ProbeReadTarget) !void {
     // Local terminal probes are asynchronous escape-sequence queries. A single
     // read can contain partial or multiple replies, so accumulate bytes and feed
     // them to the probe parser until the requested facts are known or timeout.
@@ -409,7 +410,7 @@ fn readTerminalProbeResponses(input_fd: c.fd_t, probe: *TerminalProbe, target: P
             .revents = 0,
         }};
         const timeout: i32 = @intCast(@min(remaining_ms, terminal_query_poll_ms));
-        const ready = try posix.poll(&pollfds, timeout);
+        const ready = try blocking.poll(&pollfds, timeout);
         if (ready == 0) continue;
         if ((pollfds[0].revents & posix.POLL.IN) == 0) {
             if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) break;

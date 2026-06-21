@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const core_blocking = @import("../core/blocking.zig");
 const protocol = @import("../protocol/mod.zig");
 const ssh_options = @import("ssh_options.zig");
 const ssh_transport_process = @import("ssh_transport_process.zig");
@@ -21,6 +22,7 @@ pub const ResolvedTarget = struct {
 };
 
 pub fn resolve(
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     options: []const []const u8,
     host: []const u8,
@@ -28,7 +30,7 @@ pub fn resolve(
     // Resolve OpenSSH config once and build the transport-pool identity from
     // that canonical view. Raw CLI host aliases are kept for ssh invocation, but
     // pooling uses resolved user/host/port/IPQoS.
-    var resolved_config = try ssh_options.resolveSshConfig(allocator, options, host);
+    var resolved_config = try ssh_options.resolveSshConfig(blocking, allocator, options, host);
     errdefer resolved_config.deinit(allocator);
     const default_ipqos_option = try resolved_config.defaultIpQosOption(allocator);
     errdefer if (default_ipqos_option) |option| allocator.free(option);

@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const io = @import("../core/io.zig");
 const app_allocator = @import("../core/app_allocator.zig");
 const renderer_mod = @import("renderer.zig");
@@ -21,20 +22,20 @@ pub const Guard = struct {
     alternate_screen_active: bool = false,
     active: bool = true,
 
-    pub fn init(fd: c.fd_t) Guard {
-        return initWithTerminalFds(.{ .output = fd });
+    pub fn init(blocking: core_blocking.Blocking, fd: c.fd_t) Guard {
+        return initWithTerminalFds(blocking, .{ .output = fd });
     }
 
-    pub fn initWithTerminalFds(fds: TerminalFds) Guard {
-        return initWithRenderer(Renderer.init(fds.output), null, initialKittyKeyboardFlags(fds));
+    pub fn initWithTerminalFds(blocking: core_blocking.Blocking, fds: TerminalFds) Guard {
+        return initWithRenderer(Renderer.init(fds.output), null, initialKittyKeyboardFlags(blocking, fds));
     }
 
-    pub fn initWithCleanupTitle(fd: c.fd_t, cleanup_title: []const u8) Guard {
-        return initWithTerminalFdsAndCleanupTitle(.{ .output = fd }, cleanup_title);
+    pub fn initWithCleanupTitle(blocking: core_blocking.Blocking, fd: c.fd_t, cleanup_title: []const u8) Guard {
+        return initWithTerminalFdsAndCleanupTitle(blocking, .{ .output = fd }, cleanup_title);
     }
 
-    pub fn initWithTerminalFdsAndCleanupTitle(fds: TerminalFds, cleanup_title: []const u8) Guard {
-        return initWithRenderer(Renderer.init(fds.output), cleanup_title, initialKittyKeyboardFlags(fds));
+    pub fn initWithTerminalFdsAndCleanupTitle(blocking: core_blocking.Blocking, fds: TerminalFds, cleanup_title: []const u8) Guard {
+        return initWithRenderer(Renderer.init(fds.output), cleanup_title, initialKittyKeyboardFlags(blocking, fds));
     }
 
     pub fn initWithInitialKittyKeyboardFlags(fd: c.fd_t, initial_kitty_keyboard_flags: u5) Guard {
@@ -49,12 +50,12 @@ pub const Guard = struct {
         return initWithRenderer(Renderer.init(fd), cleanup_title, initial_kitty_keyboard_flags);
     }
 
-    pub fn withCapabilities(fd: c.fd_t, caps: Capabilities) Guard {
-        return withTerminalFdsAndCapabilities(.{ .output = fd }, caps);
+    pub fn withCapabilities(blocking: core_blocking.Blocking, fd: c.fd_t, caps: Capabilities) Guard {
+        return withTerminalFdsAndCapabilities(blocking, .{ .output = fd }, caps);
     }
 
-    pub fn withTerminalFdsAndCapabilities(fds: TerminalFds, caps: Capabilities) Guard {
-        return initWithRenderer(Renderer.withCapabilities(fds.output, caps), null, initialKittyKeyboardFlags(fds));
+    pub fn withTerminalFdsAndCapabilities(blocking: core_blocking.Blocking, fds: TerminalFds, caps: Capabilities) Guard {
+        return initWithRenderer(Renderer.withCapabilities(fds.output, caps), null, initialKittyKeyboardFlags(blocking, fds));
     }
 
     pub fn withCapabilitiesAndInitialKittyKeyboardFlags(
@@ -65,12 +66,12 @@ pub const Guard = struct {
         return initWithRenderer(Renderer.withCapabilities(fd, caps), null, initial_kitty_keyboard_flags);
     }
 
-    pub fn withCapabilitiesAndCleanupTitle(fd: c.fd_t, caps: Capabilities, cleanup_title: []const u8) Guard {
-        return withTerminalFdsAndCapabilitiesAndCleanupTitle(.{ .output = fd }, caps, cleanup_title);
+    pub fn withCapabilitiesAndCleanupTitle(blocking: core_blocking.Blocking, fd: c.fd_t, caps: Capabilities, cleanup_title: []const u8) Guard {
+        return withTerminalFdsAndCapabilitiesAndCleanupTitle(blocking, .{ .output = fd }, caps, cleanup_title);
     }
 
-    pub fn withTerminalFdsAndCapabilitiesAndCleanupTitle(fds: TerminalFds, caps: Capabilities, cleanup_title: []const u8) Guard {
-        return initWithRenderer(Renderer.withCapabilities(fds.output, caps), cleanup_title, initialKittyKeyboardFlags(fds));
+    pub fn withTerminalFdsAndCapabilitiesAndCleanupTitle(blocking: core_blocking.Blocking, fds: TerminalFds, caps: Capabilities, cleanup_title: []const u8) Guard {
+        return initWithRenderer(Renderer.withCapabilities(fds.output, caps), cleanup_title, initialKittyKeyboardFlags(blocking, fds));
     }
 
     pub fn enterAlternateScreen(self: *Guard) !void {
@@ -124,9 +125,9 @@ pub fn restoreLocal(initial_kitty_keyboard_flags: u5) void {
     }
 }
 
-fn initialKittyKeyboardFlags(fds: TerminalFds) u5 {
+fn initialKittyKeyboardFlags(blocking: core_blocking.Blocking, fds: TerminalFds) u5 {
     if (c.isatty(fds.output) == 0) return 0;
-    return terminal.queryInitialKittyKeyboardFlags(fds);
+    return terminal.queryInitialKittyKeyboardFlags(blocking, fds);
 }
 
 test "final visible-client exit restore skips non-tty output and clears saved cleanup bytes" {
@@ -155,6 +156,7 @@ test "presentation guard restores cleanup title" {
     defer posix.close(fds[1]);
 
     var guard = Guard.withTerminalFdsAndCapabilitiesAndCleanupTitle(
+        core_blocking.fromTest(),
         .{ .input = fds[0], .output = fds[1] },
         Capabilities.xterm_compatible,
         "/Users/tomm/Development/sessh",
@@ -190,7 +192,11 @@ test "presentation guard leaves alternate screen only when it entered it" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var guard = Guard.withTerminalFdsAndCapabilities(.{ .input = fds[0], .output = fds[1] }, Capabilities.xterm_compatible);
+    var guard = Guard.withTerminalFdsAndCapabilities(
+        core_blocking.fromTest(),
+        .{ .input = fds[0], .output = fds[1] },
+        Capabilities.xterm_compatible,
+    );
     try guard.enterAlternateScreen();
     guard.restore();
 
@@ -206,7 +212,7 @@ test "presentation guard does not leave alternate screen when it did not enter i
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var guard = Guard.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    var guard = Guard.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     guard.restore();
 
     var buf: [512]u8 = undefined;

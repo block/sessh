@@ -1,7 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
-
-const core_blocking = @import("../core/blocking.zig");
 
 pub const DaemonIdentity = struct {
     pid: u64,
@@ -9,21 +8,21 @@ pub const DaemonIdentity = struct {
     socket_path: []const u8,
 };
 
-pub fn current(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, socket_path: []const u8) !DaemonIdentity {
+pub fn current(allocator: std.mem.Allocator, socket_path: []const u8) !DaemonIdentity {
     const pid: u64 = @intCast(c.getpid());
     return .{
         .pid = pid,
-        .start_time = try processStartTimeBlocking(blocking, allocator, pid),
+        .start_time = try processStartTime(allocator, pid),
         .socket_path = socket_path,
     };
 }
 
 pub fn processStartTime(allocator: std.mem.Allocator, pid: u64) ![]u8 {
-    return processStartTimeFromProc(allocator, pid) catch processStartTimeFromPs(allocator, pid);
-}
-
-fn processStartTimeBlocking(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, pid: u64) ![]u8 {
-    return processStartTimeFromProc(allocator, pid) catch processStartTimeFromPsBlocking(blocking, allocator, pid);
+    return switch (builtin.os.tag) {
+        .linux => processStartTimeFromProc(allocator, pid),
+        .macos => processStartTimeFromDarwinProc(allocator, pid),
+        else => error.ProcessStartTimeUnavailable,
+    };
 }
 
 fn processStartTimeFromProc(allocator: std.mem.Allocator, pid: u64) ![]u8 {
@@ -49,58 +48,62 @@ fn procStatField(fields_from_state: []const u8, field_number: usize) ![]const u8
     return error.ProcessStartTimeUnavailable;
 }
 
-fn processStartTimeFromPs(allocator: std.mem.Allocator, pid: u64) ![]u8 {
-    const pid_arg = try std.fmt.allocPrint(allocator, "{}", .{pid});
-    defer allocator.free(pid_arg);
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "ps", "-p", pid_arg, "-o", "lstart=" },
-        .max_output_bytes = 4096,
-        .expand_arg0 = .expand,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return error.ProcessStartTimeUnavailable,
-        else => return error.ProcessStartTimeUnavailable,
-    }
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (trimmed.len == 0) return error.ProcessStartTimeUnavailable;
-    return std.fmt.allocPrint(allocator, "ps-lstart:{s}", .{trimmed});
-}
-
-fn processStartTimeFromPsBlocking(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, pid: u64) ![]u8 {
-    // Fallback process identity for platforms without a cheap `/proc` start
-    // token. The value is opaque: cleanup only compares exact strings to avoid
-    // signaling a process after pid reuse.
-    const pid_arg = try std.fmt.allocPrint(allocator, "{}", .{pid});
-    defer allocator.free(pid_arg);
-
-    _ = blocking;
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "ps", "-p", pid_arg, "-o", "lstart=" },
-        .max_output_bytes = 4096,
-        .expand_arg0 = .expand,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return error.ProcessStartTimeUnavailable,
-        else => return error.ProcessStartTimeUnavailable,
-    }
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (trimmed.len == 0) return error.ProcessStartTimeUnavailable;
-    return std.fmt.allocPrint(allocator, "ps-lstart:{s}", .{trimmed});
-}
-
 pub fn processIdentityMatches(allocator: std.mem.Allocator, pid: u64, expected_start_time: []const u8) bool {
     const actual = processStartTime(allocator, pid) catch return false;
     defer allocator.free(actual);
     return std.mem.eql(u8, actual, expected_start_time);
+}
+
+const darwin_proc = if (builtin.os.tag == .macos) struct {
+    const PROC_PIDTBSDINFO = 3;
+    const MAXCOMLEN = 16;
+
+    const ProcBsdInfo = extern struct {
+        pbi_flags: u32,
+        pbi_status: u32,
+        pbi_xstatus: u32,
+        pbi_pid: u32,
+        pbi_ppid: u32,
+        pbi_uid: u32,
+        pbi_gid: u32,
+        pbi_ruid: u32,
+        pbi_rgid: u32,
+        pbi_svuid: u32,
+        pbi_svgid: u32,
+        rfu_1: u32,
+        pbi_comm: [MAXCOMLEN]u8,
+        pbi_name: [2 * MAXCOMLEN]u8,
+        pbi_nfiles: u32,
+        pbi_pgid: u32,
+        pbi_pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        pbi_nice: i32,
+        pbi_start_tvsec: u64,
+        pbi_start_tvusec: u64,
+    };
+
+    extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
+} else struct {};
+
+fn processStartTimeFromDarwinProc(allocator: std.mem.Allocator, pid: u64) ![]u8 {
+    if (builtin.os.tag != .macos) return error.ProcessStartTimeUnavailable;
+    if (pid == 0 or pid > @as(u64, @intCast(std.math.maxInt(c_int)))) return error.ProcessStartTimeUnavailable;
+
+    var info: darwin_proc.ProcBsdInfo = undefined;
+    const expected_size: c_int = @intCast(@sizeOf(darwin_proc.ProcBsdInfo));
+    const actual_size = darwin_proc.proc_pidinfo(
+        @intCast(pid),
+        darwin_proc.PROC_PIDTBSDINFO,
+        0,
+        &info,
+        expected_size,
+    );
+    if (actual_size != expected_size) return error.ProcessStartTimeUnavailable;
+    if (info.pbi_pid != pid) return error.ProcessStartTimeUnavailable;
+    // The token is intentionally opaque. Cleanup only compares exact strings,
+    // so we do not need to normalize it across platforms.
+    return std.fmt.allocPrint(allocator, "darwin-proc:{}:{}", .{ info.pbi_start_tvsec, info.pbi_start_tvusec });
 }
 
 test "processStartTime returns an opaque non-empty string for current process" {

@@ -885,6 +885,7 @@ pub fn runLocalStream(
     const ctrl_r_status_enabled = options.ctrl_r_status_enabled orelse (options.intercept_ctrl_r or options.reconnect_input_fd >= 0);
     const status_fd = if (options.status_fd >= 0) options.status_fd else control_fd;
     var reconnect_status = StreamReconnectStatus.init(.{
+        .blocking = blocking,
         .mode = options.status_mode,
         .ctrl_r_enabled = ctrl_r_status_enabled,
         .title_fallback = options.title_fallback,

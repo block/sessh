@@ -52,15 +52,15 @@ pub fn connectOrStart(blocking: core_blocking.Blocking, allocator: std.mem.Alloc
 // roles. It owns the daemon startup lock/ready-pipe choreography so daemon
 // daemon client code does not duplicate client-side spawn behavior.
 pub fn connectOrStartForDirName(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, dir_name: []const u8) !c.fd_t {
-    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+    if (connectAndHandshakeForDirName(blocking, allocator, dir_name)) |fd| return fd else |_| {}
 
     var startup_lock = (try daemon_startup.tryAcquireStartupLock(allocator, dir_name)) orelse {
         try daemon_startup.waitForStartupLockRelease(blocking, allocator, dir_name);
-        return connectAndHandshakeForDirName(allocator, dir_name);
+        return connectAndHandshakeForDirName(blocking, allocator, dir_name);
     };
     defer startup_lock.deinit();
 
-    if (connectAndHandshakeForDirName(allocator, dir_name)) |fd| return fd else |_| {}
+    if (connectAndHandshakeForDirName(blocking, allocator, dir_name)) |fd| return fd else |_| {}
 
     var pipe = try daemon_startup.ReadyPipe.init();
     defer pipe.deinit();
@@ -75,7 +75,7 @@ pub fn connectOrStartForDirName(blocking: core_blocking.Blocking, allocator: std
     }
     pipe.closeWrite();
     switch (try daemon_startup.waitForReady(blocking, &pipe)) {
-        .ready => return connectAndHandshakeForDirName(allocator, dir_name),
+        .ready => return connectAndHandshakeForDirName(blocking, allocator, dir_name),
         .closed, .timed_out => return error.DaemonDidNotStart,
     }
 }
@@ -432,9 +432,9 @@ pub fn connectForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.
     return socket_transport.connectSocket(path);
 }
 
-pub fn connectAndHandshakeForDirName(allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
+pub fn connectAndHandshakeForDirName(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, dir_name: []const u8) !c.fd_t {
     var fd = core_fds.OwnedFd.init(try connectForDirName(allocator, dir_name));
     defer fd.deinit();
-    try daemon_handshake.initiateForegroundClientHandshake(allocator, fd.get());
+    try daemon_handshake.initiateForegroundClientHandshake(blocking, allocator, fd.get());
     return fd.take();
 }

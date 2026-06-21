@@ -17,7 +17,7 @@ const protocol = @import("../protocol/mod.zig");
 const user_error = @import("../core/user_error.zig");
 const guid_ref = @import("../core/guid.zig");
 const frame_write_queue = @import("../transport/frame_write_queue.zig");
-const foreground_frame_io = @import("../transport/foreground_frame_io.zig");
+const one_shot_frame_writer = @import("../transport/one_shot_frame_writer.zig");
 const socket_transport = @import("../transport/socket.zig");
 const terminal = @import("../tty/terminal.zig");
 const tty_settings = @import("../tty/settings.zig");
@@ -435,17 +435,27 @@ fn connectTerminalWorkerControl(
     };
 }
 
-pub fn requestTerminalWorkerCleanup(allocator: std.mem.Allocator, guid: []const u8) !void {
-    const fd = try connectTerminalWorkerHandle(allocator, guid);
-    defer _ = c.close(fd);
-    try sendTerminalWorkerHangupForeground(allocator, fd);
+pub fn requestTerminalWorkerCleanup(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    guid: []const u8,
+) !void {
+    var fd = core_fds.OwnedFd.init(try connectTerminalWorker(allocator, daemon_dispatcher, guid));
+    errdefer fd.deinit();
+    try queueTerminalWorkerHangupAndClose(allocator, daemon_dispatcher, fd.get());
+    _ = fd.take();
 }
 
-fn sendTerminalWorkerHangupForeground(allocator: std.mem.Allocator, fd: c.fd_t) !void {
+fn queueTerminalWorkerHangupAndClose(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    fd: c.fd_t,
+) !void {
     const payload = try protocol.encodeTerminalEmulatorItemPayload(allocator, .{ .payload = .{ .session_hangup_request = .{} } });
     defer allocator.free(payload);
-    try foreground_frame_io.writeFrame(.{
+    try one_shot_frame_writer.registerFrameAndClose(.{
         .allocator = allocator,
+        .daemon_dispatcher = daemon_dispatcher,
         .fd = fd,
         .message_type = .client_remote,
         .payload = payload,
@@ -454,13 +464,17 @@ fn sendTerminalWorkerHangupForeground(allocator: std.mem.Allocator, fd: c.fd_t) 
 
 test "terminal worker cleanup sends hangup through foreground frame writer" {
     const protocol_test_helpers = @import("../protocol/test_helpers.zig");
-    const fds = try protocol_test_helpers.socketPairForTest();
+    var fds = try protocol_test_helpers.socketPairForTest();
     defer {
         _ = c.close(fds[0]);
         _ = c.close(fds[1]);
     }
 
-    try sendTerminalWorkerHangupForeground(std.testing.allocator, fds[0]);
+    var d = try dispatcher.Dispatcher.init(std.testing.allocator);
+    defer d.deinit();
+    try queueTerminalWorkerHangupAndClose(std.testing.allocator, &d, fds[0]);
+    _ = try d.loopForBlocking();
+    fds[0] = -1;
     var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, fds[1]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol.MessageType.client_remote, frame.message_type);

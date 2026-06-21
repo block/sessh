@@ -6,6 +6,7 @@ const c = std.c;
 const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const protocol = @import("../protocol/mod.zig");
 const foreground_frame_io = @import("../transport/foreground_frame_io.zig");
@@ -67,10 +68,11 @@ pub const Reader = struct {
 // caller waits for this one frame to flush, but the write itself still advances
 // through FrameWriteState so backpressure is explicit rather than hidden inside
 // a raw writeAll helper.
-pub fn writeConnectionEventForeground(fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
+pub fn writeConnectionEventForeground(blocking: core_blocking.Blocking, fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
     const payload = try protocol.encodeConnectionEventPayload(app_allocator.allocator(), event);
     defer app_allocator.allocator().free(payload);
     try foreground_frame_io.writeFrame(.{
+        .blocking = blocking,
         .allocator = app_allocator.allocator(),
         .fd = fd,
         .message_type = .client_daemon,
@@ -79,10 +81,11 @@ pub fn writeConnectionEventForeground(fd: c.fd_t, event: pb.ConnectionEvent.even
 }
 
 // Same foreground-only contract as writeConnectionEventForeground.
-pub fn writeRetryNowForeground(fd: c.fd_t) !void {
+pub fn writeRetryNowForeground(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
     const payload = try protocol.encodeClientDaemonPayload(app_allocator.allocator(), .{ .retry_now = .{} });
     defer app_allocator.allocator().free(payload);
     try foreground_frame_io.writeFrame(.{
+        .blocking = blocking,
         .allocator = app_allocator.allocator(),
         .fd = fd,
         .message_type = .client_daemon,
@@ -125,12 +128,14 @@ test "proxy diagnostics uses client daemon frames" {
     defer posix.close(fds[1]);
     try core_fds.setNonBlocking(fds[1]);
 
-    try writeConnectionEventForeground(fds[0], .{ .daemon_disconnected = .{
+    const blocking = core_blocking.fromTest();
+
+    try writeConnectionEventForeground(blocking, fds[0], .{ .daemon_disconnected = .{
         .retry_at_local_boot_time_ms = 1234,
     } });
-    try writeConnectionEventForeground(fds[0], .{ .ssh_stderr = .{ .data = "ssh: nope" } });
-    try writeConnectionEventForeground(fds[0], .{ .daemon_connected = .{} });
-    try writeRetryNowForeground(fds[0]);
+    try writeConnectionEventForeground(blocking, fds[0], .{ .ssh_stderr = .{ .data = "ssh: nope" } });
+    try writeConnectionEventForeground(blocking, fds[0], .{ .daemon_connected = .{} });
+    try writeRetryNowForeground(blocking, fds[0]);
 
     var reader = Reader.init(std.testing.allocator);
     defer reader.deinit();

@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 
 const config = @import("../core/config.zig");
+const core_blocking = @import("../core/blocking.zig");
 const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
 const fd_passing = @import("../core/fd_passing.zig");
 const fds = @import("../core/fds.zig");
@@ -185,6 +186,7 @@ pub fn printArgError(err: anyerror) !void {
 
 pub const FdPassSetupOptions = struct {
     allocator: std.mem.Allocator,
+    blocking: core_blocking.Blocking,
     daemon_fd: c.fd_t,
     transport: pb.ClientDaemonItem.SshTransportAcquire,
     proxy_guid: []const u8,
@@ -214,6 +216,7 @@ pub fn runFdPassSetup(options: FdPassSetupOptions) !void {
     defer allocator.free(payload);
 
     try foreground_frame_io.writeFrameWithScmRightsFd(.{
+        .blocking = options.blocking,
         .allocator = allocator,
         .fd = options.daemon_fd,
         .message_type = .client_daemon,
@@ -221,7 +224,7 @@ pub fn runFdPassSetup(options: FdPassSetupOptions) !void {
         .passed_fd = daemon_raw_fd.take(),
     });
 
-    try waitFdPassAccepted(allocator, options.daemon_fd);
+    try waitFdPassAccepted(options.blocking, allocator, options.daemon_fd);
 
     try sendRawFdMessageImmediate(std.posix.STDOUT_FILENO, "sessh-proxy-fd", ssh_raw_fd.take());
 }
@@ -239,11 +242,12 @@ fn sendRawFdMessageImmediate(sock_fd: c.fd_t, bytes: []const u8, passed_fd: c.fd
     }
 }
 
-fn waitFdPassAccepted(allocator: std.mem.Allocator, daemon_fd: c.fd_t) !void {
+fn waitFdPassAccepted(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, daemon_fd: c.fd_t) !void {
     // ProxyUseFdPass setup must not exit until sesshd has received the passed fd
     // and associated it with a mux stream; otherwise OpenSSH could inherit a
     // socket whose peer has not been adopted yet.
     var frame = try foreground_frame_io.readFrame(.{
+        .blocking = blocking,
         .allocator = allocator,
         .fd = daemon_fd,
     });

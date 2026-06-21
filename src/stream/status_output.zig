@@ -7,6 +7,7 @@ const c = std.c;
 const posix = std.posix;
 
 const client_log = @import("../core/client_log.zig");
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const fixed_buffer = @import("../core/fixed_buffer.zig");
 const connection_event = @import("../diagnostics/connection_event.zig");
@@ -195,12 +196,14 @@ pub const Status = struct {
     const Line = fixed_buffer.FixedBuffer(96);
     const TitleFallback = fixed_buffer.FixedBuffer(max_title_fallback_bytes);
     pub const InitOptions = struct {
+        blocking: core_blocking.Blocking,
         mode: Mode,
         ctrl_r_enabled: bool = false,
         title_fallback: []const u8 = "",
         status_fd: c.fd_t = -1,
     };
 
+    blocking: core_blocking.Blocking,
     fd: c.fd_t,
     mode: Mode,
     line: Line = .{},
@@ -219,6 +222,7 @@ pub const Status = struct {
     pub fn init(options: InitOptions) Status {
         const displayed = client_log.displayedUserDiagnosticSeq();
         var status = Status{
+            .blocking = options.blocking,
             .fd = if (options.status_fd >= 0) options.status_fd else switch (options.mode) {
                 .title => posix.STDOUT_FILENO,
                 .line, .status_line, .jsonl => posix.STDERR_FILENO,
@@ -338,7 +342,7 @@ pub const Status = struct {
                     self.writeStatusLine();
                 },
                 .jsonl => self.writeJsonlConnectionEvent(.{ .binary_bootstrapping = .{} }),
-                .client_control => proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .binary_bootstrapping = .{} }) catch return,
+                .client_control => proxy_diagnostics.writeConnectionEventForeground(self.blocking, self.fd, .{ .binary_bootstrapping = .{} }) catch return,
                 .title, .disabled => {},
             },
             .daemon_connecting => self.showReconnecting(),
@@ -426,19 +430,19 @@ pub const Status = struct {
 
     fn writeClientRetry(self: *Status, delay_ms: u64) void {
         if (self.mode != .client_control or self.fd < 0) return;
-        proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .daemon_disconnected = .{
+        proxy_diagnostics.writeConnectionEventForeground(self.blocking, self.fd, .{ .daemon_disconnected = .{
             .retry_at_local_boot_time_ms = local_boot_time.nowMs() +| delay_ms,
         } }) catch return;
     }
 
     fn writeClientReconnecting(self: *Status) void {
         if (self.mode != .client_control or self.fd < 0) return;
-        proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .daemon_connecting = .{} }) catch return;
+        proxy_diagnostics.writeConnectionEventForeground(self.blocking, self.fd, .{ .daemon_connecting = .{} }) catch return;
     }
 
     fn writeClientClear(self: *Status) void {
         if (self.mode != .client_control or self.fd < 0) return;
-        proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .daemon_connected = .{} }) catch return;
+        proxy_diagnostics.writeConnectionEventForeground(self.blocking, self.fd, .{ .daemon_connected = .{} }) catch return;
     }
 
     fn canWriteTitle(self: *const Status) bool {
@@ -491,7 +495,7 @@ pub const Status = struct {
                     io.writeAll(self.fd, "\r\n") catch return;
                 },
                 .jsonl => self.writeJsonlDiagnostic(line),
-                .client_control => proxy_diagnostics.writeConnectionEventForeground(self.fd, .{ .ssh_stderr = .{ .data = line } }) catch return,
+                .client_control => proxy_diagnostics.writeConnectionEventForeground(self.blocking, self.fd, .{ .ssh_stderr = .{ .data = line } }) catch return,
                 .title, .disabled => unreachable,
             }
         }
@@ -544,7 +548,7 @@ test "stream reconnect status uses plain stderr lines" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.init(.{ .status_fd = fds[1], .mode = .line });
+    var status = Status.init(.{ .blocking = core_blocking.fromTest(), .status_fd = fds[1], .mode = .line });
     status.showRetry(1_000);
     status.showRetry(500);
     status.showReconnecting();
@@ -566,7 +570,7 @@ test "stream reconnect status line redraws in place" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.init(.{ .status_fd = fds[1], .mode = .status_line });
+    var status = Status.init(.{ .blocking = core_blocking.fromTest(), .status_fd = fds[1], .mode = .status_line });
     status.showRetry(2_000);
     status.showRetry(1_000);
     status.clear();
@@ -585,7 +589,7 @@ test "stream reconnect status emits one jsonl retry per wait" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.init(.{ .status_fd = fds[1], .mode = .jsonl });
+    var status = Status.init(.{ .blocking = core_blocking.fromTest(), .status_fd = fds[1], .mode = .jsonl });
     status.handleConnectionEvent(.{ .event = .{ .daemon_disconnected = .{} } });
     status.handleConnectionEvent(.{ .event = .{ .unresponsive = .{} } });
     status.handleConnectionEvent(.{ .event = .{ .ssh_stderr = .{ .data = "ssh: noisy\n" } } });
@@ -610,6 +614,7 @@ test "disabled stream reconnect status emits no UI" {
     defer posix.close(fds[0]);
 
     var status = Status.init(.{
+        .blocking = core_blocking.fromTest(),
         .status_fd = fds[1],
         .mode = .disabled,
         .ctrl_r_enabled = true,
@@ -632,6 +637,7 @@ test "stream reconnect status emits client control messages" {
     try core_fds.setNonBlocking(fds[0]);
 
     var status = Status.init(.{
+        .blocking = core_blocking.fromTest(),
         .status_fd = fds[1],
         .mode = .client_control,
         .ctrl_r_enabled = true,
@@ -681,6 +687,7 @@ test "stream reconnect status restores tracked application title" {
     defer posix.close(fds[0]);
 
     var status = Status.init(.{
+        .blocking = core_blocking.fromTest(),
         .status_fd = fds[1],
         .mode = .title,
         .ctrl_r_enabled = true,
@@ -705,6 +712,7 @@ test "stream reconnect status uses fallback title when app set none" {
     defer posix.close(fds[0]);
 
     var status = Status.init(.{
+        .blocking = core_blocking.fromTest(),
         .status_fd = fds[1],
         .mode = .title,
         .ctrl_r_enabled = true,
@@ -727,6 +735,7 @@ test "stream reconnect status skips title while terminal parser is unsafe" {
     defer posix.close(fds[0]);
 
     var status = Status.init(.{
+        .blocking = core_blocking.fromTest(),
         .status_fd = fds[1],
         .mode = .title,
         .ctrl_r_enabled = true,
@@ -748,6 +757,7 @@ test "stream escape help waits for terminal parser safe point" {
     try core_fds.setNonBlocking(fds[0]);
 
     var status = Status.init(.{
+        .blocking = core_blocking.fromTest(),
         .status_fd = fds[1],
         .mode = .title,
         .ctrl_r_enabled = true,
@@ -772,6 +782,7 @@ test "stream reconnect status treats synchronized update as unsafe for title" {
     defer posix.close(fds[0]);
 
     var status = Status.init(.{
+        .blocking = core_blocking.fromTest(),
         .status_fd = fds[1],
         .mode = .title,
         .ctrl_r_enabled = true,
@@ -797,7 +808,7 @@ test "stream reconnect status renders ssh diagnostics before status" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    var status = Status.init(.{ .status_fd = fds[1], .mode = .line });
+    var status = Status.init(.{ .blocking = core_blocking.fromTest(), .status_fd = fds[1], .mode = .line });
     client_log.appendSshStderr("control sequence: \x1b[31mred\n");
     status.showRetry(1_000);
     status.clear();
@@ -817,7 +828,7 @@ test "stream reconnect status appends diagnostics after status line" {
     defer posix.close(fds[0]);
 
     client_log.markUserDiagnosticsDisplayedThrough(client_log.currentUserDiagnosticSeq());
-    var status = Status.init(.{ .status_fd = fds[1], .mode = .line });
+    var status = Status.init(.{ .blocking = core_blocking.fromTest(), .status_fd = fds[1], .mode = .line });
     status.showRetry(1_000);
     client_log.appendSshStderr("connection failed\n");
     status.flushDiagnostics();

@@ -14,15 +14,45 @@ pub const Blocking = struct {
     _private: void = {},
 
     pub fn readExact(_: Blocking, fd: c.fd_t, buf: []u8) !void {
-        try io.readExact(fd, buf);
+        var offset: usize = 0;
+        while (offset < buf.len) {
+            const n = c.read(fd, buf[offset..].ptr, buf.len - offset);
+            if (n < 0) switch (posix.errno(n)) {
+                .AGAIN => {
+                    try waitReadable(fd);
+                    continue;
+                },
+                .INTR => continue,
+                else => return error.ReadFailed,
+            };
+            if (n == 0) return error.EndOfStream;
+            offset += @intCast(n);
+        }
+        io.noteRead(fd, buf);
     }
 
     pub fn writeAll(_: Blocking, fd: c.fd_t, bytes: []const u8) !void {
-        try io.writeAll(fd, bytes);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const n = c.write(fd, bytes[offset..].ptr, bytes.len - offset);
+            if (n < 0) switch (posix.errno(n)) {
+                .AGAIN => {
+                    try waitWritable(fd);
+                    continue;
+                },
+                .INTR => continue,
+                else => return error.WriteFailed,
+            };
+            if (n == 0) return error.WriteFailed;
+            offset += @intCast(n);
+        }
+        io.noteWrite(fd, bytes);
     }
 
-    pub fn stderrPrint(_: Blocking, comptime fmt: []const u8, args: anytype) !void {
-        try io.stderrPrint(fmt, args);
+    pub fn stderrPrint(self: Blocking, comptime fmt: []const u8, args: anytype) !void {
+        var buf: [1024]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, fmt, args);
+        try self.writeAll(posix.STDERR_FILENO, text);
     }
 
     pub fn sleepMs(_: Blocking, milliseconds: u64) void {
@@ -38,8 +68,20 @@ pub const Blocking = struct {
         return process_wait.termFromStatus(result.status);
     }
 
-    pub fn childRun(_: Blocking, options: anytype) !std.process.Child.RunResult {
-        return std.process.Child.run(options);
+    pub const ChildRunOptions = struct {
+        allocator: std.mem.Allocator,
+        argv: []const []const u8,
+        max_output_bytes: usize = 50 * 1024,
+        expand_arg0: std.process.Child.Arg0Expand = .no_expand,
+    };
+
+    pub fn childRun(_: Blocking, options: ChildRunOptions) !std.process.Child.RunResult {
+        return std.process.Child.run(.{
+            .allocator = options.allocator,
+            .argv = options.argv,
+            .max_output_bytes = options.max_output_bytes,
+            .expand_arg0 = options.expand_arg0,
+        });
     }
 
     pub fn loop(_: Blocking) !dispatcher.LoopExit {
@@ -50,6 +92,26 @@ pub const Blocking = struct {
         _ = try self.loop();
     }
 };
+
+fn waitReadable(fd: c.fd_t) !void {
+    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    while (true) {
+        pollfds[0].revents = 0;
+        _ = posix.poll(pollfds[0..], -1) catch return error.ReadFailed;
+        if ((pollfds[0].revents & posix.POLL.IN) != 0) return;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.ReadFailed;
+    }
+}
+
+fn waitWritable(fd: c.fd_t) !void {
+    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    while (true) {
+        pollfds[0].revents = 0;
+        _ = posix.poll(pollfds[0..], -1) catch return error.WriteFailed;
+        if ((pollfds[0].revents & posix.POLL.OUT) != 0) return;
+        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return error.WriteFailed;
+    }
+}
 
 pub fn fromMain() Blocking {
     return .{};

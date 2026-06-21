@@ -6,6 +6,7 @@ const c = std.c;
 const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const fixed_buffer = @import("../core/fixed_buffer.zig");
 const io = @import("../core/io.zig");
@@ -34,6 +35,7 @@ const ProxyClientControl = struct {
     const StatusLine = fixed_buffer.FixedBuffer(max_status_bytes);
     const CleanupTitle = fixed_buffer.FixedBuffer(max_cleanup_title_bytes);
 
+    blocking: core_blocking.Blocking,
     control_fd: c.fd_t = -1,
     control_reader: proxy_diagnostics.Reader,
     title_tracker: status_output.TerminalTitleTracker = .{},
@@ -47,6 +49,7 @@ const ProxyClientControl = struct {
     onscreen_status: bool = false,
 
     const InitOptions = struct {
+        blocking: core_blocking.Blocking,
         allocator: std.mem.Allocator,
         ctrl_r_allowed: bool = false,
         onscreen_status: bool = false,
@@ -54,6 +57,7 @@ const ProxyClientControl = struct {
 
     fn init(options: InitOptions) ProxyClientControl {
         var diagnostics = ProxyClientControl{
+            .blocking = options.blocking,
             .control_reader = proxy_diagnostics.Reader.init(options.allocator),
             .ctrl_r_allowed = options.ctrl_r_allowed,
             .onscreen_status = options.onscreen_status,
@@ -154,7 +158,7 @@ const ProxyClientControl = struct {
 
     fn sendCtrlR(self: *ProxyClientControl) void {
         if (self.control_fd < 0) return;
-        proxy_diagnostics.writeRetryNowForeground(self.control_fd) catch {};
+        proxy_diagnostics.writeRetryNowForeground(self.blocking, self.control_fd) catch {};
     }
 
     fn showUpdate(self: *ProxyClientControl, line: []const u8) void {
@@ -228,6 +232,7 @@ fn retryDelayFromLocalBootDeadline(deadline_ms: ?u64) u64 {
 }
 
 pub const RunArgvWithDiagnosticsOptions = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     ssh_args: []const []const u8,
     control_fd: c.fd_t,
@@ -253,6 +258,7 @@ pub fn runArgvWithDiagnostics(options: RunArgvWithDiagnosticsOptions) !noreturn 
     try ssh_process.spawn();
 
     var diagnostics = ProxyClientControl.init(.{
+        .blocking = options.blocking,
         .allocator = allocator,
         .onscreen_status = true,
     });
@@ -263,12 +269,12 @@ pub fn runArgvWithDiagnostics(options: RunArgvWithDiagnosticsOptions) !noreturn 
     }
 
     const ssh_pid: c.pid_t = @intCast(ssh_process.id);
-    const term = waitForSshProcessAndDiagnostics(ssh_pid, &diagnostics);
+    const term = waitForSshProcessAndDiagnostics(options.blocking, ssh_pid, &diagnostics);
     return exitAfterTerm(term, options.diagnostic_name);
 }
 
-fn waitForSshProcessAndDiagnostics(pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
-    var context = SshProcessDiagnosticsWait.init(pid, diagnostics);
+fn waitForSshProcessAndDiagnostics(blocking: core_blocking.Blocking, pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
+    var context = SshProcessDiagnosticsWait.init(blocking, pid, diagnostics);
     defer context.deinit();
     context.run() catch return .{ .Unknown = 0 };
     return context.term orelse .{ .Unknown = 0 };
@@ -295,12 +301,14 @@ fn plainSshFdEventFromRevents(fd: c.fd_t, revents: i16) PlainSshFdEvent {
 }
 
 const SshProcessDiagnosticsWait = struct {
+    blocking: core_blocking.Blocking,
     pid: c.pid_t,
     diagnostics: *ProxyClientControl,
     term: ?std.process.Child.Term = null,
 
-    fn init(pid: c.pid_t, diagnostics: *ProxyClientControl) SshProcessDiagnosticsWait {
+    fn init(blocking: core_blocking.Blocking, pid: c.pid_t, diagnostics: *ProxyClientControl) SshProcessDiagnosticsWait {
         return .{
+            .blocking = blocking,
             .pid = pid,
             .diagnostics = diagnostics,
         };
@@ -322,7 +330,7 @@ const SshProcessDiagnosticsWait = struct {
                 .events = if (self.diagnostics.control_fd >= 0) posix.POLL.IN else 0,
                 .revents = 0,
             }};
-            _ = try posix.poll(pollfds[0..], ssh_process_wait_poll_ms);
+            _ = try self.blocking.poll(pollfds[0..], ssh_process_wait_poll_ms);
             if (pollfds[0].revents != 0) {
                 const event = plainSshFdEventFromRevents(pollfds[0].fd, pollfds[0].revents);
                 if (event.readable or event.hangup or event.error_event or event.invalid) {
@@ -347,6 +355,7 @@ fn checkSshProcessExit(pid: c.pid_t) ?std.process.Child.Term {
 }
 
 pub const LocalPtyArgvOptions = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     ssh_args: []const []const u8,
     control_fd: c.fd_t,
@@ -375,7 +384,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
         .command_argv = ssh_argv,
         .tty_settings = if (captured_tty_settings) |settings| settings else null,
     });
-    defer local_pty.terminate();
+    defer local_pty.terminate(options.blocking);
 
     var mode_guard = try terminal.TerminalModeGuard.enable(posix.STDIN_FILENO);
     defer mode_guard.restore();
@@ -389,6 +398,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
     core_fds.setNonBlocking(local_pty.master_fd) catch {};
 
     var diagnostics = ProxyClientControl.init(.{
+        .blocking = options.blocking,
         .allocator = allocator,
         .ctrl_r_allowed = options.client_ctrl_r,
     });
@@ -402,7 +412,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
     // PTY, user input, and diagnostics for one visible ssh invocation.
     while (true) {
         refreshLocalPtySize(local_pty.master_fd, &size);
-        var poll = LocalPtyRelayPoll.init(local_pty.master_fd, diagnostics.control_fd);
+        var poll = LocalPtyRelayPoll.init(options.blocking, local_pty.master_fd, diagnostics.control_fd);
         defer poll.deinit();
         poll.run() catch continue;
         refreshLocalPtySize(local_pty.master_fd, &size);
@@ -418,7 +428,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
                 .eof => {
                     // foreground local-PTY relay exit. The PTY
                     // has closed and this process is only collecting ssh status.
-                    const term = local_pty.wait();
+                    const term = local_pty.wait(options.blocking);
                     local_pty.closeMaster();
                     diagnostics.clear();
                     return exitAfterLocalPtyTerm(term, options.diagnostic_name, &presentation_state);
@@ -429,7 +439,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
             if ((event.hangup or event.error_event or event.invalid) and !event.readable) {
                 // foreground local-PTY relay exit. The PTY has
                 // closed and this process is only collecting ssh status.
-                const term = local_pty.wait();
+                const term = local_pty.wait(options.blocking);
                 local_pty.closeMaster();
                 diagnostics.clear();
                 return exitAfterLocalPtyTerm(term, options.diagnostic_name, &presentation_state);
@@ -452,14 +462,16 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
 }
 
 const LocalPtyRelayPoll = struct {
+    blocking: core_blocking.Blocking,
     pty_fd: c.fd_t,
     control_fd: c.fd_t,
     pty_event: ?PlainSshFdEvent = null,
     stdin_event: ?PlainSshFdEvent = null,
     control_event: ?PlainSshFdEvent = null,
 
-    fn init(pty_fd: c.fd_t, control_fd: c.fd_t) LocalPtyRelayPoll {
+    fn init(blocking: core_blocking.Blocking, pty_fd: c.fd_t, control_fd: c.fd_t) LocalPtyRelayPoll {
         return .{
+            .blocking = blocking,
             .pty_fd = pty_fd,
             .control_fd = control_fd,
         };
@@ -476,7 +488,7 @@ const LocalPtyRelayPoll = struct {
         if (self.control_fd >= 0) {
             poll_set.add(self.control_fd, posix.POLL.IN, .control);
         }
-        _ = try posix.poll(poll_set.fdSlice(), -1);
+        _ = try self.blocking.poll(poll_set.fdSlice(), -1);
         for (poll_set.fdSlice(), poll_set.kindSlice()) |pollfd, kind| {
             if (pollfd.revents == 0) continue;
             const event = plainSshFdEventFromRevents(pollfd.fd, pollfd.revents);
@@ -552,7 +564,7 @@ fn exitAfterTerm(term: std.process.Child.Term, diagnostic_name: []const u8) !nor
     }
 }
 
-pub fn runArgv(allocator: std.mem.Allocator, ssh_args: []const []const u8, diagnostic_name: []const u8) !noreturn {
+pub fn runArgv(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, ssh_args: []const []const u8, diagnostic_name: []const u8) !noreturn {
     const ssh_argv = try allocator.alloc([]const u8, ssh_args.len + 1);
     defer allocator.free(ssh_argv);
     ssh_argv[0] = "ssh";
@@ -568,6 +580,6 @@ pub fn runArgv(allocator: std.mem.Allocator, ssh_args: []const []const u8, diagn
     // foreground plain-ssh path. At this point the spawned
     // `ssh` process owns the user-visible session and there is no sessh daemon
     // workload in this process to keep responsive.
-    const term = try ssh_process.wait();
+    const term = blocking.waitPid(@intCast(ssh_process.id));
     return exitAfterTerm(term, diagnostic_name);
 }

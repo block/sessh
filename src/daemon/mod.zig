@@ -88,10 +88,10 @@ pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: 
     socket_transport.publishSesshRuntimeDirSymlinkOnce(allocator);
     const path = try socketPathForDirName(allocator, dir_name);
     defer allocator.free(path);
-    const identity = try daemon_identity.current(blocking, allocator, path);
+    const identity = try daemon_identity.current(allocator, path);
     defer allocator.free(identity.start_time);
 
-    var daemon_lock = try acquireDaemonSocketLock(allocator, dir_name, path);
+    var daemon_lock = try acquireDaemonSocketLock(blocking, allocator, dir_name, path);
     defer daemon_lock.deinit();
     var locked_namespace_executables = try daemon_executable.installNamespaceExecutablesWhileHoldingLock(allocator, exe, dir_name);
     defer locked_namespace_executables.deinit();
@@ -109,6 +109,7 @@ pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: 
     const daemon_dispatcher = dispatcher.get();
 
     var accept_context = daemon_accept.Context{
+        .blocking = blocking,
         .allocator = allocator,
         .terminal_remote_exe = locked_namespace_executables.terminal_remote,
         .proxy_remote_exe = locked_namespace_executables.proxy_remote,
@@ -155,12 +156,12 @@ const DaemonSocketLock = struct {
 // The lock file, not the socket path, serializes daemon ownership. A Unix
 // socket pathname can briefly be stale, absent, or connected to a daemon that is
 // already exiting; the lock gives startup and shutdown one shared ordering point.
-fn acquireDaemonSocketLock(allocator: std.mem.Allocator, dir_name: []const u8, socket_path: []const u8) !DaemonSocketLock {
+fn acquireDaemonSocketLock(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, dir_name: []const u8, socket_path: []const u8) !DaemonSocketLock {
     try socket_transport.ensureSocketDir(allocator, socket_path);
 
     return tryAcquireDaemonSocketLock(allocator, socket_path) catch |err| switch (err) {
         error.DaemonLockBusy => lock_busy: {
-            if (daemon_client.connectAndHandshakeForDirName(allocator, dir_name)) |fd| {
+            if (daemon_client.connectAndHandshakeForDirName(blocking, allocator, dir_name)) |fd| {
                 _ = c.close(fd);
                 return error.DaemonAlreadyRunning;
             } else |_| {}

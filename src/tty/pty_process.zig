@@ -6,8 +6,8 @@ const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
-const process_wait = @import("../core/waitpid.zig");
 const posix_pty = @import("posix_pty.zig");
 const terminal = @import("terminal.zig");
 const tty_settings = @import("settings.zig");
@@ -42,20 +42,20 @@ pub const PtyProcess = struct {
         }
     }
 
-    pub fn wait(self: *PtyProcess) std.process.Child.Term {
+    pub fn wait(self: *PtyProcess, blocking: core_blocking.Blocking) std.process.Child.Term {
         if (self.pid == 0) return .{ .Unknown = 0 };
         // process cleanup after the PTY master has been closed
         // and SIGTERM has been sent. This is not daemon event-loop work.
-        const result = posix.waitpid(self.pid, 0);
+        const term = blocking.waitPid(self.pid);
         self.pid = 0;
-        return process_wait.termFromStatus(result.status);
+        return term;
     }
 
-    pub fn terminate(self: *PtyProcess) void {
+    pub fn terminate(self: *PtyProcess, blocking: core_blocking.Blocking) void {
         self.closeMaster();
         if (self.pid != 0) {
             posix.kill(self.pid, posix.SIG.TERM) catch {};
-            _ = self.wait();
+            _ = self.wait(blocking);
         }
     }
 };
@@ -337,7 +337,8 @@ test "drain master reads available PTY output while process is still alive" {
         .shell = "/bin/sh",
         .shell_command = "printf PTY_MASTER_DRAIN; read ignored",
     });
-    defer process.terminate();
+    const blocking = core_blocking.fromTest();
+    defer process.terminate(blocking);
 
     var pollfds = [_]posix.pollfd{.{
         .fd = process.master_fd,
@@ -375,11 +376,12 @@ test "spawn applies portable tty settings before exec" {
         .shell_command = "printf 'TERM=%s\\n' \"$TERM\"; stty -a",
         .tty_settings = settings,
     });
-    defer process.terminate();
+    const blocking = core_blocking.fromTest();
+    defer process.terminate(blocking);
 
     const output = try testing.readPtyProcessOutput(std.testing.allocator, &process);
     defer std.testing.allocator.free(output);
-    const term = process.wait();
+    const term = process.wait(blocking);
 
     try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
     try std.testing.expect(std.mem.indexOf(u8, output, "TERM=ansi") != null);

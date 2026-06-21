@@ -9,6 +9,7 @@ const posix = std.posix;
 const protocol = @import("../protocol/mod.zig");
 const terminal_worker = @import("../session/terminal_worker.zig");
 const guid_ref = @import("../core/guid.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const socket_transport = @import("../transport/socket.zig");
 const proxy_worker = @import("../stream/proxy_worker.zig");
 const daemon_identity = @import("identity.zig");
@@ -177,6 +178,7 @@ pub fn deleteRecordByGuid(allocator: std.mem.Allocator, guid: []const u8) void {
 
 pub const RemoteProcessCleanupRequestQueuedOptions = struct {
     allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     mux_writer: *frame_write_queue.FrameWriteQueue,
     identity: daemon_identity.DaemonIdentity,
     request: pb.DaemonTunnelItem.RemoteProcessCleanupRequest,
@@ -188,7 +190,7 @@ pub fn handleRemoteProcessCleanupRequestQueued(options: RemoteProcessCleanupRequ
     const identity = options.identity;
     const request = options.request;
     const process = request.process orelse return error.UnexpectedFrame;
-    const result = cleanupRemoteProcess(allocator, identity, process) catch .missing;
+    const result = cleanupRemoteProcess(allocator, options.daemon_dispatcher, identity, process) catch .missing;
     try queueRemoteProcessCleanupResponse(mux_writer, process, result);
 }
 
@@ -324,6 +326,7 @@ pub fn hasRecords(allocator: std.mem.Allocator) bool {
 
 fn cleanupRemoteProcess(
     allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
     identity: daemon_identity.DaemonIdentity,
     process: pb.DaemonTunnelItem.RemoteProcessIdentity,
 ) !CleanupResult {
@@ -331,7 +334,7 @@ fn cleanupRemoteProcess(
     if (process.pid == identity.pid) {
         if (!std.mem.eql(u8, process.start_time, identity.start_time)) return .missing;
         if (std.mem.eql(u8, process.daemon_socket_path, identity.socket_path)) {
-            return cleanupGuidOnCurrentDaemon(allocator, process.guid);
+            return cleanupGuidOnCurrentDaemon(allocator, daemon_dispatcher, process.guid);
         }
     }
 
@@ -341,9 +344,13 @@ fn cleanupRemoteProcess(
     return .cleaned;
 }
 
-fn cleanupGuidOnCurrentDaemon(allocator: std.mem.Allocator, guid: []const u8) !CleanupResult {
+fn cleanupGuidOnCurrentDaemon(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    guid: []const u8,
+) !CleanupResult {
     if (std.mem.startsWith(u8, guid, "s-")) {
-        terminal_worker.requestTerminalWorkerCleanup(allocator, guid) catch |err| switch (err) {
+        terminal_worker.requestTerminalWorkerCleanup(allocator, daemon_dispatcher, guid) catch |err| switch (err) {
             error.SessionNotFound, error.InvalidSessionId => return .missing,
             else => return err,
         };

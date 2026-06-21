@@ -10,6 +10,7 @@ const bootstrap_client = @import("bootstrap_client.zig");
 const client_env = @import("client_environment.zig");
 const cleanup_identity = @import("../session/cleanup_identity.zig");
 const config = @import("../core/config.zig");
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_log = @import("../daemon/log.zig");
@@ -283,6 +284,7 @@ pub fn activePooledSshTransportCount() usize {
 }
 
 pub const RegisterPooledSshTransportOptions = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
     client_fd: c.fd_t,
@@ -297,7 +299,7 @@ pub fn registerPooledSshTransportFromDaemon(options: RegisterPooledSshTransportO
     const daemon_dispatcher = options.daemon_dispatcher;
     const client_fd = options.client_fd;
     const request = options.request;
-    var resolved_target = try pooled_ssh_identity.resolve(allocator, request.ssh_option.items, request.host);
+    var resolved_target = try pooled_ssh_identity.resolve(options.blocking, allocator, request.ssh_option.items, request.host);
     defer resolved_target.deinit(allocator);
     var acquire_request = request;
     if (acquire_request.ip_qos.len == 0) {
@@ -321,6 +323,7 @@ pub fn registerPooledSshTransportFromDaemon(options: RegisterPooledSshTransportO
 }
 
 const ProxyFdPassOpenRegistration = struct {
+    blocking: core_blocking.Blocking,
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
     setup_fd: c.fd_t,
@@ -383,7 +386,7 @@ pub fn registerProxyFdPassOpenFromDaemon(options: ProxyFdPassOpenRegistration) !
         return;
     }
 
-    var resolved_target = try pooled_ssh_identity.resolve(allocator, transport_request.ssh_option.items, transport_request.host);
+    var resolved_target = try pooled_ssh_identity.resolve(options.blocking, allocator, transport_request.ssh_option.items, transport_request.host);
     defer resolved_target.deinit(allocator);
     var acquire_request = transport_request;
     if (acquire_request.ip_qos.len == 0) {

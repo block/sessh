@@ -118,13 +118,13 @@ test "resize repaint timeout clears stale visible client display and enters unre
 
     try std.testing.expectEqual(
         @as(?VisibleClientEnd, null),
-        checkResizeRepaintTimeoutAt(&session, 1_999),
+        checkResizeRepaintTimeoutAt(core_blocking.fromTest(), &session, 1_999),
     );
     try std.testing.expectEqual(@as(i32, 7), session.viewport_offset);
 
     try std.testing.expectEqual(
         VisibleClientEnd.unresponsive,
-        checkResizeRepaintTimeoutAt(&session, 2_000).?,
+        checkResizeRepaintTimeoutAt(core_blocking.fromTest(), &session, 2_000).?,
     );
     try std.testing.expectEqual(@as(i32, 0), session.viewport_offset);
     try std.testing.expect(session.pending_repaint.requiresRepaintForRecovery());
@@ -216,7 +216,7 @@ test "cancelled reconnect frame read returns without input" {
     defer posix.close(fds[1]);
 
     var cancelled = true;
-    try std.testing.expectError(error.ReconnectCancelled, readVisibleClientFrameMaybeCancelled(fds[0], &cancelled));
+    try std.testing.expectError(error.ReconnectCancelled, readVisibleClientFrameMaybeCancelled(core_blocking.fromTest(), fds[0], &cancelled));
 }
 
 test "draw payload preserves app title presence bit" {
@@ -373,7 +373,7 @@ test "reconnect waits for repaint response before returning" {
     defer session.deinit();
     try session.scrollback_cursor.set("old-cursor");
 
-    try reconnectSessionOnTerminalWorker(.{
+    try reconnectSessionOnTerminalWorker(core_blocking.fromTest(), .{
         .read = remote_to_client[0],
         .write = client_to_remote[1],
     }, &session);
@@ -407,12 +407,12 @@ test "terminal worker repaint after local ui requests screen-only repaint" {
     try session.scrollback_cursor.set("old-cursor");
     session.viewport_offset = 5;
 
-    try repaintVisibleClientSessionState(.{
+    try repaintVisibleClientSessionState(core_blocking.fromTest(), .{
         .read = remote_to_client[0],
         .write = client_to_remote[1],
     }, &session);
 
-    var frame = try readVisibleClientFrameMaybeCancelled(client_to_remote[0], null);
+    var frame = try readVisibleClientFrameMaybeCancelled(core_blocking.fromTest(), client_to_remote[0], null);
     defer frame.deinit(app_allocator.allocator());
     try std.testing.expectEqual(protocol.MessageType.client_remote, frame.message_type);
     var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
@@ -437,6 +437,7 @@ test "terminal worker repaint after local ui requests screen-only repaint" {
 // keyboard mode, and default colors must describe the same point in time as the
 // open request sent to the terminal worker.
 pub const StartNewSessionOptions = struct {
+    blocking: core_blocking.Blocking,
     worker_fds: TerminalWorkerFds,
     scrollback_row_count: u32,
     session_guid: []const u8,
@@ -450,7 +451,7 @@ pub fn startNewSessionOnTerminalWorker(
     options: StartNewSessionOptions,
 ) !VisibleClientSessionState {
     const repaint_request_seq = try sendSessionCreate(options);
-    var session = try readVisibleClientSessionState(options.worker_fds.read);
+    var session = try readVisibleClientSessionState(options.blocking, options.worker_fds.read);
     session.viewport_offset = options.local_terminal.viewport_offset orelse 0;
     session.pending_repaint.repaint_request_seq = repaint_request_seq;
     session.initial_draw_alignment.setCursor(options.local_terminal.cursor_position);
@@ -459,10 +460,12 @@ pub fn startNewSessionOnTerminalWorker(
 }
 
 fn reconnectSessionOnTerminalWorker(
+    blocking: core_blocking.Blocking,
     worker_fds: TerminalWorkerFds,
     session: *VisibleClientSessionState,
 ) !void {
     try reconnectSessionOnTerminalWorkerInner(.{
+        .blocking = blocking,
         .worker_fds = worker_fds,
         .session = session,
         .wait_for_repaint = true,
@@ -470,11 +473,13 @@ fn reconnectSessionOnTerminalWorker(
 }
 
 pub fn reconnectSessionOnTerminalWorkerCancellable(
+    blocking: core_blocking.Blocking,
     worker_fds: TerminalWorkerFds,
     session: *VisibleClientSessionState,
     cancelled: *const bool,
 ) !void {
     try reconnectSessionOnTerminalWorkerInner(.{
+        .blocking = blocking,
         .worker_fds = worker_fds,
         .session = session,
         .cancelled = cancelled,
@@ -483,6 +488,7 @@ pub fn reconnectSessionOnTerminalWorkerCancellable(
 }
 
 const ReconnectTerminalWorkerRequest = struct {
+    blocking: core_blocking.Blocking,
     worker_fds: TerminalWorkerFds,
     session: *VisibleClientSessionState,
     cancelled: ?*const bool = null,
@@ -490,42 +496,45 @@ const ReconnectTerminalWorkerRequest = struct {
 };
 
 fn reconnectSessionOnTerminalWorkerInner(request: ReconnectTerminalWorkerRequest) !void {
-    request.session.pending_repaint.repaint_request_seq = try sendSessionOpen(request.worker_fds.write, terminal.currentWindowSize(), request.session);
-    try readSessionReadyInner(request.worker_fds.read, request.cancelled);
+    request.session.pending_repaint.repaint_request_seq = try sendSessionOpen(request.blocking, request.worker_fds.write, terminal.currentWindowSize(), request.session);
+    try readSessionReadyInner(request.blocking, request.worker_fds.read, request.cancelled);
     if (request.wait_for_repaint) {
-        try finishReconnectRepaintInner(request.worker_fds.read, request.session, request.cancelled);
+        try finishReconnectRepaintInner(request.blocking, request.worker_fds.read, request.session, request.cancelled);
     }
 }
 
 pub fn finishReconnectRepaint(
+    blocking: core_blocking.Blocking,
     read_fd: c.fd_t,
     session: *VisibleClientSessionState,
 ) !void {
-    try finishReconnectRepaintInner(read_fd, session, null);
+    try finishReconnectRepaintInner(blocking, read_fd, session, null);
 }
 
 fn repaintVisibleClientSessionState(
+    blocking: core_blocking.Blocking,
     worker_fds: TerminalWorkerFds,
     session: *VisibleClientSessionState,
 ) !void {
-    try sendTerminalEmulatorPayloadForeground(worker_fds.write, .{ .resize = visible_client_messages.resizeMessage(.{
+    try sendTerminalEmulatorPayloadForeground(blocking, worker_fds.write, .{ .resize = visible_client_messages.resizeMessage(.{
         .size = terminal.currentWindowSize(),
         .viewport_offset = visible_client_messages.nonZeroViewportOffset(session.viewport_offset),
         .repaint_request = .{ .repaint_request_seq = session.pending_repaint.start() },
     }) });
-    try finishReconnectRepaint(worker_fds.read, session);
+    try finishReconnectRepaint(blocking, worker_fds.read, session);
 }
 
 // During reconnect, keep reading worker frames until the requested repaint is
 // complete. Draw/input-ack/transcript frames can arrive interleaved with the
 // repaint response, so this loop applies only the pieces that advance recovery.
 fn finishReconnectRepaintInner(
+    blocking: core_blocking.Blocking,
     read_fd: c.fd_t,
     session: *VisibleClientSessionState,
     cancelled: ?*const bool,
 ) !void {
     while (session.pending_repaint.active()) {
-        var frame = try readVisibleClientFrameMaybeCancelled(read_fd, cancelled);
+        var frame = try readVisibleClientFrameMaybeCancelled(blocking, read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .client_remote => {
@@ -737,12 +746,12 @@ fn readTerminalWorkerRecoveryFrame(read_fd: c.fd_t, session: *VisibleClientSessi
     }
 }
 
-fn readVisibleClientSessionState(read_fd: c.fd_t) !VisibleClientSessionState {
+fn readVisibleClientSessionState(blocking: core_blocking.Blocking, read_fd: c.fd_t) !VisibleClientSessionState {
     // Initial session creation waits for either a session_ready item or a daemon
     // error. Client-daemon diagnostics may arrive first, so consume handled
     // daemon items until the terminal worker answers.
     while (true) {
-        var frame = try readVisibleClientFrameMaybeCancelled(read_fd, null);
+        var frame = try readVisibleClientFrameMaybeCancelled(blocking, read_fd, null);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .error_message => return initialSessionError(frame.payload),
@@ -768,18 +777,19 @@ fn readVisibleClientSessionState(read_fd: c.fd_t) !VisibleClientSessionState {
     }
 }
 
-fn readSessionReady(conn: c.fd_t) !void {
-    return readSessionReadyInner(conn, null);
+fn readSessionReady(blocking: core_blocking.Blocking, conn: c.fd_t) !void {
+    return readSessionReadyInner(blocking, conn, null);
 }
 
 fn readSessionReadyInner(
+    blocking: core_blocking.Blocking,
     read_fd: c.fd_t,
     cancelled: ?*const bool,
 ) !void {
     // Reconnect opens wait for a fresh session_ready but may be cancelled by the
     // visible UI if the user hangs up before the replacement transport wins.
     while (true) {
-        var frame = try readVisibleClientFrameMaybeCancelled(read_fd, cancelled);
+        var frame = try readVisibleClientFrameMaybeCancelled(blocking, read_fd, cancelled);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .error_message => return initialSessionError(frame.payload),
@@ -828,10 +838,12 @@ fn initialSessionError(payload: []const u8) anyerror {
 }
 
 fn readVisibleClientFrameMaybeCancelled(
+    blocking: core_blocking.Blocking,
     fd: c.fd_t,
     cancelled: ?*const bool,
 ) !protocol.OwnedFrame {
     return foreground_frame_io.readFrame(.{
+        .blocking = blocking,
         .allocator = app_allocator.allocator(),
         .fd = fd,
         .cancelled = cancelled,
@@ -840,11 +852,13 @@ fn readVisibleClientFrameMaybeCancelled(
 }
 
 fn writeVisibleClientFrameForeground(
+    blocking: core_blocking.Blocking,
     fd: c.fd_t,
     message_type: protocol.MessageType,
     payload: []const u8,
 ) !void {
     try foreground_frame_io.writeFrame(.{
+        .blocking = blocking,
         .allocator = app_allocator.allocator(),
         .fd = fd,
         .message_type = message_type,
@@ -900,11 +914,12 @@ fn sendSessionCreate(
         .capture_tty_transcript = tty_transcript.enabled(),
         .create = create,
     };
-    try sendTerminalEmulatorPayloadForeground(options.worker_fds.write, .{ .open = message });
+    try sendTerminalEmulatorPayloadForeground(options.blocking, options.worker_fds.write, .{ .open = message });
     return repaint_request_seq;
 }
 
 fn sendSessionOpen(
+    blocking: core_blocking.Blocking,
     write_fd: c.fd_t,
     size: WindowSize,
     session: *const VisibleClientSessionState,
@@ -925,11 +940,12 @@ fn sendSessionOpen(
         }),
         .capture_tty_transcript = tty_transcript.enabled(),
     };
-    try sendTerminalEmulatorPayloadForeground(write_fd, .{ .open = message });
+    try sendTerminalEmulatorPayloadForeground(blocking, write_fd, .{ .open = message });
     return repaint_request_seq;
 }
 
 fn sendTerminalEmulatorPayloadForeground(
+    blocking: core_blocking.Blocking,
     fd: c.fd_t,
     payload: protocol.TerminalEmulatorPayload,
 ) !void {
@@ -937,15 +953,15 @@ fn sendTerminalEmulatorPayloadForeground(
         .terminal_emulator = .{ .payload = payload },
     });
     defer app_allocator.allocator().free(encoded);
-    try writeVisibleClientFrameForeground(fd, .client_remote, encoded);
+    try writeVisibleClientFrameForeground(blocking, fd, .client_remote, encoded);
 }
 
-fn readSessionEndedOrError(conn: c.fd_t) !bool {
+fn readSessionEndedOrError(blocking: core_blocking.Blocking, conn: c.fd_t) !bool {
     // After sending a hang-up/open failure path, drain until the worker confirms
     // session end or reports a terminal error. Returning true means an error was
     // printed and should influence the caller's exit path.
     while (true) {
-        var frame = try readVisibleClientFrameMaybeCancelled(conn, null);
+        var frame = try readVisibleClientFrameMaybeCancelled(blocking, conn, null);
         defer frame.deinit(app_allocator.allocator());
         switch (frame.message_type) {
             .error_message => {
@@ -1238,7 +1254,7 @@ const VisibleTerminalLoop = struct {
             .last_size = &self.last_size,
             .session = session,
         });
-        if (checkResizeRepaintTimeout(session)) |end| {
+        if (checkResizeRepaintTimeout(self.blocking, session)) |end| {
             self.setEnd(end);
             return;
         }
@@ -1545,25 +1561,25 @@ fn finishVisibleClient(end: VisibleClientEnd, session: *VisibleClientSessionStat
     return end;
 }
 
-fn clearVisibleAfterResizeTimeout(session: *VisibleClientSessionState) void {
+fn clearVisibleAfterResizeTimeout(blocking: core_blocking.Blocking, session: *VisibleClientSessionState) void {
     session.viewport_offset = 0;
     if (c.isatty(posix.STDOUT_FILENO) == 0) return;
     const renderer = client_renderer.Renderer.init(posix.STDOUT_FILENO);
-    renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(.{})) catch {};
+    renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(blocking, .{})) catch {};
     renderer.clearVisible() catch {};
 }
 
-fn checkResizeRepaintTimeout(session: *VisibleClientSessionState) ?VisibleClientEnd {
-    return checkResizeRepaintTimeoutAt(session, null);
+fn checkResizeRepaintTimeout(blocking: core_blocking.Blocking, session: *VisibleClientSessionState) ?VisibleClientEnd {
+    return checkResizeRepaintTimeoutAt(blocking, session, null);
 }
 
-fn checkResizeRepaintTimeoutAt(session: *VisibleClientSessionState, now_ms: ?u64) ?VisibleClientEnd {
+fn checkResizeRepaintTimeoutAt(blocking: core_blocking.Blocking, session: *VisibleClientSessionState, now_ms: ?u64) ?VisibleClientEnd {
     const timed_out = if (now_ms) |ms|
         session.pending_repaint.resizeTimedOutAt(ms)
     else
         session.pending_repaint.resizeTimedOut();
     if (!timed_out) return null;
-    clearVisibleAfterResizeTimeout(session);
+    clearVisibleAfterResizeTimeout(blocking, session);
     return .unresponsive;
 }
 
