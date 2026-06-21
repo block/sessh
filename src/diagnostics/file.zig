@@ -5,8 +5,8 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
-const io = @import("../core/io.zig");
 const posix_pty = @import("../tty/posix_pty.zig");
 const terminal = @import("../tty/terminal.zig");
 
@@ -121,6 +121,7 @@ pub fn validatePath(path: []const u8) !void {
 }
 
 test "opens regular file as output only" {
+    const blocking = core_blocking.fromTest();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -141,7 +142,7 @@ test "opens regular file as output only" {
         terminal.TerminalFds{ .input = 456, .output = diagnostics.output_fd },
         diagnostics.terminalFdsOr(.{ .input = 456, .output = 123 }),
     );
-    try io.writeAll(diagnostics.output_fd, "status\n");
+    try blocking.writeAll(diagnostics.output_fd, "status\n");
     diagnostics.deinit();
 
     const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "diagnostics.log", 64);
@@ -150,6 +151,7 @@ test "opens regular file as output only" {
 }
 
 test "opens tty path as output and reconnect input" {
+    const blocking = core_blocking.fromTest();
     var pty = try posix_pty.open();
     defer pty.close();
 
@@ -166,12 +168,12 @@ test "opens tty path as output and reconnect input" {
         diagnostics.terminalFdsOr(.{ .input = 456, .output = 123 }),
     );
 
-    try io.writeAll(diagnostics.output_fd, "status");
+    try blocking.writeAll(diagnostics.output_fd, "status");
     var output_buf: [16]u8 = undefined;
     const output_n = try posix.read(pty.master_fd, &output_buf);
     try std.testing.expectEqualStrings("status", output_buf[0..output_n]);
 
-    try io.writeAll(pty.master_fd, "R");
+    try blocking.writeAll(pty.master_fd, "R");
     var input_buf: [16]u8 = undefined;
     const input_n = c.read(diagnostics.input_fd, &input_buf, input_buf.len);
     if (input_n < 0) return error.ReadFailed;

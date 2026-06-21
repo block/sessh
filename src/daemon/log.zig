@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
 
+const dispatch_io = @import("../core/dispatch_io.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const protocol = @import("../protocol/mod.zig");
 
@@ -24,14 +25,13 @@ pub fn activeSubscriberCount() usize {
 const Subscriber = struct {
     fd: c.fd_t,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    write_watch_id: ?dispatcher.FdWatchId = null,
+    write_source: dispatcher.Source,
+    write_task: dispatcher.DispatchTask,
     pending_frames: std.ArrayList(protocol.FrameWriteState) = .empty,
 
     fn deinit(self: *Subscriber) void {
-        if (self.write_watch_id) |watch_id| {
-            self.daemon_dispatcher.cancel(.{ .fd = watch_id });
-            self.write_watch_id = null;
-        }
+        self.write_task.deinit();
+        self.write_source.deinit();
         for (self.pending_frames.items) |*frame| {
             frame.deinit();
         }
@@ -54,7 +54,18 @@ pub fn subscribe(
     subscriber.* = .{
         .fd = fd,
         .daemon_dispatcher = daemon_dispatcher,
+        .write_source = try daemon_dispatcher.fdSource(fd, .{ .writable = true }),
+        .write_task = undefined,
     };
+    errdefer subscriber.write_source.deinit();
+    subscriber.write_task = try dispatcher.fdDispatchTask(
+        Subscriber,
+        allocator,
+        subscriber,
+        subscriber.write_source,
+        writeSubscriber,
+    );
+    errdefer subscriber.write_task.deinit();
     errdefer {
         subscriber.fd = -1;
         subscriber.deinit();
@@ -91,48 +102,39 @@ fn destroySubscriber(allocator: std.mem.Allocator, subscriber: *Subscriber) void
     }
 }
 
-fn writeSubscriber(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+fn writeSubscriber(
+    subscriber: *Subscriber,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+    fd_event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
+    _ = daemon_dispatcher;
+    _ = task;
     // Log subscribers are best-effort observers. Drain their bounded frame queue
     // only when their socket is writable, and drop the subscriber on socket
     // errors so daemon logging never becomes required work.
-    const subscriber: *Subscriber = @ptrCast(@alignCast(ctx));
-    const daemon_dispatcher = handler_event.dispatcher;
-    const id = handler_event.id;
-    const event = handler_event.event;
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedDaemonLogTimer,
-    };
     if (fd_event.error_event or fd_event.invalid) {
         destroySubscriber(subscriber.daemon_dispatcher.allocator, subscriber);
-        return;
+        return .done;
     }
-    if (!fd_event.writable) return;
+    if (!fd_event.writable) return .pending;
 
     while (subscriber.pending_frames.items.len != 0) {
         const write = &subscriber.pending_frames.items[0];
         switch (try write.writeReady(subscriber.fd)) {
-            .blocked, .progress => return,
+            .blocked, .progress => return .pending,
             .done => {
                 write.deinit();
                 _ = subscriber.pending_frames.orderedRemove(0);
             },
         }
     }
-    daemon_dispatcher.cancel(id);
-    subscriber.write_watch_id = null;
+    return .done;
 }
 
 fn ensureWriteWatch(subscriber: *Subscriber) !void {
-    if (subscriber.write_watch_id != null) return;
-    subscriber.write_watch_id = try subscriber.daemon_dispatcher.watchFd(.{
-        .fd = subscriber.fd,
-        .events = .{ .writable = true },
-        .handler = .{
-            .ctx = subscriber,
-            .callback = writeSubscriber,
-        },
-    });
+    subscriber.write_source.setFdEvents(.{ .writable = true });
+    try subscriber.write_task.schedule(subscriber.daemon_dispatcher);
 }
 
 const QueueSubscriberFrameOptions = struct {

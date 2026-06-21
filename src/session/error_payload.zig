@@ -3,7 +3,7 @@ const posix = std.posix;
 
 const app_allocator = @import("../core/app_allocator.zig");
 const client_log = @import("../core/client_log.zig");
-const io = @import("../core/io.zig");
+const core_blocking = @import("../core/blocking.zig");
 const protocol = @import("../protocol/mod.zig");
 
 const hpb = protocol.hpb;
@@ -14,8 +14,8 @@ pub const Payload = struct {
     hint: []const u8,
 };
 
-pub fn printPayload(payload: []const u8) !void {
-    try printParsed(try parse(payload));
+pub fn printPayload(blocking: core_blocking.Blocking, payload: []const u8) !void {
+    try printParsed(blocking, try parse(payload));
 }
 
 pub fn parse(payload: []const u8) !Payload {
@@ -35,19 +35,19 @@ pub fn transportExitCode(code: []const u8) ?u8 {
     return @intCast(@min(parsed, 255));
 }
 
-pub fn printParsed(parsed: Payload) !void {
+pub fn printParsed(blocking: core_blocking.Blocking, parsed: Payload) !void {
     defer free(parsed);
-    client_log.flush(posix.STDERR_FILENO);
-    try printBorrowed(parsed);
+    client_log.flush(blocking, posix.STDERR_FILENO);
+    try printBorrowed(blocking, parsed);
 }
 
-fn printBorrowed(parsed: Payload) !void {
-    try io.writeAll(posix.STDERR_FILENO, "ERROR ");
-    try io.writeAll(posix.STDERR_FILENO, parsed.message);
-    try io.writeAll(posix.STDERR_FILENO, "\n");
+fn printBorrowed(blocking: core_blocking.Blocking, parsed: Payload) !void {
+    try blocking.writeAll(posix.STDERR_FILENO, "ERROR ");
+    try blocking.writeAll(posix.STDERR_FILENO, parsed.message);
+    try blocking.writeAll(posix.STDERR_FILENO, "\n");
     if (parsed.hint.len > 0) {
-        try io.writeAll(posix.STDERR_FILENO, parsed.hint);
-        try io.writeAll(posix.STDERR_FILENO, "\n");
+        try blocking.writeAll(posix.STDERR_FILENO, parsed.hint);
+        try blocking.writeAll(posix.STDERR_FILENO, "\n");
     }
 }
 

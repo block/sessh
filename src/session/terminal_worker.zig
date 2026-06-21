@@ -14,9 +14,9 @@ const input_translation = @import("input_translation.zig");
 const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
 const pty_process = @import("../tty/pty_process.zig");
 const protocol = @import("../protocol/mod.zig");
-const user_error = @import("../core/user_error.zig");
+const daemon_log = @import("../daemon/log.zig");
 const guid_ref = @import("../core/guid.zig");
-const frame_write_queue = @import("../transport/frame_write_queue.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const one_shot_frame_writer = @import("../transport/one_shot_frame_writer.zig");
 const socket_transport = @import("../transport/socket.zig");
 const terminal = @import("../tty/terminal.zig");
@@ -127,17 +127,18 @@ const DispatcherTerminalWorker = struct {
     session_watch: WorkerFdWatch = .{},
     visible_watch: WorkerFdWatch = .{},
     pending_watch: WorkerFdWatch = .{},
-    timer_watch_id: ?dispatcher.TimerWatchId = null,
+    fd_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
+    timer_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
 
     fn deinit(self: *DispatcherTerminalWorker, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
         if (daemon_dispatcher) |d| {
+            self.fd_task.deinit();
+            self.timer_task.deinit();
             self.listen_watch.cancel(d);
             self.session_watch.cancel(d);
             self.visible_watch.cancel(d);
             self.pending_watch.cancel(d);
-            if (self.timer_watch_id) |id| d.cancel(.{ .timer = id });
         }
-        self.timer_watch_id = null;
         closeTerminalWorker(&self.terminal_worker);
         self.* = undefined;
     }
@@ -209,7 +210,7 @@ const DispatcherTerminalWorker = struct {
                 .fd = visible_client.fd,
                 .events = .{
                     .readable = !visible_client.close_after_flush and !debug_unresponsive,
-                    .writable = !debug_unresponsive and visible_client.queuedBytes() > 0,
+                    .writable = !debug_unresponsive and visible_client.pendingBytes() > 0,
                 },
             });
         } else {
@@ -228,6 +229,7 @@ const DispatcherTerminalWorker = struct {
             self.pending_watch.cancel(daemon_dispatcher);
         }
 
+        try self.refreshFdTask(daemon_dispatcher);
         try self.updateTimer(daemon_dispatcher, clock);
     }
 
@@ -239,6 +241,7 @@ const DispatcherTerminalWorker = struct {
     };
 
     fn ensureWatch(self: *DispatcherTerminalWorker, options: EnsureWatchOptions) !void {
+        _ = self;
         // Worker fds can change when clients reconnect. Reuse an existing watch
         // only while it still points at the same fd; otherwise cancel and
         // register a fresh dispatcher slot.
@@ -246,21 +249,36 @@ const DispatcherTerminalWorker = struct {
         const watch = options.watch;
         const fd = options.fd;
         const events = options.events;
-        if (watch.id != null and watch.fd != fd) {
+        if (watch.active() and watch.fd != fd) {
             watch.cancel(daemon_dispatcher);
         }
-        if (watch.id) |id| {
-            try daemon_dispatcher.updateFdEvents(id, events);
+        if (watch.active()) {
+            watch.source.setFdEvents(events);
         } else {
-            watch.id = try daemon_dispatcher.watchFd(.{
-                .fd = fd,
-                .events = events,
-                .handler = .{
-                    .ctx = self,
-                    .callback = handleDispatcherTerminalWorkerEvent,
-                },
-            });
+            watch.source = try daemon_dispatcher.fdSource(fd, events);
             watch.fd = fd;
+        }
+    }
+
+    fn refreshFdTask(self: *DispatcherTerminalWorker, daemon_dispatcher: *dispatcher.Dispatcher) !void {
+        if (!self.fd_task.isInitialized()) {
+            self.fd_task = dispatcher.dispatchTask(
+                DispatcherTerminalWorker,
+                self.allocator,
+                self,
+                handleDispatcherTerminalWorkerFd,
+            );
+            self.fd_task.setSourceReadiness(.any);
+        }
+        self.fd_task.clearSources();
+        if (self.session_watch.active()) try self.fd_task.requireSource(self.session_watch.source);
+        if (self.visible_watch.active()) try self.fd_task.requireSource(self.visible_watch.source);
+        if (self.pending_watch.active()) try self.fd_task.requireSource(self.pending_watch.source);
+        if (self.listen_watch.active()) try self.fd_task.requireSource(self.listen_watch.source);
+        if (self.fd_task.sources.items.len == 0) {
+            self.fd_task.cancel();
+        } else {
+            try self.fd_task.schedule(daemon_dispatcher);
         }
     }
 
@@ -269,19 +287,26 @@ const DispatcherTerminalWorker = struct {
         daemon_dispatcher: *dispatcher.Dispatcher,
         clock: terminal_worker_lifecycle.PollClock,
     ) !void {
-        if (self.timer_watch_id) |id| daemon_dispatcher.cancel(.{ .timer = id });
-        self.timer_watch_id = null;
+        if (!self.timer_task.isInitialized()) {
+            self.timer_task = dispatcher.timerDispatchTask(
+                DispatcherTerminalWorker,
+                self.allocator,
+                self,
+                handleDispatcherTerminalWorkerTimer,
+            );
+        }
         const timeout_ms = terminalWorkerPollTimeoutMs(&self.terminal_worker, clock);
-        if (timeout_ms < 0) return;
-        self.timer_watch_id = try daemon_dispatcher.watchTimerAfter(@intCast(timeout_ms), .{
-            .ctx = self,
-            .callback = handleDispatcherTerminalWorkerEvent,
-        });
+        if (timeout_ms < 0) {
+            self.timer_task.cancel();
+            return;
+        }
+        self.timer_task.setTimerAfter(daemon_dispatcher, @intCast(timeout_ms));
+        try self.timer_task.schedule(daemon_dispatcher);
     }
 
     fn runMaintenance(self: *DispatcherTerminalWorker) void {
         runTerminalWorkerMaintenance(&self.terminal_worker);
-        const waiting_for_initial_process_client = self.listen_watch.id != null and !self.terminal_worker.started_session;
+        const waiting_for_initial_process_client = self.listen_watch.active() and !self.terminal_worker.started_session;
         if (!waiting_for_initial_process_client and
             !self.terminal_worker.started_session and
             !self.terminal_worker.pending_client.active and
@@ -606,50 +631,55 @@ fn destroyRegisteredTerminalWorker(control: *TerminalWorkerHandle, daemon_dispat
 // runs maintenance to reap completed PTYs or expired timers, dispatches the
 // actual fd/timer event, then recomputes watches because almost every branch can
 // transfer ownership, close a client, or queue output.
-fn handleDispatcherTerminalWorkerEvent(
-    ctx: *anyopaque,
-    handler_event: dispatcher.HandlerEvent,
-) !void {
-    const daemon_dispatcher = handler_event.dispatcher;
-    const id = handler_event.id;
-    const event = handler_event.event;
-    const worker: *DispatcherTerminalWorker = @ptrCast(@alignCast(ctx));
+fn handleDispatcherTerminalWorkerFd(
+    worker: *DispatcherTerminalWorker,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+) !dispatch_io.DispatchTaskStatus {
+    _ = task;
     worker.runMaintenance();
     if (!worker.terminal_worker.running) {
         worker.finish(daemon_dispatcher);
-        return;
+        return .done;
     }
 
-    switch (event) {
-        .fd => |fd_event| {
-            const fd_id = switch (id) {
-                .fd => |watch_id| watch_id,
-                .timer => return error.UnexpectedWorkerTimerId,
-            };
-            if (worker.session_watch.matches(fd_id)) {
-                handleSessionPtyEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(fd_event));
-            } else if (worker.visible_watch.matches(fd_id)) {
-                handleVisibleClientEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(fd_event));
-            } else if (worker.pending_watch.matches(fd_id)) {
-                handlePendingWorkerClientEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(fd_event));
-            } else if (worker.listen_watch.matches(fd_id)) {
-                if (fd_event.readable) handleWorkerHandoffEvent(&worker.terminal_worker, fd_event.fd);
-            }
-        },
-        .timer => {
-            if (worker.timer_watch_id) |timer_id| {
-                switch (id) {
-                    .timer => |fired| {
-                        if (timer_id.index == fired.index and timer_id.generation == fired.generation) {
-                            worker.timer_watch_id = null;
-                        }
-                    },
-                    .fd => return error.UnexpectedWorkerFdId,
-                }
-            }
-        },
+    if (worker.session_watch.takeEvent()) |event| {
+        handleSessionPtyEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(event));
+    }
+    if (worker.visible_watch.takeEvent()) |event| {
+        handleVisibleClientEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(event));
+    }
+    if (worker.pending_watch.takeEvent()) |event| {
+        handlePendingWorkerClientEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(event));
+    }
+    if (worker.listen_watch.takeEvent()) |event| {
+        if (event.readable) handleWorkerHandoffEvent(&worker.terminal_worker, event.fd);
     }
 
+    try finishDispatcherTerminalWorkerEvent(worker, daemon_dispatcher);
+    return .pending;
+}
+
+fn handleDispatcherTerminalWorkerTimer(
+    worker: *DispatcherTerminalWorker,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+    _: dispatcher.TimerEvent,
+) !dispatch_io.DispatchTaskStatus {
+    _ = task;
+    worker.runMaintenance();
+    if (!worker.terminal_worker.running) {
+        worker.finish(daemon_dispatcher);
+        return .done;
+    }
+    try finishDispatcherTerminalWorkerEvent(worker, daemon_dispatcher);
+    return .pending;
+}
+
+fn finishDispatcherTerminalWorkerEvent(
+    worker: *DispatcherTerminalWorker,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+) !void {
     worker.runMaintenance();
     if (!worker.terminal_worker.running) {
         worker.finish(daemon_dispatcher);
@@ -802,21 +832,21 @@ fn drainPendingWorkerClient(terminal_worker: *TerminalWorker) void {
     if (!pending_client.active) return;
     if (pending_client.close_after_flush) return;
     while (true) {
-        var frame = switch (pending_client.reader.readReady(pending_client.fd) catch |err| {
-            user_error.rolePrintLine("sessh-terminal-remote", "client error: {t}", .{err}) catch {};
+        var frame = switch (pending_client.readFrame() catch |err| {
+            logPendingWorkerClientError(err);
             pending_client.close();
             return;
         }) {
-            .blocked, .progress => return,
-            .eof, .truncated_frame => {
+            .blocked => return,
+            .eof => {
                 pending_client.close();
                 return;
             },
-            .frame => |frame_value| frame_value,
+            .frame => |frame| frame,
         };
         defer frame.deinit(app_allocator.allocator());
         switch (handlePendingWorkerClientFrame(terminal_worker, pending_client, &frame) catch |err| {
-            user_error.rolePrintLine("sessh-terminal-remote", "client error: {t}", .{err}) catch {};
+            logPendingWorkerClientError(err);
             pending_client.close();
             return;
         }) {
@@ -829,6 +859,10 @@ fn drainPendingWorkerClient(terminal_worker: *TerminalWorker) void {
             .transferred_to_visible_client => return,
         }
     }
+}
+
+fn logPendingWorkerClientError(err: anyerror) void {
+    daemon_log.infof(app_allocator.allocator(), "terminal worker client error: {t}", .{err});
 }
 
 const PendingWorkerFrameResult = enum {
@@ -896,7 +930,7 @@ fn handlePendingWorkerClientFrame(
 
 fn handlePendingWorkerTransportControl(pending_client: *PendingWorkerClient, control: protocol.TransportControl) !void {
     switch (control) {
-        .ping => try pending_client.queueDaemonTunnelPayload(.{ .pong = .{} }),
+        .ping => try pending_client.writeDaemonTunnelPayload(.{ .pong = .{} }),
         .pong => {},
     }
 }
@@ -1000,7 +1034,7 @@ fn flushVisibleClientOutput(terminal_worker: *TerminalWorker) void {
         visible_client.debug_unresponsive_until_ms = 0;
     }
 
-    const status = visible_client.writer.writeReady(visible_client.fd) catch {
+    const status = visible_client.writer.writeReadyTo(visible_client.fd) catch {
         disconnectVisibleClient(terminal_worker);
         return;
     };
@@ -1158,15 +1192,15 @@ fn connectVisibleClient(options: ConnectVisibleClientOptions) !void {
         .size = resize.size,
         .connected_at_unix_ms = nowUnixMs(),
         .active = true,
-        .reader = protocol.FrameReader.init(app_allocator.allocator()),
-        .reader_initialized = true,
-        .writer = frame_write_queue.FrameWriteQueue.init(app_allocator.allocator()),
+        .source = dispatch_io.FrameSource.init(app_allocator.allocator(), client_fd),
+        .source_initialized = true,
+        .writer = dispatch_io.FrameSink.init(.{ .allocator = app_allocator.allocator(), .fd = -1 }),
         .writer_initialized = true,
         .capture_tty_transcript = capture_tty_transcript,
     };
     visible_client.presentation.setViewportOffset(resize.viewport_offset);
     errdefer {
-        if (visible_client.reader_initialized) visible_client.reader.deinit();
+        if (visible_client.source_initialized) visible_client.source.deinit();
         if (visible_client.writer_initialized) visible_client.writer.deinit();
         visible_client.* = VisibleClient{};
     }
@@ -1347,16 +1381,16 @@ fn drainVisibleClientInput(terminal_worker: *TerminalWorker) void {
         return;
     }
 
-    var frame = switch (visible_client.reader.readReady(visible_client.fd) catch {
+    var frame = switch (visible_client.readFrame() catch {
         disconnectVisibleClient(terminal_worker);
         return;
     }) {
-        .blocked, .progress => return,
-        .eof, .truncated_frame => {
+        .blocked => return,
+        .eof => {
             disconnectVisibleClient(terminal_worker);
             return;
         },
-        .frame => |frame_value| frame_value,
+        .frame => |frame| frame,
     };
     defer frame.deinit(app_allocator.allocator());
 
@@ -1413,7 +1447,7 @@ fn queueVisibleClientProtocolError(visible_client: *VisibleClient, message: []co
 
 fn handleVisibleClientTransportControl(visible_client: *VisibleClient, control: protocol.TransportControl) !void {
     switch (control) {
-        .ping => try visible_client.queueDaemonTunnelPayload(.{ .pong = .{} }),
+        .ping => try visible_client.writeDaemonTunnelPayload(.{ .pong = .{} }),
         .pong => {},
     }
 }
@@ -1707,7 +1741,7 @@ fn disconnectVisibleClient(terminal_worker: *TerminalWorker) void {
     if (!visible_client.active) return;
 
     _ = c.close(visible_client.fd);
-    if (visible_client.reader_initialized) visible_client.reader.deinit();
+    if (visible_client.source_initialized) visible_client.source.deinit();
     if (visible_client.writer_initialized) visible_client.writer.deinit();
     visible_client.* = VisibleClient{};
     refreshVisibleClientConnectionState(terminal_worker);

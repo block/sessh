@@ -5,8 +5,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
 
+const core_blocking = @import("blocking.zig");
 const fixed_buffer = @import("fixed_buffer.zig");
-const io = @import("io.zig");
 
 const max_entries = 256;
 const max_entry_bytes = 1024;
@@ -115,9 +115,9 @@ pub fn appendSshStderr(bytes: []const u8) void {
     }
 }
 
-pub fn flush(fd: c.fd_t) void {
-    flushUserDiagnostics(fd) catch {};
-    flushEntries(fd) catch {};
+pub fn flush(blocking: core_blocking.Blocking, fd: c.fd_t) void {
+    flushUserDiagnostics(blocking, fd) catch {};
+    flushEntries(blocking, fd) catch {};
 }
 
 pub fn userDiagnosticInfo(comptime fmt: []const u8, args: anytype) void {
@@ -259,7 +259,7 @@ fn appendMessage(level: Level, message: []const u8) void {
     if (entry_count < max_entries) entry_count += 1;
 }
 
-fn flushEntries(fd: c.fd_t) !void {
+fn flushEntries(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
     const oldest = oldestEntryIndex();
     var offset: usize = 0;
     while (offset < entry_count) : (offset += 1) {
@@ -267,7 +267,7 @@ fn flushEntries(fd: c.fd_t) !void {
         if (entries[idx].flushed) continue;
         entries[idx].flushed = true;
         if (!shouldDisplay(entries[idx].level)) continue;
-        try writeEntry(fd, &entries[idx]);
+        try writeEntry(blocking, fd, &entries[idx]);
     }
 }
 
@@ -284,7 +284,7 @@ fn shouldDisplay(level: Level) bool {
     return @intFromEnum(level) >= @intFromEnum(configured_level);
 }
 
-fn flushUserDiagnostics(fd: c.fd_t) !void {
+fn flushUserDiagnostics(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
     const oldest = oldestDiagnosticIndex();
     var offset: usize = 0;
     var displayed = displayed_diagnostic_seq;
@@ -293,31 +293,31 @@ fn flushUserDiagnostics(fd: c.fd_t) !void {
         const diagnostic = &diagnostics[idx];
         if (diagnostic.seq <= displayed_diagnostic_seq) continue;
         if (shouldDisplay(diagnostic.level)) {
-            try writeDelayedUserDiagnostic(fd, diagnostic);
+            try writeDelayedUserDiagnostic(blocking, fd, diagnostic);
         }
         displayed = @max(displayed, diagnostic.seq);
     }
     displayed_diagnostic_seq = displayed;
 }
 
-fn writeDelayedUserDiagnostic(fd: c.fd_t, diagnostic: *const UserDiagnostic) !void {
+fn writeDelayedUserDiagnostic(blocking: core_blocking.Blocking, fd: c.fd_t, diagnostic: *const UserDiagnostic) !void {
     var prefix_buf: [96]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&prefix_buf, "{s} ts_ms={}: ", .{ diagnostic.tag.label(), diagnostic.ts_ms });
-    try io.writeAll(fd, prefix);
-    try io.writeAll(fd, diagnostic.message.slice());
-    try io.writeAll(fd, "\r\n");
+    try blocking.writeAll(fd, prefix);
+    try blocking.writeAll(fd, diagnostic.message.slice());
+    try blocking.writeAll(fd, "\r\n");
 }
 
-fn writeEntry(fd: c.fd_t, entry: *const Entry) !void {
+fn writeEntry(blocking: core_blocking.Blocking, fd: c.fd_t, entry: *const Entry) !void {
     var prefix_buf: [96]u8 = undefined;
     const prefix = try std.fmt.bufPrint(
         &prefix_buf,
         "sessh ts_ms={}: ",
         .{entry.ts_ms},
     );
-    try io.writeAll(fd, prefix);
-    try io.writeAll(fd, entry.message.slice());
-    try io.writeAll(fd, "\r\n");
+    try blocking.writeAll(fd, prefix);
+    try blocking.writeAll(fd, entry.message.slice());
+    try blocking.writeAll(fd, "\r\n");
 }
 
 fn nowUnixMs() u64 {

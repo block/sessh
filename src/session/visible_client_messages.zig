@@ -1,23 +1,23 @@
 const std = @import("std");
 
 const visible_client_state = @import("visible_client_state.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const protocol = @import("../protocol/mod.zig");
 const terminal = @import("../tty/terminal.zig");
-const frame_write_queue = @import("../transport/frame_write_queue.zig");
 
 const pb = protocol.pb;
 const WindowSize = terminal.WindowSize;
 const VisibleClientSessionState = visible_client_state.VisibleClientSessionState;
 const input_chunk_bytes = 1024;
 
-pub const QueueMaybeResizeOptions = struct {
-    write_queue: *frame_write_queue.FrameWriteQueue,
+pub const MaybeWriteResizeOptions = struct {
+    writer: *dispatch_io.FrameSink,
     last_size: *WindowSize,
     session: *VisibleClientSessionState,
 };
 
 pub const QueueInputChunksOptions = struct {
-    write_queue: *frame_write_queue.FrameWriteQueue,
+    writer: *dispatch_io.FrameSink,
     bytes: []const u8,
     session: *VisibleClientSessionState,
     paste_like: bool,
@@ -42,26 +42,26 @@ pub fn resizeMessage(options: ResizeMessageOptions) pb.TerminalEmulatorItem.Resi
     };
 }
 
-pub fn maybeQueueResize(options: QueueMaybeResizeOptions) !void {
+pub fn maybeWriteResize(options: MaybeWriteResizeOptions) !void {
     const size = terminal.currentWindowSize();
     if (size.eql(options.last_size.*)) return;
     options.last_size.* = size;
     const session = options.session;
     const resize_viewport_offset: i32 = if (session.viewport_offset == 0) 0 else -1;
     session.viewport_offset = resize_viewport_offset;
-    queueResizeWithRepaint(options.write_queue, size, session) catch |err| {
+    writeResizeWithRepaint(options.writer, size, session) catch |err| {
         session.pending_repaint.clear();
         return err;
     };
 }
 
-fn queueResizeWithRepaint(
-    write_queue: *frame_write_queue.FrameWriteQueue,
+fn writeResizeWithRepaint(
+    writer: *dispatch_io.FrameSink,
     size: WindowSize,
     session: *VisibleClientSessionState,
 ) !void {
     const repaint_request_seq = session.pending_repaint.startResize();
-    try write_queue.queueTerminalEmulatorPayload(.{ .resize = resizeMessage(.{
+    try writer.writeTerminalEmulatorPayload(.{ .resize = resizeMessage(.{
         .size = size,
         .viewport_offset = nonZeroViewportOffset(session.viewport_offset),
         .repaint_request = .{
@@ -71,28 +71,28 @@ fn queueResizeWithRepaint(
     }) });
 }
 
-pub fn queueScreenRepaint(
-    write_queue: *frame_write_queue.FrameWriteQueue,
+pub fn writeScreenRepaint(
+    writer: *dispatch_io.FrameSink,
     session: *VisibleClientSessionState,
 ) !void {
-    try write_queue.queueTerminalEmulatorPayload(.{ .repaint_request = .{
+    try writer.writeTerminalEmulatorPayload(.{ .repaint_request = .{
         .repaint_request_seq = session.pending_repaint.start(),
     } });
 }
 
-fn queueInput(options: QueueInputChunksOptions) !void {
-    try options.write_queue.queueTerminalEmulatorPayload(.{ .input = .{
+fn writeInput(options: QueueInputChunksOptions) !void {
+    try options.writer.writeTerminalEmulatorPayload(.{ .input = .{
         .data = options.bytes,
         .input_seq = options.session.input_ack_tracker.allocate(if (options.paste_like) .paste_like else .normal),
     } });
 }
 
-pub fn queueInputChunks(options: QueueInputChunksOptions) !void {
+pub fn writeInputChunks(options: QueueInputChunksOptions) !void {
     var offset: usize = 0;
     while (offset < options.bytes.len) {
         const end = @min(offset + input_chunk_bytes, options.bytes.len);
-        try queueInput(.{
-            .write_queue = options.write_queue,
+        try writeInput(.{
+            .writer = options.writer,
             .bytes = options.bytes[offset..end],
             .session = options.session,
             .paste_like = options.paste_like,

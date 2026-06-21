@@ -16,27 +16,31 @@ pub const Context = struct {
     cleanup_context: *daemon_cleanup_scheduler.Context,
     active_local_clients: *usize,
     last_live_work_ms: u64,
+    idle_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
 };
 
 pub fn watchIdle(context: *Context, daemon_dispatcher: *dispatcher.Dispatcher) !void {
-    _ = try daemon_dispatcher.watchTimerAfter(daemon_idle_check_ms, .{
-        .ctx = context,
-        .callback = checkDaemonIdle,
-    });
+    if (!context.idle_task.isInitialized()) {
+        context.idle_task = dispatcher.timerDispatchTask(
+            Context,
+            context.allocator,
+            context,
+            checkDaemonIdle,
+        );
+    }
+    context.idle_task.setTimerAfter(daemon_dispatcher, daemon_idle_check_ms);
+    try context.idle_task.schedule(daemon_dispatcher);
 }
 
-fn checkDaemonIdle(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+fn checkDaemonIdle(
+    idle_context: *Context,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+    _: dispatcher.TimerEvent,
+) !@import("../core/dispatch_io.zig").DispatchTaskStatus {
     // sesshd should disappear when it has no clients, transports, workers, log
     // subscribers, or cleanup work. The grace window prevents rapid
     // start/stop churn between short sequential sessh invocations.
-    const daemon_dispatcher = handler_event.dispatcher;
-    const event = handler_event.event;
-    const idle_context: *Context = @ptrCast(@alignCast(ctx));
-    switch (event) {
-        .timer => {},
-        .fd => return error.UnexpectedDaemonFdEvent,
-    }
-
     const now_ms = daemon_dispatcher.nowMs();
     const cleanup_keeps_daemon_alive = try idle_context.cleanup_context.maintain(
         now_ms,
@@ -55,10 +59,11 @@ fn checkDaemonIdle(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !voi
     } else if (daemonShouldStopForIdle(idle_context.last_live_work_ms, now_ms)) {
         daemon_log.infof(idle_context.allocator, "daemon idle; shutting down", .{});
         daemon_dispatcher.stop();
-        return;
+        return .done;
     }
 
-    try watchIdle(idle_context, daemon_dispatcher);
+    task.setTimerAfter(daemon_dispatcher, daemon_idle_check_ms);
+    return .pending;
 }
 
 const LiveWorkSnapshot = struct {

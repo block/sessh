@@ -167,14 +167,14 @@ pub fn runRemoteNewSession(
     options: RunRemoteNewSessionOptions,
 ) !void {
     var session_config = remoteSessionConfig(allocator, options.common, options.ssh_options) catch |err| {
-        try user_error.printLine("invalid config: {t}", .{err});
+        try user_error.printLine(options.blocking, "invalid config: {t}", .{err});
         return process_exit.request(64);
     };
     defer session_config.deinit(allocator);
     client_log.setLevel(session_config.common.client_log_level);
     if (session_config.common.diagnostics_file) |path| {
         diagnostics_file.validatePath(path) catch |err| {
-            try user_error.printLine("cannot open diagnostics file {s}: {t}", .{ path, err });
+            try user_error.printLine(options.blocking, "cannot open diagnostics file {s}: {t}", .{ path, err });
             return process_exit.request(1);
         };
     }
@@ -189,7 +189,7 @@ pub fn runRemoteNewSession(
         .stdout_is_tty = stdout_is_tty,
     })) {
         if (session_config.common.capture_tty_transcript != null) {
-            try user_error.line("--capture-tty-transcript is not supported with proxy stream mode");
+            try user_error.line(options.blocking, "--capture-tty-transcript is not supported with proxy stream mode");
             return process_exit.request(64);
         }
         try runProxyStreamSsh(.{
@@ -210,7 +210,7 @@ pub fn runRemoteNewSession(
     defer local_terminal_probe.deinit();
 
     var transcript_capture = TranscriptCapture{};
-    try transcript_capture.start(allocator, session_config.common.capture_tty_transcript);
+    try transcript_capture.start(options.blocking, allocator, session_config.common.capture_tty_transcript);
     defer transcript_capture.deinit();
 
     const new_guid = try guid_ref.generateSessionGuid(allocator);
@@ -244,11 +244,11 @@ pub fn runRemoteNewSession(
         if (err == error.VersionMismatch) {
             transport.close();
             if (session_config.common.capture_tty_transcript != null) {
-                try user_error.line("--capture-tty-transcript requires a compatible sessh remote");
+                try user_error.line(options.blocking, "--capture-tty-transcript requires a compatible sessh remote");
                 return process_exit.request(1);
             }
             if (options.new.command_argv.len > 0 or shell_command != null) {
-                try user_error.line("remote command recovery requires a compatible sessh remote");
+                try user_error.line(options.blocking, "remote command recovery requires a compatible sessh remote");
                 return process_exit.request(1);
             }
             try runPlainSshFallbackAfterVersionMismatch(options.blocking, allocator, target);
@@ -257,9 +257,9 @@ pub fn runRemoteNewSession(
             transport.close();
             try runPlainSshFallback(options.blocking, allocator, target, null);
         }
-        waitAfterTerminalWorkerConnectionFailure(&transport, "start");
+        waitAfterTerminalWorkerConnectionFailure(options.blocking, &transport, "start");
         if (process_exit.is(err)) return err;
-        try user_error.printLine("ssh remote session failed: {t}", .{err});
+        try user_error.printLine(options.blocking, "ssh remote session failed: {t}", .{err});
         return process_exit.request(1);
     };
     defer session.deinit();
@@ -320,7 +320,7 @@ fn openTerminalDaemonTransport(options: TerminalDaemonTransportOpen) !TerminalTr
 const TranscriptCapture = struct {
     recorder: ?tty_transcript.Recorder = null,
 
-    fn start(self: *TranscriptCapture, allocator: std.mem.Allocator, capture_tty_transcript: ?[]const u8) !void {
+    fn start(self: *TranscriptCapture, blocking: core_blocking.Blocking, allocator: std.mem.Allocator, capture_tty_transcript: ?[]const u8) !void {
         const path = capture_tty_transcript orelse return;
         self.recorder = try tty_transcript.Recorder.init(allocator, path);
         errdefer {
@@ -328,7 +328,7 @@ const TranscriptCapture = struct {
             self.recorder = null;
         }
         if (self.recorder) |*recorder| {
-            try recorder.warnEnabled();
+            try recorder.warnEnabled(blocking);
             tty_transcript.activate(recorder);
         }
     }
@@ -369,33 +369,33 @@ fn runVisibleRemoteClient(ctx: RemoteClientContext) !void {
             ctx.session,
             .{ .monitor_connection = false },
         ) catch |err| {
-            waitAfterTerminalWorkerConnectionFailure(ctx.transport, "visible client");
+            waitAfterTerminalWorkerConnectionFailure(ctx.blocking, ctx.transport, "visible client");
             if (process_exit.is(err)) return err;
-            try user_error.printLine("ssh remote session failed: {t}", .{err});
+            try user_error.printLine(ctx.blocking, "ssh remote session failed: {t}", .{err});
             return process_exit.request(1);
         };
 
         switch (end) {
             .session_ended => {
                 client_log.debug("event=session_ended host={s} session={s}", .{ ctx.target.host, ctx.session.idSlice() });
-                const exit_status = try finishEndedRemoteSession(ctx.transport, ctx.session);
+                const exit_status = try finishEndedRemoteSession(ctx.blocking, ctx.transport, ctx.session);
                 return process_exit.request(exit_status);
             },
             .client_hangup => {
                 client_log.debug("event=client_hangup host={s} session={s}", .{ ctx.target.host, ctx.session.idSlice() });
                 visible_client.drainLocalTransportDiagnostics(ctx.blocking, ctx.transport.readFd(), 100);
                 ctx.transport.terminate();
-                try finishHungUpSshSession(ctx.session);
+                try finishHungUpSshSession(ctx.blocking, ctx.session);
                 return;
             },
             .unresponsive => {
                 client_log.debug("event=local_daemon_unresponsive host={s} session={s}", .{ ctx.target.host, ctx.session.idSlice() });
-                try finishLocalDaemonClosedSshSession(ctx.transport, ctx.session);
+                try finishLocalDaemonClosedSshSession(ctx.blocking, ctx.transport, ctx.session);
                 return process_exit.request(255);
             },
             .transport_closed => {
                 client_log.debug("event=local_daemon_closed host={s} session={s}", .{ ctx.target.host, ctx.session.idSlice() });
-                try finishLocalDaemonClosedSshSession(ctx.transport, ctx.session);
+                try finishLocalDaemonClosedSshSession(ctx.blocking, ctx.transport, ctx.session);
                 return process_exit.request(255);
             },
             .remote_transport_closed => {
@@ -449,7 +449,7 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
         switch (try reconnect_ui.waitForReconnect(delay_ms)) {
             .client_hangup => {
                 finishReconnectUi(&reconnect_ui, &reconnect_ui_active);
-                try finishHungUpSshSession(ctx.session);
+                try finishHungUpSshSession(ctx.blocking, ctx.session);
                 return process_exit.request(0);
             },
             .reconnect_now, .wait_elapsed => {
@@ -495,7 +495,7 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
         ) catch |err| switch (err) {
             error.RemoteDaemonDied => {
                 finishReconnectUi(&reconnect_ui, &reconnect_ui_active);
-                try finishRemoteDaemonDiedSshSession(&replacement, ctx.session);
+                try finishRemoteDaemonDiedSshSession(ctx.blocking, &replacement, ctx.session);
                 return process_exit.request(255);
             },
             error.RemoteTransportClosed => {
@@ -526,7 +526,7 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
             .client_hangup => {
                 finishReconnectUi(&reconnect_ui, &reconnect_ui_active);
                 replacement.close();
-                try finishHungUpSshSession(ctx.session);
+                try finishHungUpSshSession(ctx.blocking, ctx.session);
                 return process_exit.request(0);
             },
             .reconnect_now, .wait_elapsed => {},
@@ -542,7 +542,7 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
             error.SessionEnded => {
                 replacement_active = false;
                 ctx.transport.* = replacement;
-                const exit_status = try finishEndedRemoteSession(ctx.transport, ctx.session);
+                const exit_status = try finishEndedRemoteSession(ctx.blocking, ctx.transport, ctx.session);
                 return process_exit.request(exit_status);
             },
             error.RemoteTransportClosed => {
@@ -580,33 +580,33 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
     }
 }
 
-fn waitAfterTerminalWorkerConnectionFailure(transport: *TerminalTransport, stage: []const u8) void {
+fn waitAfterTerminalWorkerConnectionFailure(blocking: core_blocking.Blocking, transport: *TerminalTransport, stage: []const u8) void {
     transport.closeStdin();
     transport.close();
-    client_log.flush(posix.STDERR_FILENO);
-    user_error.printLine("ssh remote transport closed after connect {s} failure", .{stage}) catch {};
+    client_log.flush(blocking, posix.STDERR_FILENO);
+    user_error.printLine(blocking, "ssh remote transport closed after connect {s} failure", .{stage}) catch {};
 }
 
-fn finishHungUpSshSession(session: *visible_client.VisibleClientSessionState) !void {
-    session.restoreVisibleClientEndPresentationForExit();
-    client_log.flush(posix.STDERR_FILENO);
-    try tty_transcript.finishActiveOrReport();
+fn finishHungUpSshSession(blocking: core_blocking.Blocking, session: *visible_client.VisibleClientSessionState) !void {
+    session.restoreVisibleClientEndPresentationForExit(blocking);
+    client_log.flush(blocking, posix.STDERR_FILENO);
+    try tty_transcript.finishActiveOrReport(blocking);
 }
 
-fn finishLocalDaemonClosedSshSession(transport: *TerminalTransport, session: *visible_client.VisibleClientSessionState) !void {
+fn finishLocalDaemonClosedSshSession(blocking: core_blocking.Blocking, transport: *TerminalTransport, session: *visible_client.VisibleClientSessionState) !void {
     transport.close();
-    session.restoreVisibleClientEndPresentationForExit();
-    client_log.flush(posix.STDERR_FILENO);
-    try user_error.cleanTerminalLine("local daemon connection lost");
-    try tty_transcript.finishActiveOrReport();
+    session.restoreVisibleClientEndPresentationForExit(blocking);
+    client_log.flush(blocking, posix.STDERR_FILENO);
+    try user_error.cleanTerminalLine(blocking, "local daemon connection lost");
+    try tty_transcript.finishActiveOrReport(blocking);
 }
 
-fn finishRemoteDaemonDiedSshSession(transport: *TerminalTransport, session: *visible_client.VisibleClientSessionState) !void {
+fn finishRemoteDaemonDiedSshSession(blocking: core_blocking.Blocking, transport: *TerminalTransport, session: *visible_client.VisibleClientSessionState) !void {
     transport.close();
-    session.restoreVisibleClientEndPresentationForExit();
-    client_log.flush(posix.STDERR_FILENO);
-    try user_error.cleanTerminalLine("remote daemon died");
-    try tty_transcript.finishActiveOrReport();
+    session.restoreVisibleClientEndPresentationForExit(blocking);
+    client_log.flush(blocking, posix.STDERR_FILENO);
+    try user_error.cleanTerminalLine(blocking, "remote daemon died");
+    try tty_transcript.finishActiveOrReport(blocking);
 }
 
 fn finishReconnectUi(reconnect_ui: *client_ui.ReconnectUi, active: *bool) void {
@@ -666,13 +666,13 @@ fn nextReconnectAttemptAfterFailure(attempt: usize, reconnect_ui: *client_ui.Rec
     return reconnect.nextAttempt(attempt, if (reconnect_ui.consumeReconnectAcknowledgement()) .reset else .increment);
 }
 
-fn finishEndedRemoteSession(transport: *TerminalTransport, session: *visible_client.VisibleClientSessionState) !u8 {
+fn finishEndedRemoteSession(blocking: core_blocking.Blocking, transport: *TerminalTransport, session: *visible_client.VisibleClientSessionState) !u8 {
     const exit_status = session.endedProcessExitCode();
-    session.restoreVisibleClientEndPresentationForExit();
+    session.restoreVisibleClientEndPresentationForExit(blocking);
     transport.closeStdin();
     transport.close();
-    client_log.flush(posix.STDERR_FILENO);
-    try tty_transcript.finishActiveOrReport();
+    client_log.flush(blocking, posix.STDERR_FILENO);
+    try tty_transcript.finishActiveOrReport(blocking);
     return exit_status;
 }
 
@@ -904,7 +904,7 @@ fn runProxyStreamSsh(options: ProxyStreamSshOptions) !noreturn {
 // from OpenSSH's byte stream.
 pub fn runProxyStream(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     var invocation = proxy_entry.parse(allocator, args) catch |err| {
-        try proxy_entry.printArgError(err);
+        try proxy_entry.printArgError(blocking, err);
         return process_exit.request(64);
     };
     defer invocation.deinit(allocator);
@@ -947,7 +947,7 @@ pub fn runProxyStream(blocking: core_blocking.Blocking, allocator: std.mem.Alloc
     };
 
     var diagnostics_handle = diagnostics_file.Handle.open(invocation.diagnostics_file) catch |err| {
-        try io.stderrPrint(
+        try blocking.stderrPrint(
             "sessh: proxy mode cannot open diagnostics file {s}: {t}\n",
             .{ invocation.diagnostics_file orelse "", err },
         );
@@ -1043,18 +1043,19 @@ fn sendClientDaemonPayloadForeground(
 }
 
 fn runPlainSshFallbackAfterVersionMismatch(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, target: SshTarget) !noreturn {
-    try user_error.line("existing remote sessh is incompatible; falling back to plain ssh without sessh recovery");
+    try user_error.line(blocking, "existing remote sessh is incompatible; falling back to plain ssh without sessh recovery");
     try runPlainSshFallbackArgv(blocking, allocator, target);
 }
 
 fn runPlainSshFallback(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, target: SshTarget, platform: ?Platform) !noreturn {
     if (platform) |remote_platform| {
         try user_error.printLine(
+            blocking,
             "no matching sessh binary for remote platform {s} {s}; falling back to plain ssh without sessh recovery",
             .{ remote_platform.os, remote_platform.arch },
         );
     } else {
-        try user_error.line("remote platform is unsupported and no matching sessh binary is available; falling back to plain ssh without sessh recovery");
+        try user_error.line(blocking, "remote platform is unsupported and no matching sessh binary is available; falling back to plain ssh without sessh recovery");
     }
 
     try runPlainSshFallbackArgv(blocking, allocator, target);
@@ -1069,33 +1070,33 @@ fn runPlainSshFallbackArgv(blocking: core_blocking.Blocking, allocator: std.mem.
     try plain_ssh.runArgv(blocking, allocator, ssh_argv, "plain-ssh-fallback");
 }
 
-pub fn printSshArgError(err: anyerror) !void {
+pub fn printSshArgError(blocking: core_blocking.Blocking, err: anyerror) !void {
     // Convert parser errors into ssh-shaped one-line diagnostics. The parser is
     // deliberately strict about sessh options appearing before HOST so remote
     // command arguments are not reinterpreted.
     switch (err) {
-        error.MissingHost => try user_error.line("missing host"),
-        error.MissingScrollbackRowCount => try user_error.line("--scrollback-limit requires a value"),
-        error.MissingClientLogLevel => try user_error.line("--log-level requires a value"),
-        error.MissingFilterLevel => try user_error.line("--filter-level requires one of: unhygienic, hygienic, emulated"),
-        error.MissingDiagnosticsLevel => try user_error.line("--diagnostics-level requires one of: overlay, status, title, line, jsonl"),
-        error.MissingIsolationMode => try user_error.line("--isolation-mode requires one of: full, process, none"),
-        error.MissingDiagnosticsFile => try user_error.line("--diagnostics-file requires a file path"),
-        error.MissingTtyTranscriptPath => try user_error.line("--capture-tty-transcript requires a path"),
-        error.MissingSshOptionValue => try user_error.line("ssh option is missing its value"),
-        error.SesshOptionAfterHost => try user_error.line("sessh options must appear before HOST"),
-        error.ConflictingSesshAction => try user_error.line("conflicting sessh actions"),
-        error.InvalidScrollbackRowCount => try user_error.line("invalid scrollback row count"),
-        error.InvalidClientLogLevel => try user_error.line("invalid log level"),
-        error.InvalidFilterLevel => try user_error.line("invalid filter level; expected one of: unhygienic, hygienic, emulated"),
-        error.InvalidDiagnosticsLevel => try user_error.line("invalid diagnostics level; expected one of: overlay, status, title, line, jsonl"),
-        error.InvalidIsolationMode => try user_error.line("invalid isolation mode; expected one of: full, process, none"),
-        error.InvalidBool => try user_error.line("expected true or false"),
-        error.RemoteCommandUnsupported => try user_error.line("remote command recovery requires -t or -tt"),
-        error.UnsafeSshOption => try user_error.line("ssh option is not safe for sessh transport"),
-        error.UnsupportedSesshOption => try user_error.line("unsupported sessh option for ssh transport"),
-        error.UnsupportedSesshCliOption => try user_error.line("unsupported sessh option"),
-        error.UnsupportedSshOption => try user_error.line("unsupported ssh option for sessh transport"),
-        else => try user_error.printLine("invalid ssh arguments: {t}", .{err}),
+        error.MissingHost => try user_error.line(blocking, "missing host"),
+        error.MissingScrollbackRowCount => try user_error.line(blocking, "--scrollback-limit requires a value"),
+        error.MissingClientLogLevel => try user_error.line(blocking, "--log-level requires a value"),
+        error.MissingFilterLevel => try user_error.line(blocking, "--filter-level requires one of: unhygienic, hygienic, emulated"),
+        error.MissingDiagnosticsLevel => try user_error.line(blocking, "--diagnostics-level requires one of: overlay, status, title, line, jsonl"),
+        error.MissingIsolationMode => try user_error.line(blocking, "--isolation-mode requires one of: full, process, none"),
+        error.MissingDiagnosticsFile => try user_error.line(blocking, "--diagnostics-file requires a file path"),
+        error.MissingTtyTranscriptPath => try user_error.line(blocking, "--capture-tty-transcript requires a path"),
+        error.MissingSshOptionValue => try user_error.line(blocking, "ssh option is missing its value"),
+        error.SesshOptionAfterHost => try user_error.line(blocking, "sessh options must appear before HOST"),
+        error.ConflictingSesshAction => try user_error.line(blocking, "conflicting sessh actions"),
+        error.InvalidScrollbackRowCount => try user_error.line(blocking, "invalid scrollback row count"),
+        error.InvalidClientLogLevel => try user_error.line(blocking, "invalid log level"),
+        error.InvalidFilterLevel => try user_error.line(blocking, "invalid filter level; expected one of: unhygienic, hygienic, emulated"),
+        error.InvalidDiagnosticsLevel => try user_error.line(blocking, "invalid diagnostics level; expected one of: overlay, status, title, line, jsonl"),
+        error.InvalidIsolationMode => try user_error.line(blocking, "invalid isolation mode; expected one of: full, process, none"),
+        error.InvalidBool => try user_error.line(blocking, "expected true or false"),
+        error.RemoteCommandUnsupported => try user_error.line(blocking, "remote command recovery requires -t or -tt"),
+        error.UnsafeSshOption => try user_error.line(blocking, "ssh option is not safe for sessh transport"),
+        error.UnsupportedSesshOption => try user_error.line(blocking, "unsupported sessh option for ssh transport"),
+        error.UnsupportedSesshCliOption => try user_error.line(blocking, "unsupported sessh option"),
+        error.UnsupportedSshOption => try user_error.line(blocking, "unsupported ssh option for sessh transport"),
+        else => try user_error.printLine(blocking, "invalid ssh arguments: {t}", .{err}),
     }
 }

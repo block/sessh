@@ -14,7 +14,7 @@ const socket_transport = @import("../transport/socket.zig");
 const proxy_worker = @import("../stream/proxy_worker.zig");
 const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
-const frame_write_queue = @import("../transport/frame_write_queue.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 
 const pb = protocol.pb;
 
@@ -179,7 +179,7 @@ pub fn deleteRecordByGuid(allocator: std.mem.Allocator, guid: []const u8) void {
 pub const RemoteProcessCleanupRequestQueuedOptions = struct {
     allocator: std.mem.Allocator,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    mux_writer: *frame_write_queue.FrameWriteQueue,
+    mux_writer: *dispatch_io.FrameSink,
     identity: daemon_identity.DaemonIdentity,
     request: pb.DaemonTunnelItem.RemoteProcessCleanupRequest,
 };
@@ -369,7 +369,7 @@ fn cleanupGuidOnCurrentDaemon(
 }
 
 fn queueRemoteProcessCleanupResponse(
-    mux_writer: *frame_write_queue.FrameWriteQueue,
+    mux_writer: *dispatch_io.FrameSink,
     process: pb.DaemonTunnelItem.RemoteProcessIdentity,
     result: CleanupResult,
 ) !void {
@@ -377,7 +377,7 @@ fn queueRemoteProcessCleanupResponse(
         .cleaned => .{ .cleaned = .{} },
         .missing => .{ .missing = .{} },
     };
-    try mux_writer.queueDaemonTunnelPayload(.{ .remote_process_cleanup_response = .{
+    try mux_writer.writeDaemonTunnelPayload(.{ .remote_process_cleanup_response = .{
         .process = process,
         .result = result_payload,
     } });

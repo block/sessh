@@ -7,7 +7,6 @@ const c = std.c;
 const core_blocking = @import("../core/blocking.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
-const io = @import("../core/io.zig");
 const user_error = @import("../core/user_error.zig");
 const protocol = @import("../protocol/mod.zig");
 const session_daemon_handler = @import("../session/daemon_handler.zig");
@@ -19,7 +18,7 @@ const pb = protocol.pb;
 
 pub fn forwardBrokerToDaemon(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     if (args.len > 1) {
-        try user_error.roleLine("sessh-broker", "accepts at most one daemon socket namespace");
+        try user_error.roleLine(blocking, "sessh-broker", "accepts at most one daemon socket namespace");
         return error.InvalidBrokerArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
@@ -35,9 +34,9 @@ pub fn forwardBrokerToDaemon(blocking: core_blocking.Blocking, allocator: std.me
     });
 }
 
-pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+pub fn reexecBrokerOrForward(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     if (args.len > 1) {
-        try user_error.roleLine("sessh-broker", "accepts at most one daemon socket namespace");
+        try user_error.roleLine(blocking, "sessh-broker", "accepts at most one daemon socket namespace");
         return error.InvalidBrokerArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
@@ -87,19 +86,15 @@ fn forwardBrokerFramesToDaemon(
         .client_to_daemon = &client_to_daemon,
         .daemon_to_client = &daemon_to_client,
     };
-    try bridge.watch(broker_dispatcher);
+    defer bridge.deinit();
+    try bridge.registerSources(broker_dispatcher);
     try blocking.runLoop();
 }
 
-const BrokerWatchKind = enum {
+const BrokerFdKind = enum {
     stdin,
     stdout,
     daemon,
-};
-
-const BrokerWatchContext = struct {
-    bridge: *BrokerBridge,
-    kind: BrokerWatchKind,
 };
 
 const BrokerBridge = struct {
@@ -108,81 +103,88 @@ const BrokerBridge = struct {
     daemon_fd: c.fd_t,
     client_to_daemon: *BrokerFramePipe,
     daemon_to_client: *BrokerFramePipe,
-    stdin_watch: dispatcher.FdWatchId = undefined,
-    stdout_watch: dispatcher.FdWatchId = undefined,
-    daemon_watch: dispatcher.FdWatchId = undefined,
-    watch_contexts: [3]BrokerWatchContext = undefined,
+    sources: [3]dispatcher.Source = .{
+        dispatcher.Source.uninitialized(),
+        dispatcher.Source.uninitialized(),
+        dispatcher.Source.uninitialized(),
+    },
+    task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
 
-    fn watch(self: *BrokerBridge, broker_dispatcher: *dispatcher.Dispatcher) !void {
-        // The bridge has three fd interests: OpenSSH input, OpenSSH output, and
-        // daemon IPC. Store one stable context per watch so dispatcher callbacks
-        // can identify which side became ready without allocation.
-        self.watch_contexts = .{
-            .{ .bridge = self, .kind = .stdin },
-            .{ .bridge = self, .kind = .stdout },
-            .{ .bridge = self, .kind = .daemon },
+    fn registerSources(self: *BrokerBridge, broker_dispatcher: *dispatcher.Dispatcher) !void {
+        self.sources = .{
+            try broker_dispatcher.fdSource(self.stdin_fd, .{}),
+            try broker_dispatcher.fdSource(self.stdout_fd, .{}),
+            try broker_dispatcher.fdSource(self.daemon_fd, .{}),
         };
-        self.stdin_watch = try broker_dispatcher.watchFd(.{
-            .fd = self.stdin_fd,
-            .events = .{},
-            .handler = .{ .ctx = &self.watch_contexts[0], .callback = handleBrokerBridgeEvent },
-        });
-        self.stdout_watch = try broker_dispatcher.watchFd(.{
-            .fd = self.stdout_fd,
-            .events = .{},
-            .handler = .{ .ctx = &self.watch_contexts[1], .callback = handleBrokerBridgeEvent },
-        });
-        self.daemon_watch = try broker_dispatcher.watchFd(.{
-            .fd = self.daemon_fd,
-            .events = .{},
-            .handler = .{ .ctx = &self.watch_contexts[2], .callback = handleBrokerBridgeEvent },
-        });
-        try self.updateWatches(broker_dispatcher);
+        self.task = dispatcher.dispatchTask(BrokerBridge, self.client_to_daemon.allocator, self, runBrokerBridgeTask);
+        self.task.setSourceReadiness(.any);
+        inline for (self.sources) |source| try self.task.requireSource(source);
+        try self.updateSources(broker_dispatcher);
     }
 
-    fn updateWatches(self: *BrokerBridge, broker_dispatcher: *dispatcher.Dispatcher) !void {
-        try broker_dispatcher.updateFdEvents(self.stdin_watch, .{ .readable = self.client_to_daemon.wantsRead() });
-        try broker_dispatcher.updateFdEvents(self.stdout_watch, .{ .writable = self.daemon_to_client.wantsWrite() });
-        try broker_dispatcher.updateFdEvents(self.daemon_watch, .{
+    fn deinit(self: *BrokerBridge) void {
+        self.task.deinit();
+        for (&self.sources) |*source| source.deinit();
+    }
+
+    fn updateSources(self: *BrokerBridge, broker_dispatcher: *dispatcher.Dispatcher) !void {
+        self.sources[0].setFdEvents(.{ .readable = self.client_to_daemon.wantsRead() });
+        self.sources[1].setFdEvents(.{ .writable = self.daemon_to_client.wantsWrite() });
+        self.sources[2].setFdEvents(.{
             .readable = self.daemon_to_client.wantsRead(),
             .writable = self.client_to_daemon.wantsWrite(),
         });
+        try self.task.schedule(broker_dispatcher);
     }
 };
 
-fn handleBrokerBridgeEvent(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+fn runBrokerBridgeTask(
+    bridge: *BrokerBridge,
+    broker_dispatcher: *dispatcher.Dispatcher,
+    _: *dispatcher.DispatchTask,
+) !@import("../core/dispatch_io.zig").DispatchTaskStatus {
+    const kinds = [_]BrokerFdKind{ .stdin, .stdout, .daemon };
+    for (bridge.sources, kinds) |source, kind| {
+        const fd_event = source.takeFdEvent() orelse continue;
+        if (try handleBrokerBridgeEvent(bridge, kind, fd_event)) {
+            broker_dispatcher.stop();
+            return .done;
+        }
+    }
+    try bridge.updateSources(broker_dispatcher);
+    return .pending;
+}
+
+fn handleBrokerBridgeEvent(
+    bridge: *BrokerBridge,
+    kind: BrokerFdKind,
+    fd_event: dispatcher.FdEvent,
+) !bool {
     // Each ready fd advances only its matching half of the bridge. The
     // BrokerFramePipe objects remember partial frame reads/writes, so a short
     // write to OpenSSH or sesshd does not block unrelated progress.
-    const broker_dispatcher = handler_event.dispatcher;
-    const event = handler_event.event;
-    const watch: *BrokerWatchContext = @ptrCast(@alignCast(ctx));
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedBrokerBridgeTimer,
-    };
-    const closed = switch (watch.kind) {
+    return switch (kind) {
         .stdout => blk: {
             if (!fd_event.writable and !fd_event.hangup and !fd_event.error_event and !fd_event.invalid) break :blk false;
-            switch (try watch.bridge.daemon_to_client.writeReady(watch.bridge.stdout_fd)) {
+            switch (try bridge.daemon_to_client.writeReady(bridge.stdout_fd)) {
                 .blocked, .progress, .drained => break :blk false,
             }
         },
         .stdin => blk: {
             if (!fd_event.readable and !fd_event.hangup and !fd_event.error_event and !fd_event.invalid) break :blk false;
-            switch (try watch.bridge.client_to_daemon.readReady(watch.bridge.stdin_fd)) {
+            switch (try bridge.client_to_daemon.readReady(bridge.stdin_fd)) {
                 .blocked, .progress => break :blk false,
                 .closed => break :blk true,
             }
         },
         .daemon => blk: {
             if (fd_event.writable) {
-                switch (try watch.bridge.client_to_daemon.writeReady(watch.bridge.daemon_fd)) {
+                switch (try bridge.client_to_daemon.writeReady(bridge.daemon_fd)) {
                     .blocked, .progress, .drained => {},
                 }
             }
             if (fd_event.readable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-                switch (try watch.bridge.daemon_to_client.readReady(watch.bridge.daemon_fd)) {
+                switch (try bridge.daemon_to_client.readReady(bridge.daemon_fd)) {
                     .blocked, .progress => break :blk false,
                     .closed => break :blk true,
                 }
@@ -190,11 +192,6 @@ fn handleBrokerBridgeEvent(ctx: *anyopaque, handler_event: dispatcher.HandlerEve
             break :blk false;
         },
     };
-    if (closed) {
-        broker_dispatcher.stop();
-        return;
-    }
-    try watch.bridge.updateWatches(broker_dispatcher);
 }
 
 const BrokerFrameReadStatus = enum {

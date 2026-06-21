@@ -7,6 +7,7 @@ const c = std.c;
 const posix = std.posix;
 
 const core_fds = @import("../core/fds.zig");
+const core_blocking = @import("../core/blocking.zig");
 const fd_passing = @import("../core/fd_passing.zig");
 const io = @import("../core/io.zig");
 const test_helpers = if (builtin.is_test) @import("test_helpers.zig") else struct {};
@@ -521,6 +522,7 @@ test "generated protobuf payload round trip" {
 }
 
 test "frame envelope round trip" {
+    const blocking = core_blocking.fromTest();
     const payload = try encodePayload(std.testing.allocator, pb.ClientRemoteItem{
         .payload = .{ .terminal_emulator = .{ .payload = .{ .input_ack = .{ .input_seq = 42 } } } },
     });
@@ -531,7 +533,7 @@ test "frame envelope round trip" {
     const pipe = try posix.pipe();
     defer _ = c.close(pipe[0]);
     defer _ = c.close(pipe[1]);
-    try io.writeAll(pipe[1], frame_bytes);
+    try blocking.writeAll(pipe[1], frame_bytes);
     var frame = try test_helpers.readFrameForTest(std.testing.allocator, pipe[0]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(MessageType.client_remote, frame.message_type);
@@ -550,6 +552,7 @@ test "frame envelope round trip" {
 }
 
 test "mux stream frame preserves stream id offset and proxy payload" {
+    const blocking = core_blocking.fromTest();
     const payload = try encodePayload(std.testing.allocator, pb.DaemonTunnelItem{
         .payload = .{ .mux_stream = .{
             .stream_id = 7,
@@ -567,7 +570,7 @@ test "mux stream frame preserves stream id offset and proxy payload" {
     const pipe = try posix.pipe();
     defer _ = c.close(pipe[0]);
     defer _ = c.close(pipe[1]);
-    try io.writeAll(pipe[1], frame_bytes);
+    try blocking.writeAll(pipe[1], frame_bytes);
     var frame = try test_helpers.readFrameForTest(std.testing.allocator, pipe[0]);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(MessageType.daemon_tunnel, frame.message_type);
@@ -603,6 +606,7 @@ test "mux stream frame preserves stream id offset and proxy payload" {
 }
 
 test "frame envelope preserves attached bytes appendix" {
+    const blocking = core_blocking.fromTest();
     const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
         .payload = .{ .log_request = .{} },
     });
@@ -622,7 +626,7 @@ test "frame envelope preserves attached bytes appendix" {
     const pipe = try posix.pipe();
     defer _ = c.close(pipe[0]);
     defer _ = c.close(pipe[1]);
-    try io.writeAll(pipe[1], frame_bytes);
+    try blocking.writeAll(pipe[1], frame_bytes);
     var frame = try test_helpers.readFrameForTest(std.testing.allocator, pipe[0]);
     defer frame.deinit(std.testing.allocator);
 
@@ -637,6 +641,7 @@ test "frame envelope preserves attached bytes appendix" {
 }
 
 test "frame reader returns complete frame after incremental nonblocking reads" {
+    const blocking = core_blocking.fromTest();
     const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
         .payload = .{ .log_request = .{} },
     });
@@ -657,11 +662,11 @@ test "frame reader returns complete frame after incremental nonblocking reads" {
     defer reader.deinit();
 
     try std.testing.expectEqual(FrameReadStatus.blocked, try reader.readReady(pipe[0]));
-    try io.writeAll(pipe[1], frame_bytes[0..2]);
+    try blocking.writeAll(pipe[1], frame_bytes[0..2]);
     try std.testing.expectEqual(FrameReadStatus.progress, try reader.readReady(pipe[0]));
     try std.testing.expectEqual(FrameReadStatus.blocked, try reader.readReady(pipe[0]));
 
-    try io.writeAll(pipe[1], frame_bytes[2 .. frame_bytes.len - 3]);
+    try blocking.writeAll(pipe[1], frame_bytes[2 .. frame_bytes.len - 3]);
     while (true) {
         switch (try reader.readReady(pipe[0])) {
             .progress => continue,
@@ -670,7 +675,7 @@ test "frame reader returns complete frame after incremental nonblocking reads" {
         }
     }
 
-    try io.writeAll(pipe[1], frame_bytes[frame_bytes.len - 3 ..]);
+    try blocking.writeAll(pipe[1], frame_bytes[frame_bytes.len - 3 ..]);
     while (true) {
         switch (try reader.readReady(pipe[0])) {
             .progress => continue,
@@ -693,6 +698,7 @@ test "frame reader returns complete frame after incremental nonblocking reads" {
 }
 
 test "frame reader returns fd from SCM_RIGHTS marker byte" {
+    const blocking = core_blocking.fromTest();
     const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
         .payload = .{ .proxy_fd_pass_open = .{} },
     });
@@ -733,7 +739,7 @@ test "frame reader returns fd from SCM_RIGHTS marker byte" {
     }
     const fd = received_fd orelse return error.MissingFileDescriptor;
     defer _ = c.close(fd);
-    try io.writeAll(fd, "through-fd");
+    try blocking.writeAll(fd, "through-fd");
     var raw_buf: [32]u8 = undefined;
     const n = c.read(raw[1], &raw_buf, raw_buf.len);
     if (n < 0) return error.ReadFailed;
@@ -741,6 +747,7 @@ test "frame reader returns fd from SCM_RIGHTS marker byte" {
 }
 
 test "test frame reader returns fd from SCM_RIGHTS frame" {
+    const blocking = core_blocking.fromTest();
     const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
         .payload = .{ .proxy_fd_pass_open = .{} },
     });
@@ -769,7 +776,7 @@ test "test frame reader returns fd from SCM_RIGHTS frame" {
 
     const fd = frame.takeFd() orelse return error.MissingFileDescriptor;
     defer _ = c.close(fd);
-    try io.writeAll(fd, "through-test-reader");
+    try blocking.writeAll(fd, "through-test-reader");
     var raw_buf: [64]u8 = undefined;
     const n = c.read(raw[1], &raw_buf, raw_buf.len);
     if (n < 0) return error.ReadFailed;
@@ -826,6 +833,7 @@ fn sendScmRightsFrameForTest(options: ScmRightsFrameForTestOptions) !void {
 }
 
 test "frame reader reports eof shape for empty and partial streams" {
+    const blocking = core_blocking.fromTest();
     const clean_pipe = try posix.pipe();
     defer _ = c.close(clean_pipe[0]);
     try test_helpers.setNonBlockingFdForTest(clean_pipe[0]);
@@ -837,7 +845,7 @@ test "frame reader reports eof shape for empty and partial streams" {
     const partial_pipe = try posix.pipe();
     defer _ = c.close(partial_pipe[0]);
     try test_helpers.setNonBlockingFdForTest(partial_pipe[0]);
-    try io.writeAll(partial_pipe[1], "\x00\x00");
+    try blocking.writeAll(partial_pipe[1], "\x00\x00");
     _ = c.close(partial_pipe[1]);
     var partial = FrameReader.init(std.testing.allocator);
     defer partial.deinit();

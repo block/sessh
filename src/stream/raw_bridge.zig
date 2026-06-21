@@ -41,99 +41,78 @@ pub fn forwardRawDuplex(blocking: core_blocking.Blocking, left: SplitEndpointFds
         .left_to_right = &left_to_right,
         .right_to_left = &right_to_left,
     };
-    try bridge.watch(raw_dispatcher);
+    defer bridge.deinit();
+    try bridge.start(raw_dispatcher);
     try blocking.runLoop();
 }
-
-const DirectionId = enum {
-    left_to_right,
-    right_to_left,
-};
-
-const PollKind = enum {
-    read,
-    write,
-};
 
 const RawBridge = struct {
     left_to_right: *RawDirection,
     right_to_left: *RawDirection,
-    watches: [4]dispatcher.FdWatchId = undefined,
-    watch_contexts: [4]RawWatchContext = undefined,
+    sources: [3]dispatcher.Source = .{
+        dispatcher.Source.uninitialized(),
+        dispatcher.Source.uninitialized(),
+        dispatcher.Source.uninitialized(),
+    },
+    task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
 
-    fn watch(self: *RawBridge, raw_dispatcher: *dispatcher.Dispatcher) !void {
-        // Four watches model two independent directions. Reads are enabled while
-        // the opposite buffer has room; writes are enabled while that direction
-        // has queued bytes.
-        self.watch_contexts = .{
-            .{ .bridge = self, .direction = .left_to_right, .kind = .read },
-            .{ .bridge = self, .direction = .left_to_right, .kind = .write },
-            .{ .bridge = self, .direction = .right_to_left, .kind = .read },
-            .{ .bridge = self, .direction = .right_to_left, .kind = .write },
-        };
-        self.watches[0] = try raw_dispatcher.watchFd(.{
-            .fd = self.left_to_right.read_fd,
-            .events = .{},
-            .handler = .{ .ctx = &self.watch_contexts[0], .callback = handleRawBridgeEvent },
-        });
-        self.watches[1] = try raw_dispatcher.watchFd(.{
-            .fd = self.left_to_right.write_fd,
-            .events = .{},
-            .handler = .{ .ctx = &self.watch_contexts[1], .callback = handleRawBridgeEvent },
-        });
-        self.watches[2] = try raw_dispatcher.watchFd(.{
-            .fd = self.right_to_left.read_fd,
-            .events = .{},
-            .handler = .{ .ctx = &self.watch_contexts[2], .callback = handleRawBridgeEvent },
-        });
-        self.watches[3] = try raw_dispatcher.watchFd(.{
-            .fd = self.right_to_left.write_fd,
-            .events = .{},
-            .handler = .{ .ctx = &self.watch_contexts[3], .callback = handleRawBridgeEvent },
-        });
-        try self.updateWatches(raw_dispatcher);
+    fn start(self: *RawBridge, raw_dispatcher: *dispatcher.Dispatcher) !void {
+        // Three fds model the two directions: left input, left output, and the
+        // bidirectional right fd. The right Source carries both readable and
+        // writable interests, preserving the invariant that each fd has one
+        // dispatcher Source.
+        self.sources[0] = try raw_dispatcher.fdSource(self.left_to_right.read_fd, .{});
+        self.sources[1] = try raw_dispatcher.fdSource(self.right_to_left.write_fd, .{});
+        self.sources[2] = try raw_dispatcher.fdSource(self.right_to_left.read_fd, .{});
+        self.task = dispatcher.dispatchTask(RawBridge, raw_dispatcher.allocator, self, runRawBridgeTask);
+        self.task.setSourceReadiness(.any);
+        for (self.sources) |source| try self.task.requireSource(source);
+        try self.updateSources(raw_dispatcher);
+        try self.task.schedule(raw_dispatcher);
     }
 
-    fn direction(self: *RawBridge, id: DirectionId) *RawDirection {
-        return switch (id) {
-            .left_to_right => self.left_to_right,
-            .right_to_left => self.right_to_left,
-        };
+    fn deinit(self: *RawBridge) void {
+        self.task.deinit();
+        for (&self.sources) |*source| source.deinit();
     }
 
-    fn updateWatches(self: *RawBridge, raw_dispatcher: *dispatcher.Dispatcher) !void {
-        try raw_dispatcher.updateFdEvents(self.watches[0], .{ .readable = self.left_to_right.wantsRead() });
-        try raw_dispatcher.updateFdEvents(self.watches[1], .{ .writable = self.left_to_right.wantsWrite() });
-        try raw_dispatcher.updateFdEvents(self.watches[2], .{ .readable = self.right_to_left.wantsRead() });
-        try raw_dispatcher.updateFdEvents(self.watches[3], .{ .writable = self.right_to_left.wantsWrite() });
+    fn updateSources(self: *RawBridge, raw_dispatcher: *dispatcher.Dispatcher) !void {
+        self.sources[0].setFdEvents(.{ .readable = self.left_to_right.wantsRead() });
+        self.sources[1].setFdEvents(.{ .writable = self.right_to_left.wantsWrite() });
+        self.sources[2].setFdEvents(.{
+            .readable = self.right_to_left.wantsRead(),
+            .writable = self.left_to_right.wantsWrite(),
+        });
         if (self.left_to_right.done() and self.right_to_left.done()) raw_dispatcher.stop();
     }
 };
 
-const RawWatchContext = struct {
+fn runRawBridgeTask(
     bridge: *RawBridge,
-    direction: DirectionId,
-    kind: PollKind,
-};
-
-fn handleRawBridgeEvent(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
-    const raw_dispatcher = handler_event.dispatcher;
-    const event = handler_event.event;
-    const watch: *RawWatchContext = @ptrCast(@alignCast(ctx));
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedRawBridgeTimer,
-    };
-    const direction = watch.bridge.direction(watch.direction);
-    switch (watch.kind) {
-        .read => if (fd_event.readable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-            direction.readReady();
-        },
-        .write => if (fd_event.writable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-            direction.writeReady();
-        },
+    raw_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+) !@import("../core/dispatch_io.zig").DispatchTaskStatus {
+    _ = task;
+    if (bridge.sources[0].takeFdEvent()) |fd_event| {
+        if (fd_event.readable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+            bridge.left_to_right.readReady();
+        }
     }
-    try watch.bridge.updateWatches(raw_dispatcher);
+    if (bridge.sources[1].takeFdEvent()) |fd_event| {
+        if (fd_event.writable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+            bridge.right_to_left.writeReady();
+        }
+    }
+    if (bridge.sources[2].takeFdEvent()) |fd_event| {
+        if (fd_event.writable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+            bridge.left_to_right.writeReady();
+        }
+        if (fd_event.readable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
+            bridge.right_to_left.readReady();
+        }
+    }
+    try bridge.updateSources(raw_dispatcher);
+    return .pending;
 }
 
 const RawDirection = struct {

@@ -16,7 +16,7 @@ const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
 const daemon_tunnel = @import("tunnel.zig");
 const proxy_diagnostics_router = @import("../transport/proxy_diagnostics_router.zig");
-const frame_write_queue = @import("../transport/frame_write_queue.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const transport_ssh = @import("../transport/ssh.zig");
 
 const hpb = protocol.hpb;
@@ -57,14 +57,16 @@ pub fn registerAcceptedClient(options: RegisterAcceptedClientOptions) !void {
     options.active_local_clients.* += 1;
     errdefer options.active_local_clients.* -= 1;
 
-    _ = try options.daemon_dispatcher.watchFd(.{
-        .fd = options.client_fd,
-        .events = .{ .readable = true },
-        .handler = .{
-            .ctx = context,
-            .callback = readDaemonClient,
-        },
-    });
+    context.source = try options.daemon_dispatcher.fdSource(options.client_fd, .{ .readable = true });
+    errdefer context.releaseDispatchHandles();
+    context.task = try dispatcher.fdDispatchTask(
+        ClientContext,
+        allocator,
+        context,
+        context.source,
+        readDaemonClient,
+    );
+    try context.task.schedule(options.daemon_dispatcher);
 }
 
 const ClientStage = enum {
@@ -83,7 +85,9 @@ const ClientContext = struct {
     active_local_clients: *usize,
     fd: c.fd_t,
     reader: protocol.FrameReader = undefined,
-    writer: frame_write_queue.FrameWriteQueue = undefined,
+    writer: dispatch_io.FrameSink = undefined,
+    source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
     stage: ClientStage = .waiting_peer_hello,
     owns_active_count: bool = true,
     close_after_write: bool = false,
@@ -93,10 +97,11 @@ const ClientContext = struct {
     }
 
     fn initWriter(self: *ClientContext) void {
-        self.writer = frame_write_queue.FrameWriteQueue.init(self.allocator);
+        self.writer = dispatch_io.FrameSink.init(.{ .allocator = self.allocator, .fd = -1 });
     }
 
     fn deinit(self: *ClientContext) void {
+        self.releaseDispatchHandles();
         self.writer.deinit();
         self.reader.deinit();
         if (self.fd >= 0) {
@@ -109,15 +114,23 @@ const ClientContext = struct {
         }
         self.allocator.destroy(self);
     }
+
+    fn releaseDispatchHandles(self: *ClientContext) void {
+        self.task.deinit();
+        self.source.deinit();
+    }
 };
 
-fn readDaemonClient(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
-    const daemon_dispatcher = handler_event.dispatcher;
-    const id = handler_event.id;
-    const context: *ClientContext = @ptrCast(@alignCast(ctx));
-    readDaemonClientInner(context, handler_event) catch |err| {
+fn readDaemonClient(
+    context: *ClientContext,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    _: *dispatcher.DispatchTask,
+    event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
+    return readDaemonClientInner(context, daemon_dispatcher, event) catch |err| {
         daemon_log.infof(context.allocator, "client handler failed error={t}", .{err});
-        closeDaemonClient(context, daemon_dispatcher, id);
+        closeDaemonClient(context, daemon_dispatcher);
+        return .done;
     };
 }
 
@@ -125,26 +138,22 @@ fn readDaemonClient(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !vo
 // writes before reads so protocol errors and hello replies are not stranded
 // behind more input, then transfers ownership once the first real request is
 // decoded.
-fn readDaemonClientInner(context: *ClientContext, handler_event: dispatcher.HandlerEvent) !void {
-    const daemon_dispatcher = handler_event.dispatcher;
-    const id = handler_event.id;
-    const event = handler_event.event;
-    switch (event) {
-        .fd => |fd_event| {
-            if (fd_event.error_event or fd_event.invalid) {
-                closeDaemonClient(context, daemon_dispatcher, id);
-                return;
-            }
-            if (fd_event.writable and try drainDaemonClientWrites(context, daemon_dispatcher, id)) return;
-            if (context.close_after_write) return;
-            if (!fd_event.readable and !fd_event.hangup) return;
-        },
-        .timer => return error.UnexpectedDaemonTimer,
+fn readDaemonClientInner(
+    context: *ClientContext,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    fd_event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
+    if (fd_event.error_event or fd_event.invalid) {
+        closeDaemonClient(context, daemon_dispatcher);
+        return .done;
     }
+    if (fd_event.writable and try drainDaemonClientWrites(context, daemon_dispatcher)) return .done;
+    if (context.close_after_write) return .pending;
+    if (!fd_event.readable and !fd_event.hangup) return .pending;
 
     while (true) {
         switch (try context.reader.readReady(context.fd)) {
-            .blocked => return,
+            .blocked => return .pending,
             .progress => continue,
             .eof => {
                 if (context.stage == .daemon_log) {
@@ -152,41 +161,40 @@ fn readDaemonClientInner(context: *ClientContext, handler_event: dispatcher.Hand
                 } else {
                     daemon_log.infof(context.allocator, "client disconnected from daemon", .{});
                 }
-                closeDaemonClient(context, daemon_dispatcher, id);
-                return;
+                closeDaemonClient(context, daemon_dispatcher);
+                return .done;
             },
             .truncated_frame => {
-                closeDaemonClient(context, daemon_dispatcher, id);
-                return;
+                closeDaemonClient(context, daemon_dispatcher);
+                return .done;
             },
             .frame => |frame_value| {
                 var frame = frame_value;
                 const action = try handleDaemonClientFrame(context, daemon_dispatcher, .{
-                    .watch_id = id,
                     .frame = &frame,
                 });
                 switch (action) {
                     .consumed => {
                         frame.deinit(context.allocator);
-                        if (context.writer.hasPending()) {
-                            try updateDaemonClientEvents(context, daemon_dispatcher, id);
-                            return;
+                        if (context.writer.hasPendingWrite()) {
+                            try updateDaemonClientEvents(context, daemon_dispatcher);
+                            return .pending;
                         }
                     },
                     .close => {
                         frame.deinit(context.allocator);
-                        if (context.writer.hasPending()) {
+                        if (context.writer.hasPendingWrite()) {
                             context.close_after_write = true;
-                            try updateDaemonClientEvents(context, daemon_dispatcher, id);
-                            return;
+                            try updateDaemonClientEvents(context, daemon_dispatcher);
+                            return .pending;
                         }
-                        closeDaemonClient(context, daemon_dispatcher, id);
-                        return;
+                        closeDaemonClient(context, daemon_dispatcher);
+                        return .done;
                     },
                     .transferred => {
                         frame.deinit(context.allocator);
                         context.deinit();
-                        return;
+                        return .done;
                     },
                 }
             },
@@ -201,7 +209,6 @@ const DaemonClientFrameAction = enum {
 };
 
 const DaemonClientFrame = struct {
-    watch_id: dispatcher.WatchId,
     frame: *protocol.OwnedFrame,
 
     fn takePassedFd(self: DaemonClientFrame) ?c.fd_t {
@@ -325,7 +332,7 @@ const TransferInitialRequestResult = enum {
 
 // Some first client frames create a long-lived owner outside the generic daemon
 // client router. When that happens, move the accepted fd and its first frame to
-// the terminal/proxy owner and cancel the router watch so there is exactly one
+// the terminal/proxy owner and release the router source so there is exactly one
 // dispatcher path responsible for the connection.
 fn transferInitialRequestToDispatcherOwner(
     context: *ClientContext,
@@ -339,9 +346,8 @@ fn transferInitialRequestToDispatcherOwner(
         defer item.deinit(context.allocator);
         const item_payload = item.payload orelse return .not_transferred;
         if (item_payload == .open) {
-            daemon_dispatcher.cancel(event.watch_id);
             const client_fd = context.fd;
-            context.fd = -1;
+            context.releaseDispatchHandles();
             try session_daemon_handler.registerFrameWithTerminalRemoteFromDaemon(.{
                 .allocator = context.allocator,
                 .daemon_dispatcher = daemon_dispatcher,
@@ -349,21 +355,22 @@ fn transferInitialRequestToDispatcherOwner(
                 .frame = frame.*,
                 .client_fd = client_fd,
             });
+            context.fd = -1;
             return .transferred;
         }
         switch (item_payload) {
             .debug_sever_connection_request,
             .debug_unresponsive_connection_request,
             => {
-                daemon_dispatcher.cancel(event.watch_id);
                 const client_fd = context.fd;
-                context.fd = -1;
+                context.releaseDispatchHandles();
                 try session_daemon_handler.registerDebugFrameWithTerminalRemoteFromDaemon(.{
                     .allocator = context.allocator,
                     .daemon_dispatcher = daemon_dispatcher,
                     .frame = frame.*,
                     .client_fd = client_fd,
                 });
+                context.fd = -1;
                 return .transferred;
             },
             else => {},
@@ -376,7 +383,7 @@ fn transferInitialRequestToDispatcherOwner(
         if (try handleTransportControlFrameQueued(context, frame.message_type, frame.payload)) return .consumed;
         if (try handleDaemonTunnelControlFrame(context, daemon_dispatcher, frame.*)) return .consumed;
         var initial_frames = [_]protocol.OwnedFrame{frame.*};
-        daemon_dispatcher.cancel(event.watch_id);
+        context.releaseDispatchHandles();
         try daemon_tunnel.registerMuxConnectionFromDaemon(context.allocator, daemon_dispatcher, .{
             .terminal_remote_exe = context.terminal_remote_exe,
             .proxy_remote_exe = context.proxy_remote_exe,
@@ -396,7 +403,7 @@ fn transferInitialRequestToDispatcherOwner(
         .ssh_transport_acquire => |request| {
             if (try event.rejectPassedFd(context, "passed file descriptor is only valid for proxy fd-pass open")) return .close;
             daemon_log.infof(context.allocator, "ssh transport requested", .{});
-            daemon_dispatcher.cancel(event.watch_id);
+            context.releaseDispatchHandles();
             try transport_ssh.registerPooledSshTransportFromDaemon(.{
                 .blocking = context.blocking,
                 .allocator = context.allocator,
@@ -410,7 +417,7 @@ fn transferInitialRequestToDispatcherOwner(
         .proxy_diagnostics_open => |request| {
             if (try event.rejectPassedFd(context, "passed file descriptor is only valid for proxy fd-pass open")) return .close;
             daemon_log.infof(context.allocator, "proxy diagnostics requested guid={s}", .{request.proxy_guid});
-            daemon_dispatcher.cancel(event.watch_id);
+            context.releaseDispatchHandles();
             try proxy_diagnostics_router.registerOpenFromDaemon(.{
                 .allocator = context.allocator,
                 .daemon_dispatcher = daemon_dispatcher,
@@ -435,7 +442,7 @@ fn transferInitialRequestToDispatcherOwner(
             } else {
                 daemon_log.infof(context.allocator, "proxy fd-pass requested without proxy details", .{});
             }
-            daemon_dispatcher.cancel(event.watch_id);
+            context.releaseDispatchHandles();
             try transport_ssh.registerProxyFdPassOpenFromDaemon(.{
                 .blocking = context.blocking,
                 .allocator = context.allocator,
@@ -449,7 +456,7 @@ fn transferInitialRequestToDispatcherOwner(
         },
         .log_request => {
             if (try event.rejectPassedFd(context, "unexpected passed file descriptor")) return .close;
-            daemon_dispatcher.cancel(event.watch_id);
+            context.releaseDispatchHandles();
             const log_fd = context.fd;
             try daemon_log.subscribe(context.allocator, daemon_dispatcher, log_fd);
             context.fd = -1;
@@ -460,8 +467,8 @@ fn transferInitialRequestToDispatcherOwner(
     }
 }
 
-fn closeDaemonClient(context: *ClientContext, daemon_dispatcher: *dispatcher.Dispatcher, id: dispatcher.WatchId) void {
-    daemon_dispatcher.cancel(id);
+fn closeDaemonClient(context: *ClientContext, daemon_dispatcher: *dispatcher.Dispatcher) void {
+    _ = daemon_dispatcher;
     if (context.stage == .daemon_log and context.fd >= 0) daemon_log.unsubscribe(context.allocator, context.fd);
     context.deinit();
 }
@@ -573,7 +580,7 @@ fn handleDaemonTunnelControlFrame(
 fn handleTransportControlFrameQueued(context: *ClientContext, message_type: protocol.MessageType, payload: []const u8) !bool {
     switch (try protocol.decodeTransportControlFrame(context.allocator, message_type, payload) orelse return false) {
         .ping => {
-            try context.writer.queueDaemonTunnelPayload(.{ .pong = .{} });
+            try context.writer.writeDaemonTunnelPayload(.{ .pong = .{} });
             return true;
         },
         .pong => return true,
@@ -587,13 +594,13 @@ fn queueHelloRequest(context: *ClientContext) !void {
         .version = core_config.version,
     });
     defer context.allocator.free(payload);
-    try context.writer.queueFrame(.hello_request, payload);
+    try context.writer.writeFrame(.hello_request, payload);
 }
 
 fn queueHelloOk(context: *ClientContext) !void {
     const payload = try protocol.encodePayload(context.allocator, hpb.HelloOk{});
     defer context.allocator.free(payload);
-    try context.writer.queueFrame(.hello_ok, payload);
+    try context.writer.writeFrame(.hello_ok, payload);
 }
 
 fn queueHelloError(context: *ClientContext, info: protocol.ErrorInfo) !void {
@@ -603,14 +610,14 @@ fn queueHelloError(context: *ClientContext, info: protocol.ErrorInfo) !void {
         .hint = info.hint,
     });
     defer context.allocator.free(payload);
-    try context.writer.queueFrame(.hello_error, payload);
+    try context.writer.writeFrame(.hello_error, payload);
     context.close_after_write = true;
 }
 
 fn queueError(context: *ClientContext, info: protocol.ErrorInfo) !void {
     const payload = try protocol.encodeErrorPayload(context.allocator, info);
     defer context.allocator.free(payload);
-    try context.writer.queueFrame(.error_message, payload);
+    try context.writer.writeFrame(.error_message, payload);
     context.close_after_write = true;
 }
 
@@ -624,42 +631,38 @@ fn queueProtocolError(context: *ClientContext, message: []const u8) !void {
 fn drainDaemonClientWrites(
     context: *ClientContext,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    id: dispatcher.WatchId,
 ) !bool {
     // Flush queued response frames before closing or resuming reads. This keeps
     // daemon errors/log replies ordered while still respecting socket
     // backpressure from slow foreground clients.
-    if (!context.writer.hasPending()) {
-        try updateDaemonClientEvents(context, daemon_dispatcher, id);
+    if (!context.writer.hasPendingWrite()) {
+        try updateDaemonClientEvents(context, daemon_dispatcher);
         return false;
     }
-    switch (try context.writer.writeReady(context.fd)) {
+    switch (try context.writer.writeReadyTo(context.fd)) {
         .blocked, .progress => {
-            try updateDaemonClientEvents(context, daemon_dispatcher, id);
+            try updateDaemonClientEvents(context, daemon_dispatcher);
             return false;
         },
         .drained => {
             if (context.close_after_write) {
-                closeDaemonClient(context, daemon_dispatcher, id);
+                closeDaemonClient(context, daemon_dispatcher);
                 return true;
             }
-            try updateDaemonClientEvents(context, daemon_dispatcher, id);
+            try updateDaemonClientEvents(context, daemon_dispatcher);
             return false;
         },
     }
 }
 
 fn updateDaemonClientEvents(
-    context: *const ClientContext,
+    context: *ClientContext,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    id: dispatcher.WatchId,
 ) !void {
-    const fd_id = switch (id) {
-        .fd => |fd_id| fd_id,
-        .timer => return error.UnexpectedDaemonTimer,
-    };
-    try daemon_dispatcher.updateFdEvents(fd_id, .{
+    if (!context.source.isInitialized()) return;
+    context.source.setFdEvents(.{
         .readable = !context.close_after_write,
-        .writable = context.writer.hasPending(),
+        .writable = context.writer.hasPendingWrite(),
     });
+    if (context.task.isInitialized()) try context.task.schedule(daemon_dispatcher);
 }

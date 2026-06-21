@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = std.c;
 
-const io = @import("../core/io.zig");
+const core_blocking = @import("../core/blocking.zig");
 const terminal = @import("../tty/terminal.zig");
 
 /// Shared title-bar status helpers for reconnect UI.
@@ -35,34 +35,34 @@ pub fn reconnectingStatus(controls: Controls) []const u8 {
     return "sessh: disconnected: Reconnecting...";
 }
 
-pub fn writeRetryTitle(fd: c.fd_t, delay_ms: u64) !void {
+pub fn writeRetryTitle(blocking: core_blocking.Blocking, fd: c.fd_t, delay_ms: u64) !void {
     var title_buf: [48]u8 = undefined;
     const title = try retryTitle(delay_ms, &title_buf);
-    try writeTitle(fd, title);
+    try writeTitle(blocking, fd, title);
 }
 
-pub fn writeRetryNowTitle(fd: c.fd_t, delay_ms: u64) !void {
+pub fn writeRetryNowTitle(blocking: core_blocking.Blocking, fd: c.fd_t, delay_ms: u64) !void {
     var title_buf: [48]u8 = undefined;
     const title = try retryNowTitle(delay_ms, &title_buf);
-    try writeTitle(fd, title);
+    try writeTitle(blocking, fd, title);
 }
 
-pub fn writeReconnectingTitle(fd: c.fd_t) !void {
-    try writeTitle(fd, "reconnecting");
+pub fn writeReconnectingTitle(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
+    try writeTitle(blocking, fd, "reconnecting");
 }
 
-pub fn writeReconnectingNowTitle(fd: c.fd_t) !void {
-    try writeTitle(fd, "reconnecting CTRL-R");
+pub fn writeReconnectingNowTitle(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
+    try writeTitle(blocking, fd, "reconnecting CTRL-R");
 }
 
-pub fn writeConnectionReadyTitle(fd: c.fd_t) !void {
-    try writeTitle(fd, "connection ready");
+pub fn writeConnectionReadyTitle(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
+    try writeTitle(blocking, fd, "connection ready");
 }
 
-pub fn writeSwitchCountdownTitle(fd: c.fd_t, delay_ms: u64) !void {
+pub fn writeSwitchCountdownTitle(blocking: core_blocking.Blocking, fd: c.fd_t, delay_ms: u64) !void {
     var title_buf: [48]u8 = undefined;
     const title = try switchCountdownTitle(delay_ms, &title_buf);
-    try writeTitle(fd, title);
+    try writeTitle(blocking, fd, title);
 }
 
 fn retryTitle(delay_ms: u64, buf: []u8) ![]const u8 {
@@ -83,20 +83,20 @@ fn switchCountdownTitle(delay_ms: u64, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s} until switch", .{delay});
 }
 
-pub fn writeTitle(fd: c.fd_t, title: []const u8) !void {
-    try io.writeAll(fd, "\x1b]2;");
+pub fn writeTitle(blocking: core_blocking.Blocking, fd: c.fd_t, title: []const u8) !void {
+    try blocking.writeAll(fd, "\x1b]2;");
     var buf: [256]u8 = undefined;
     var len: usize = 0;
     for (title) |byte| {
         buf[len] = terminal.sanitizedOscTextByte(byte);
         len += 1;
         if (len == buf.len) {
-            try io.writeAll(fd, buf[0..len]);
+            try blocking.writeAll(fd, buf[0..len]);
             len = 0;
         }
     }
-    if (len > 0) try io.writeAll(fd, buf[0..len]);
-    try io.writeAll(fd, "\x1b\\");
+    if (len > 0) try blocking.writeAll(fd, buf[0..len]);
+    try blocking.writeAll(fd, "\x1b\\");
 }
 
 test "retry title uses compact reconnect delay" {
@@ -120,12 +120,13 @@ test "retry status includes available controls" {
 }
 
 test "writeTitle sanitizes control bytes" {
+    const blocking = core_blocking.fromTest();
     const posix = std.posix;
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    try writeTitle(fds[1], "a\nb\x7fc");
+    try writeTitle(blocking, fds[1], "a\nb\x7fc");
 
     var buf: [64]u8 = undefined;
     const n = try posix.read(fds[0], &buf);

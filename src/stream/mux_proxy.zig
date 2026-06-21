@@ -11,7 +11,7 @@ const worker_endpoint = @import("../daemon/worker_endpoint.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const guid_ref = @import("../core/guid.zig");
 const protocol = @import("../protocol/mod.zig");
-const frame_write_queue = @import("../transport/frame_write_queue.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const one_shot_frame_writer = @import("../transport/one_shot_frame_writer.zig");
 const proxy_remote = @import("proxy_remote.zig");
 
@@ -34,8 +34,7 @@ pub const ProxyMuxContext = struct {
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     streams: *std.ArrayList(ProxyMuxStream),
-    mux_writer: *frame_write_queue.FrameWriteQueue,
-    process_watch_handler: ?dispatcher.Handler,
+    mux_writer: *dispatch_io.FrameSink,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 };
 
@@ -115,7 +114,7 @@ pub fn handleProxyMuxOpen(
                 .stream_id = proxy_mux_stream_id,
                 .message = .{ .open = open },
             });
-            if (ctx.daemon_dispatcher) |d| try streams.items[index].endpoint.updateWatch(d);
+            if (ctx.daemon_dispatcher != null) streams.items[index].endpoint.updateDispatchSource();
         }
         return;
     }
@@ -147,9 +146,9 @@ fn handleProxyMuxPayload(
         .open => |request| try handleProxyMuxPayloadOpen(ctx, stream_id, request),
         .data => {
             try forwardProxyMuxFrameToProxyRemote(ctx.streams, mux_frame);
-            if (ctx.daemon_dispatcher) |d| {
+            if (ctx.daemon_dispatcher != null) {
                 const index = findProxyMuxStreamIndex(ctx.streams, stream_id) orelse return error.StreamUnexpectedFrame;
-                try ctx.streams.items[index].endpoint.updateWatch(d);
+                ctx.streams.items[index].endpoint.updateDispatchSource();
             }
         },
     }
@@ -191,14 +190,13 @@ fn handleProxyMuxPayloadOpen(
     const canonical = try guid_ref.canonicalProxyGuid(ctx.allocator, request.proxy_guid);
     defer ctx.allocator.free(canonical);
     try ctx.streams.items[index].proxy_guid.set(canonical);
-    try ctx.mux_writer.queueDaemonTunnelPayload(.{ .remote_process_started = .{
+    try ctx.mux_writer.writeDaemonTunnelPayload(.{ .remote_process_started = .{
         .stream_id = stream_id,
         .process = daemon_cleanup.makeRemoteProcessIdentity(ctx.identity, canonical),
     } });
     if (ctx.daemon_dispatcher) |d| {
-        const handler = ctx.process_watch_handler orelse return error.MissingProxyRemoteHandler;
         ctx.streams.items[index].endpoint.initReader(ctx.allocator);
-        try ctx.streams.items[index].endpoint.watch(d, handler);
+        try ctx.streams.items[index].endpoint.initDispatchSource(d);
         _ = try drainProxyProcessWrites(&ctx.streams.items[index], d);
     }
 }
@@ -216,7 +214,7 @@ fn forwardProxyMuxFrameToProxyRemote(
 
 pub const ForwardProxyRemoteFrameToMuxOptions = struct {
     allocator: std.mem.Allocator,
-    mux_writer: *frame_write_queue.FrameWriteQueue,
+    mux_writer: *dispatch_io.FrameSink,
     stream: *ProxyMuxStream,
     frame: *protocol.OwnedFrame,
 };
@@ -244,7 +242,7 @@ pub fn handleProxyRemoteControlFrame(
     defer item.deinit(allocator);
     switch (item.payload orelse return false) {
         .ping => {
-            try stream.endpoint.writer.queueDaemonTunnelPayload(.{ .pong = .{} });
+            try stream.endpoint.writer.writeDaemonTunnelPayload(.{ .pong = .{} });
             return true;
         },
         .pong => return true,
@@ -259,10 +257,10 @@ pub fn findProxyMuxStreamIndex(streams: *const std.ArrayList(ProxyMuxStream), st
     return null;
 }
 
-pub fn findProxyMuxStreamIndexByWatch(streams: *const std.ArrayList(ProxyMuxStream), watch_id: dispatcher.FdWatchId) ?usize {
+pub fn findProxyMuxStreamIndexBySource(streams: *const std.ArrayList(ProxyMuxStream), source: dispatcher.Source) ?usize {
     for (streams.items, 0..) |stream, index| {
-        const process_watch_id = stream.endpoint.watch_id orelse continue;
-        if (process_watch_id.index == watch_id.index and process_watch_id.generation == watch_id.generation) return index;
+        if (!stream.endpoint.dispatch_source.isInitialized()) continue;
+        if (stream.endpoint.dispatch_source.eql(source)) return index;
     }
     return null;
 }
@@ -314,7 +312,7 @@ fn sendProxyStartupFailedAndClose(
 pub fn drainProxyProcessWrites(
     stream: *ProxyMuxStream,
     daemon_dispatcher: *dispatcher.Dispatcher,
-) !frame_write_queue.WriteQueueStatus {
+) !dispatch_io.SinkWriteStatus {
     return stream.endpoint.drainWrites(daemon_dispatcher);
 }
 
@@ -322,15 +320,15 @@ fn queueProxyProcessFrame(
     stream: *ProxyMuxStream,
     message: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
-    stream.endpoint.queueMuxStreamFrame(message) catch |err| switch (err) {
+    stream.endpoint.writeMuxStreamFrame(message) catch |err| switch (err) {
         error.WorkerEndpointWriterMissing => return error.ProxyProcessWriterMissing,
         else => return err,
     };
 }
 
 fn queueProxyMuxFrame(
-    mux_writer: *frame_write_queue.FrameWriteQueue,
+    mux_writer: *dispatch_io.FrameSink,
     message: pb.DaemonTunnelItem.MuxStreamFrame,
 ) !void {
-    try mux_writer.queueMuxStreamFrame(message);
+    try mux_writer.writeMuxStreamFrame(message);
 }

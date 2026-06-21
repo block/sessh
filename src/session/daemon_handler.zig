@@ -9,7 +9,7 @@ const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
 const protocol = @import("../protocol/mod.zig");
 const frame_forwarder = @import("../transport/frame_forwarder.zig");
-const frame_write_queue = @import("../transport/frame_write_queue.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const one_shot_frame_writer = @import("../transport/one_shot_frame_writer.zig");
 const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_identity = @import("../daemon/identity.zig");
@@ -205,8 +205,7 @@ pub const TerminalMuxContext = struct {
     exe: []const u8,
     identity: daemon_identity.DaemonIdentity,
     sessions: *std.ArrayList(TerminalMuxStream),
-    mux_writer: *frame_write_queue.FrameWriteQueue,
-    process_watch_handler: ?dispatcher.Handler,
+    mux_writer: *dispatch_io.FrameSink,
     daemon_dispatcher: ?*dispatcher.Dispatcher,
 };
 
@@ -374,7 +373,7 @@ fn handleTerminalMuxPayloadOpen(
         try core_fds.setNonBlocking(process_fd.get());
     }
 
-    try ctx.mux_writer.queueDaemonTunnelPayload(.{ .remote_process_started = .{
+    try ctx.mux_writer.writeDaemonTunnelPayload(.{ .remote_process_started = .{
         .stream_id = stream_id,
         .process = daemon_cleanup.makeRemoteProcessIdentity(ctx.identity, te_open.session_guid),
     } });
@@ -385,9 +384,8 @@ fn handleTerminalMuxPayloadOpen(
     defer remote_open.deinit(ctx.allocator);
     try queueTerminalWorkerPayload(ctx.allocator, &ctx.sessions.items[stream_index], .{ .open = remote_open });
     if (ctx.daemon_dispatcher) |d| {
-        const handler = ctx.process_watch_handler orelse return error.MissingTerminalRemoteHandler;
         ctx.sessions.items[stream_index].endpoint.initReader(ctx.allocator);
-        try ctx.sessions.items[stream_index].endpoint.watch(d, handler);
+        try ctx.sessions.items[stream_index].endpoint.initDispatchSource(d);
     }
     ctx.sessions.items[stream_index].session_guid = session_guid;
     ctx.sessions.items[stream_index].inbound_next_offset = @max(ctx.sessions.items[stream_index].inbound_next_offset, payload_offset +| 1);
@@ -483,13 +481,13 @@ fn handleTerminalMuxPayload(
         }
     }
     try queueTerminalWorkerItem(ctx.allocator, stream, te_item);
-    if (ctx.daemon_dispatcher) |d| try stream.endpoint.updateWatch(d);
+    if (ctx.daemon_dispatcher != null) stream.endpoint.updateDispatchSource();
 }
 
 pub fn drainTerminalWorkerWrites(
     stream: *TerminalMuxStream,
     daemon_dispatcher: *dispatcher.Dispatcher,
-) !frame_write_queue.WriteQueueStatus {
+) !dispatch_io.SinkWriteStatus {
     return stream.endpoint.drainWrites(daemon_dispatcher);
 }
 
@@ -508,7 +506,7 @@ fn queueTerminalWorkerItem(
 ) !void {
     const encoded = try protocol.encodeTerminalEmulatorItemPayload(allocator, item);
     defer allocator.free(encoded);
-    stream.endpoint.queueFrame(.client_remote, encoded) catch |err| switch (err) {
+    stream.endpoint.writeFrame(.client_remote, encoded) catch |err| switch (err) {
         error.WorkerEndpointWriterMissing => return error.TerminalWorkerWriterMissing,
         else => return err,
     };
@@ -516,7 +514,7 @@ fn queueTerminalWorkerItem(
 
 pub const ForwardTerminalRemoteFrameToMuxOptions = struct {
     allocator: std.mem.Allocator,
-    mux_writer: *frame_write_queue.FrameWriteQueue,
+    mux_writer: *dispatch_io.FrameSink,
     stream: *TerminalMuxStream,
     frame: *protocol.OwnedFrame,
 };
@@ -565,10 +563,10 @@ pub fn forwardTerminalRemoteFrameToMux(options: ForwardTerminalRemoteFrameToMuxO
     return true;
 }
 
-pub fn findTerminalMuxStreamIndexByWatch(sessions: *const std.ArrayList(TerminalMuxStream), watch_id: dispatcher.FdWatchId) ?usize {
+pub fn findTerminalMuxStreamIndexBySource(sessions: *const std.ArrayList(TerminalMuxStream), source: dispatcher.Source) ?usize {
     for (sessions.items, 0..) |stream, index| {
-        const process_watch_id = stream.endpoint.watch_id orelse continue;
-        if (process_watch_id.index == watch_id.index and process_watch_id.generation == watch_id.generation) return index;
+        if (!stream.endpoint.dispatch_source.isInitialized()) continue;
+        if (stream.endpoint.dispatch_source.eql(source)) return index;
     }
     return null;
 }
@@ -599,7 +597,7 @@ fn removeTerminalMuxStream(
     });
 }
 
-fn sendTerminalMuxOpenOk(mux_writer: *frame_write_queue.FrameWriteQueue, stream_id: u64) !void {
+fn sendTerminalMuxOpenOk(mux_writer: *dispatch_io.FrameSink, stream_id: u64) !void {
     try sendTerminalMuxFrame(mux_writer, .{
         .stream_id = stream_id,
         .message = .{ .open_ok = .{
@@ -609,7 +607,7 @@ fn sendTerminalMuxOpenOk(mux_writer: *frame_write_queue.FrameWriteQueue, stream_
 }
 
 fn sendTerminalMuxPayload(
-    mux_writer: *frame_write_queue.FrameWriteQueue,
+    mux_writer: *dispatch_io.FrameSink,
     stream: *const TerminalMuxStream,
     item: pb.TerminalEmulatorItem,
 ) !void {
@@ -622,7 +620,7 @@ fn sendTerminalMuxPayload(
     });
 }
 
-fn sendTerminalMuxEof(mux_writer: *frame_write_queue.FrameWriteQueue, stream_id: u64, final_offset: u64) !void {
+fn sendTerminalMuxEof(mux_writer: *dispatch_io.FrameSink, stream_id: u64, final_offset: u64) !void {
     try sendTerminalMuxFrame(mux_writer, .{
         .stream_id = stream_id,
         .message = .{ .eof = .{ .final_offset = final_offset } },
@@ -630,14 +628,14 @@ fn sendTerminalMuxEof(mux_writer: *frame_write_queue.FrameWriteQueue, stream_id:
 }
 
 const TerminalMuxResetOptions = struct {
-    mux_writer: *frame_write_queue.FrameWriteQueue,
+    mux_writer: *dispatch_io.FrameSink,
     stream_id: u64,
     code: []const u8,
     message: []const u8,
 };
 
 fn sendTerminalMuxReset(options: TerminalMuxResetOptions) !void {
-    try options.mux_writer.queueMuxStreamFrame(protocol.muxStreamResetFrame(
+    try options.mux_writer.writeMuxStreamFrame(protocol.muxStreamResetFrame(
         options.stream_id,
         options.code,
         options.message,
@@ -646,7 +644,7 @@ fn sendTerminalMuxReset(options: TerminalMuxResetOptions) !void {
 
 const TerminalMuxResetForErrorOptions = struct {
     allocator: std.mem.Allocator,
-    mux_writer: *frame_write_queue.FrameWriteQueue,
+    mux_writer: *dispatch_io.FrameSink,
     stream_id: u64,
     code: []const u8,
     err: anyerror,
@@ -663,8 +661,8 @@ fn sendTerminalMuxResetForError(options: TerminalMuxResetForErrorOptions) !void 
     });
 }
 
-fn sendTerminalMuxFrame(mux_writer: *frame_write_queue.FrameWriteQueue, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
-    try mux_writer.queueMuxStreamFrame(message);
+fn sendTerminalMuxFrame(mux_writer: *dispatch_io.FrameSink, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
+    try mux_writer.writeMuxStreamFrame(message);
 }
 
 fn queueTerminalHangupAndCloseEndpoint(

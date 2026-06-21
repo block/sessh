@@ -159,28 +159,28 @@ fn clearOwnedDaemonDirName(allocator: std.mem.Allocator, invocation: *Invocation
     invocation.daemon_dir_name_owned = false;
 }
 
-pub fn printArgError(err: anyerror) !void {
+pub fn printArgError(blocking: core_blocking.Blocking, err: anyerror) !void {
     // ProxyCommand argument errors need to be terse and ssh-like because they
     // appear in OpenSSH's connection failure path, often before sessh UI exists.
     switch (err) {
-        error.MissingProxyHost => try user_error.line("proxy mode requires --host HOST"),
-        error.MissingProxyPort => try user_error.line("proxy mode requires --port PORT"),
-        error.MissingProxyUser => try user_error.line("proxy mode --user requires a value"),
-        error.MissingSshOptionValue => try user_error.line("proxy mode --ssh-option requires a value"),
-        error.MissingProxyDiagnosticsGuid => try user_error.line("proxy mode --diagnostics-guid requires a p-guid"),
-        error.InvalidProxyDiagnosticsGuid => try user_error.line("proxy mode --diagnostics-guid requires a valid p-guid"),
-        error.MissingDaemonNamespace => try user_error.line("proxy mode --daemon-namespace requires a value"),
-        error.InvalidDaemonSocketDir => try user_error.line("proxy mode invalid daemon namespace"),
-        error.MissingFilterLevel => try user_error.line("proxy mode --filter-level requires a value"),
-        error.InvalidFilterLevel => try user_error.line("proxy mode invalid filter level"),
-        error.MissingDiagnosticsLevel => try user_error.line("proxy mode --diagnostics-level requires one of: overlay, status, title, line, jsonl"),
-        error.InvalidDiagnosticsLevel => try user_error.line("proxy mode invalid diagnostics level; expected one of: overlay, status, title, line, jsonl"),
-        error.MissingIsolationMode => try user_error.line("proxy mode --isolation-mode requires one of: full, process, none"),
-        error.InvalidIsolationMode => try user_error.line("proxy mode invalid isolation mode; expected one of: full, process, none"),
-        error.MissingDiagnosticsFile => try user_error.line("proxy mode --diagnostics-file requires a file path"),
-        error.MissingClientCtrlR => try user_error.line("proxy mode --client-ctrl-r requires a value"),
-        error.InvalidClientCtrlR => try user_error.line("proxy mode --client-ctrl-r must be 0 or 1"),
-        else => try user_error.printLine("invalid proxy mode arguments: {t}", .{err}),
+        error.MissingProxyHost => try user_error.line(blocking, "proxy mode requires --host HOST"),
+        error.MissingProxyPort => try user_error.line(blocking, "proxy mode requires --port PORT"),
+        error.MissingProxyUser => try user_error.line(blocking, "proxy mode --user requires a value"),
+        error.MissingSshOptionValue => try user_error.line(blocking, "proxy mode --ssh-option requires a value"),
+        error.MissingProxyDiagnosticsGuid => try user_error.line(blocking, "proxy mode --diagnostics-guid requires a p-guid"),
+        error.InvalidProxyDiagnosticsGuid => try user_error.line(blocking, "proxy mode --diagnostics-guid requires a valid p-guid"),
+        error.MissingDaemonNamespace => try user_error.line(blocking, "proxy mode --daemon-namespace requires a value"),
+        error.InvalidDaemonSocketDir => try user_error.line(blocking, "proxy mode invalid daemon namespace"),
+        error.MissingFilterLevel => try user_error.line(blocking, "proxy mode --filter-level requires a value"),
+        error.InvalidFilterLevel => try user_error.line(blocking, "proxy mode invalid filter level"),
+        error.MissingDiagnosticsLevel => try user_error.line(blocking, "proxy mode --diagnostics-level requires one of: overlay, status, title, line, jsonl"),
+        error.InvalidDiagnosticsLevel => try user_error.line(blocking, "proxy mode invalid diagnostics level; expected one of: overlay, status, title, line, jsonl"),
+        error.MissingIsolationMode => try user_error.line(blocking, "proxy mode --isolation-mode requires one of: full, process, none"),
+        error.InvalidIsolationMode => try user_error.line(blocking, "proxy mode invalid isolation mode; expected one of: full, process, none"),
+        error.MissingDiagnosticsFile => try user_error.line(blocking, "proxy mode --diagnostics-file requires a file path"),
+        error.MissingClientCtrlR => try user_error.line(blocking, "proxy mode --client-ctrl-r requires a value"),
+        error.InvalidClientCtrlR => try user_error.line(blocking, "proxy mode --client-ctrl-r must be 0 or 1"),
+        else => try user_error.printLine(blocking, "invalid proxy mode arguments: {t}", .{err}),
     }
 }
 
@@ -264,7 +264,7 @@ fn waitFdPassAccepted(blocking: core_blocking.Blocking, allocator: std.mem.Alloc
         .error_message => {
             var message = try protocol.decodePayload(protocol.hpb.Error, allocator, frame.payload);
             defer message.deinit(allocator);
-            try user_error.rolePrintLine("sessh-proxy", "daemon rejected fd-pass proxy: {s}", .{message.message});
+            try user_error.rolePrintLine(blocking, "sessh-proxy", "daemon rejected fd-pass proxy: {s}", .{message.message});
             return error.ProxyFdPassRejected;
         },
         else => return error.UnexpectedDaemonFrame,

@@ -175,9 +175,9 @@ const ProxyClientControl = struct {
 
     fn showDiagnostic(self: *ProxyClientControl, line: []const u8) void {
         if (!self.onscreen_status) return;
-        if (self.status_visible) io.writeAll(posix.STDERR_FILENO, "\r\x1b[K") catch {};
-        io.writeAll(posix.STDERR_FILENO, line) catch {};
-        io.writeAll(posix.STDERR_FILENO, "\r\n") catch {};
+        if (self.status_visible) self.blocking.writeAll(posix.STDERR_FILENO, "\r\x1b[K") catch {};
+        self.blocking.writeAll(posix.STDERR_FILENO, line) catch {};
+        self.blocking.writeAll(posix.STDERR_FILENO, "\r\n") catch {};
         if (self.status_visible) self.redrawStatusLine();
     }
 
@@ -189,7 +189,7 @@ const ProxyClientControl = struct {
     fn flushPendingTitle(self: *ProxyClientControl) void {
         if (self.pending_title.isEmpty()) return;
         if (!self.title_tracker.safeForLocalTitle()) return;
-        reconnect_title.writeTitle(posix.STDOUT_FILENO, self.pending_title.slice()) catch return;
+        reconnect_title.writeTitle(self.blocking, posix.STDOUT_FILENO, self.pending_title.slice()) catch return;
         self.title_visible = true;
         self.pending_title.clear();
     }
@@ -202,7 +202,7 @@ const ProxyClientControl = struct {
     fn clearUpdate(self: *ProxyClientControl) void {
         self.pending_title.clear();
         if (self.onscreen_status and self.status_visible) {
-            io.writeAll(posix.STDERR_FILENO, "\r\x1b[K") catch {};
+            self.blocking.writeAll(posix.STDERR_FILENO, "\r\x1b[K") catch {};
             self.status_visible = false;
         }
         self.restoreTitle();
@@ -214,14 +214,14 @@ const ProxyClientControl = struct {
             self.title_tracker.titleSlice()
         else
             self.cleanup_title.slice();
-        reconnect_title.writeTitle(posix.STDOUT_FILENO, title) catch {};
+        reconnect_title.writeTitle(self.blocking, posix.STDOUT_FILENO, title) catch {};
         self.title_visible = false;
     }
 
     fn redrawStatusLine(self: *ProxyClientControl) void {
         if (!self.status_visible) return;
-        io.writeAll(posix.STDERR_FILENO, "\r\x1b[K") catch {};
-        io.writeAll(posix.STDERR_FILENO, self.status_line.slice()) catch {};
+        self.blocking.writeAll(posix.STDERR_FILENO, "\r\x1b[K") catch {};
+        self.blocking.writeAll(posix.STDERR_FILENO, self.status_line.slice()) catch {};
     }
 };
 
@@ -270,7 +270,7 @@ pub fn runArgvWithDiagnostics(options: RunArgvWithDiagnosticsOptions) !noreturn 
 
     const ssh_pid: c.pid_t = @intCast(ssh_process.id);
     const term = waitForSshProcessAndDiagnostics(options.blocking, ssh_pid, &diagnostics);
-    return exitAfterTerm(term, options.diagnostic_name);
+    return exitAfterTerm(options.blocking, term, options.diagnostic_name);
 }
 
 fn waitForSshProcessAndDiagnostics(blocking: core_blocking.Blocking, pid: c.pid_t, diagnostics: *ProxyClientControl) std.process.Child.Term {
@@ -422,7 +422,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
             switch (try pty_process.readMaster(local_pty.master_fd, &buf)) {
                 .bytes => |bytes| {
                     diagnostics.observeOutput(bytes);
-                    try io.writeAll(posix.STDOUT_FILENO, bytes);
+                    try options.blocking.writeAll(posix.STDOUT_FILENO, bytes);
                 },
                 .would_block => {},
                 .eof => {
@@ -431,7 +431,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
                     const term = local_pty.wait(options.blocking);
                     local_pty.closeMaster();
                     diagnostics.clear();
-                    return exitAfterLocalPtyTerm(term, options.diagnostic_name, &presentation_state);
+                    return exitAfterLocalPtyTerm(options.blocking, term, options.diagnostic_name, &presentation_state);
                 },
             }
         }
@@ -442,7 +442,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
                 const term = local_pty.wait(options.blocking);
                 local_pty.closeMaster();
                 diagnostics.clear();
-                return exitAfterLocalPtyTerm(term, options.diagnostic_name, &presentation_state);
+                return exitAfterLocalPtyTerm(options.blocking, term, options.diagnostic_name, &presentation_state);
             }
         }
 
@@ -451,7 +451,7 @@ pub fn runArgvUnderLocalPty(options: LocalPtyArgvOptions) !noreturn {
             const n = c.read(posix.STDIN_FILENO, &input, input.len);
             if (n > 0) {
                 const bytes = input[0..@intCast(n)];
-                try writePtyInput(local_pty.master_fd, bytes, &diagnostics);
+                try writePtyInput(options.blocking, local_pty.master_fd, bytes, &diagnostics);
             }
         }
 
@@ -520,12 +520,13 @@ const LocalPtyPresentationState = struct {
 };
 
 fn exitAfterLocalPtyTerm(
+    blocking: core_blocking.Blocking,
     term: std.process.Child.Term,
     diagnostic_name: []const u8,
     presentation_state: *LocalPtyPresentationState,
 ) !noreturn {
     presentation_state.restore();
-    return exitAfterTerm(term, diagnostic_name);
+    return exitAfterTerm(blocking, term, diagnostic_name);
 }
 
 fn refreshLocalPtySize(pty_fd: c.fd_t, size: *terminal.WindowSize) void {
@@ -535,30 +536,30 @@ fn refreshLocalPtySize(pty_fd: c.fd_t, size: *terminal.WindowSize) void {
     size.* = current_size;
 }
 
-fn writePtyInput(pty_fd: c.fd_t, bytes: []const u8, diagnostics: *ProxyClientControl) !void {
+fn writePtyInput(blocking: core_blocking.Blocking, pty_fd: c.fd_t, bytes: []const u8, diagnostics: *ProxyClientControl) !void {
     if (!diagnostics.shouldInterceptCtrlR()) {
-        try io.writeAll(pty_fd, bytes);
+        try blocking.writeAll(pty_fd, bytes);
         return;
     }
     var start: usize = 0;
     for (bytes, 0..) |byte, index| {
         if (byte != reconnect_control.ctrl_r) continue;
-        if (index > start) try io.writeAll(pty_fd, bytes[start..index]);
+        if (index > start) try blocking.writeAll(pty_fd, bytes[start..index]);
         diagnostics.sendCtrlR();
         start = index + 1;
     }
-    if (start < bytes.len) try io.writeAll(pty_fd, bytes[start..]);
+    if (start < bytes.len) try blocking.writeAll(pty_fd, bytes[start..]);
 }
 
-fn exitAfterTerm(term: std.process.Child.Term, diagnostic_name: []const u8) !noreturn {
+fn exitAfterTerm(blocking: core_blocking.Blocking, term: std.process.Child.Term, diagnostic_name: []const u8) !noreturn {
     switch (term) {
         .Exited => |code| return process_exit.request(code),
         .Signal => |signal| {
-            try user_error.printLine("{s} ended by signal {}", .{ diagnostic_name, signal });
+            try user_error.printLine(blocking, "{s} ended by signal {}", .{ diagnostic_name, signal });
             return process_exit.request(255);
         },
         else => {
-            try user_error.printLine("{s} ended unexpectedly: {t}", .{ diagnostic_name, term });
+            try user_error.printLine(blocking, "{s} ended unexpectedly: {t}", .{ diagnostic_name, term });
             return process_exit.request(255);
         },
     }
@@ -581,5 +582,5 @@ pub fn runArgv(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, s
     // `ssh` process owns the user-visible session and there is no sessh daemon
     // workload in this process to keep responsive.
     const term = blocking.waitPid(@intCast(ssh_process.id));
-    return exitAfterTerm(term, diagnostic_name);
+    return exitAfterTerm(blocking, term, diagnostic_name);
 }

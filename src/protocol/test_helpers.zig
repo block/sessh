@@ -6,7 +6,7 @@ const c = std.c;
 const posix = std.posix;
 
 const core_fds = @import("../core/fds.zig");
-const io = @import("../core/io.zig");
+const core_blocking = @import("../core/blocking.zig");
 const frame = @import("frame.zig");
 const typed_send = @import("typed_send.zig");
 
@@ -73,7 +73,7 @@ pub fn rawFrameForTest(allocator: std.mem.Allocator, frame_header_len: usize, pa
 pub fn sendFrameBlocking(fd: c.fd_t, message_type: frame.MessageType, payload: []const u8) !void {
     const frame_bytes = try frame.encodeFrame(std.testing.allocator, message_type, payload);
     defer std.testing.allocator.free(frame_bytes);
-    try io.writeAll(fd, frame_bytes);
+    try core_blocking.fromTest().writeAll(fd, frame_bytes);
 }
 
 pub fn sendFrameWithAttachedKindAndBytesBlocking(
@@ -82,7 +82,7 @@ pub fn sendFrameWithAttachedKindAndBytesBlocking(
 ) !void {
     const frame_bytes = try frame.encodeFrameWithAttachedKindAndBytes(std.testing.allocator, options);
     defer std.testing.allocator.free(frame_bytes);
-    try io.writeAll(fd, frame_bytes);
+    try core_blocking.fromTest().writeAll(fd, frame_bytes);
 }
 
 pub fn sendClientDaemonPayloadFrameBlocking(

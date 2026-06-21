@@ -279,7 +279,7 @@ pub fn TaggedRawWrite(comptime Kind: type) type {
     };
 }
 
-pub fn TaggedFrameWriteQueue(comptime Kind: type) type {
+pub fn TaggedFrameWrites(comptime Kind: type) type {
     // Small FIFO of encoded frames tagged with caller-owned state. The tag lets
     // write completion drive the surrounding state machine without decoding the
     // already-serialized frame.
@@ -456,9 +456,9 @@ test "mux router keeps multiple streams independent and rejects kind changes" {
     try std.testing.expectEqual(StreamKind.unknown, registry.kind(2));
 }
 
-test "tagged frame write queue preserves order and kind" {
+test "tagged frame writes preserves order and kind" {
     const TestKind = enum { first, second };
-    const Queue = TaggedFrameWriteQueue(TestKind);
+    const Queue = TaggedFrameWrites(TestKind);
     var queue = Queue.init(std.testing.allocator);
     defer queue.deinit();
 

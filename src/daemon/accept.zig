@@ -3,6 +3,7 @@ const c = std.c;
 
 const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const daemon_identity = @import("identity.zig");
 const daemon_log = @import("log.zig");
@@ -17,25 +18,24 @@ pub const Context = struct {
     identity: daemon_identity.DaemonIdentity,
     listen_fd: c.fd_t,
     active_local_clients: *usize,
+    listen_source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    listen_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
 };
 
 /// Accept one local daemon client and hand it to the protocol router.
 /// The accept callback deliberately does no client protocol work so the daemon
 /// listener remains responsive while individual clients progress independently.
-pub fn acceptDaemonClient(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
-    const daemon_dispatcher = handler_event.dispatcher;
-    const event = handler_event.event;
-    const accept_context: *Context = @ptrCast(@alignCast(ctx));
-
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedDaemonTimer,
-    };
+pub fn acceptDaemonClient(
+    accept_context: *Context,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    _: *dispatcher.DispatchTask,
+    fd_event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
     if (fd_event.error_event or fd_event.invalid) return error.DaemonListenFailed;
-    if (!fd_event.readable) return;
+    if (!fd_event.readable) return .pending;
 
     const client_fd = c.accept(accept_context.listen_fd, null, null);
-    if (client_fd < 0) return;
+    if (client_fd < 0) return .pending;
     var owned_client_fd = core_fds.OwnedFd.init(client_fd);
     defer owned_client_fd.deinit();
 
@@ -53,4 +53,5 @@ pub fn acceptDaemonClient(ctx: *anyopaque, handler_event: dispatcher.HandlerEven
         .active_local_clients = accept_context.active_local_clients,
     });
     _ = owned_client_fd.take();
+    return .pending;
 }

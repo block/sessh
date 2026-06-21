@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
@@ -232,8 +233,9 @@ const FrameForwarder = struct {
 const DispatcherFrameRelay = struct {
     allocator: std.mem.Allocator,
     endpoints: FrameRelayEndpoints,
-    left_watch_id: ?dispatcher.FdWatchId = null,
-    right_watch_id: ?dispatcher.FdWatchId = null,
+    left_source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    right_source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
     left_to_right: FramePipe,
     right_to_left: FramePipe,
     closing: bool = false,
@@ -248,8 +250,10 @@ const DispatcherFrameRelay = struct {
     }
 
     pub fn deinit(self: *DispatcherFrameRelay, d: *dispatcher.Dispatcher) void {
-        if (self.left_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-        if (self.right_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
+        _ = d;
+        self.task.deinit();
+        self.left_source.deinit();
+        self.right_source.deinit();
         if (self.endpoints.left >= 0) {
             _ = c.close(self.endpoints.left);
             self.endpoints.left = -1;
@@ -263,50 +267,45 @@ const DispatcherFrameRelay = struct {
         self.allocator.destroy(self);
     }
 
-    fn updateWatches(self: *DispatcherFrameRelay, d: *dispatcher.Dispatcher) !void {
-        if (self.left_watch_id) |watch_id| {
-            try d.updateFdEvents(watch_id, .{
-                .readable = self.left_to_right.wantsRead(),
-                .writable = self.right_to_left.wantsWrite(),
-            });
-        }
-        if (self.right_watch_id) |watch_id| {
-            try d.updateFdEvents(watch_id, .{
-                .readable = self.right_to_left.wantsRead(),
-                .writable = self.left_to_right.wantsWrite(),
-            });
-        }
+    fn updateSources(self: *DispatcherFrameRelay) void {
+        self.left_source.setFdEvents(.{
+            .readable = self.left_to_right.wantsRead(),
+            .writable = self.right_to_left.wantsWrite(),
+        });
+        self.right_source.setFdEvents(.{
+            .readable = self.right_to_left.wantsRead(),
+            .writable = self.left_to_right.wantsWrite(),
+        });
     }
 
-    fn handleEvent(self: *DispatcherFrameRelay, handler_event: dispatcher.HandlerEvent) !void {
+    fn handleEvent(
+        self: *DispatcherFrameRelay,
+        d: *dispatcher.Dispatcher,
+        source: dispatcher.Source,
+        fd_event: dispatcher.FdEvent,
+    ) !void {
         // A relay fd can be both readable and writable in the same dispatcher
         // turn. Drain pending output first, then read more input so buffers do
         // not grow while the opposite fd is ready to accept bytes.
-        const d = handler_event.dispatcher;
-        const id = handler_event.id;
-        const event = handler_event.event;
-        const fd_event = switch (event) {
-            .fd => |fd| fd,
-            .timer => return error.UnexpectedFrameRelayTimer,
-        };
         if (fd_event.error_event or fd_event.invalid) {
-            self.close(d);
+            _ = d;
+            self.closing = true;
             return;
         }
 
-        if (self.isLeftWatch(id)) {
+        if (source.eql(self.left_source)) {
             if (fd_event.writable) try self.drainPipeToFd(&self.right_to_left, self.endpoints.left);
             if (fd_event.readable or fd_event.hangup) try self.readPipeFromFd(&self.left_to_right, self.endpoints.left);
-        } else if (self.isRightWatch(id)) {
+        } else if (source.eql(self.right_source)) {
             if (fd_event.writable) try self.drainPipeToFd(&self.left_to_right, self.endpoints.right);
             if (fd_event.readable or fd_event.hangup) try self.readPipeFromFd(&self.right_to_left, self.endpoints.right);
         }
 
         if (self.closing) {
-            self.deinit(d);
+            _ = d;
             return;
         }
-        try self.updateWatches(d);
+        self.updateSources();
     }
 
     fn readPipeFromFd(self: *DispatcherFrameRelay, pipe: *FramePipe, fd: c.fd_t) !void {
@@ -334,34 +333,39 @@ const DispatcherFrameRelay = struct {
     }
 
     fn close(self: *DispatcherFrameRelay, d: *dispatcher.Dispatcher) void {
+        _ = d;
         self.closing = true;
-        self.deinit(d);
     }
 
-    fn isLeftWatch(self: *const DispatcherFrameRelay, id: dispatcher.WatchId) bool {
-        const left_id = self.left_watch_id orelse return false;
-        const fd_id = switch (id) {
-            .fd => |watch_id| watch_id,
-            .timer => return false,
-        };
-        return watchIdsEqual(left_id, fd_id);
-    }
-
-    fn isRightWatch(self: *const DispatcherFrameRelay, id: dispatcher.WatchId) bool {
-        const right_id = self.right_watch_id orelse return false;
-        const fd_id = switch (id) {
-            .fd => |watch_id| watch_id,
-            .timer => return false,
-        };
-        return watchIdsEqual(right_id, fd_id);
-    }
-
-    fn onFd(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
-        const self: *DispatcherFrameRelay = @ptrCast(@alignCast(ctx));
-        self.handleEvent(handler_event) catch {
-            const d = handler_event.dispatcher;
-            self.close(d);
-        };
+    fn runTask(
+        self: *DispatcherFrameRelay,
+        d: *dispatcher.Dispatcher,
+        task: *dispatcher.DispatchTask,
+    ) !@import("../core/dispatch_io.zig").DispatchTaskStatus {
+        _ = task;
+        if (self.left_source.takeFdEvent()) |event| {
+            self.handleEvent(d, self.left_source, event) catch {
+                self.close(d);
+                self.deinit(d);
+                return .done;
+            };
+            if (self.closing) {
+                self.deinit(d);
+                return .done;
+            }
+        }
+        if (self.right_source.takeFdEvent()) |event| {
+            self.handleEvent(d, self.right_source, event) catch {
+                self.close(d);
+                self.deinit(d);
+                return .done;
+            };
+            if (self.closing) {
+                self.deinit(d);
+                return .done;
+            }
+        }
+        return .pending;
     }
 };
 
@@ -480,27 +484,16 @@ pub fn registerFrameRelayWithInitialWrites(options: FrameRelayRegistration) !voi
         relay.right_to_left.deinit();
     }
 
-    const handler: dispatcher.Handler = .{
-        .ctx = relay,
-        .callback = DispatcherFrameRelay.onFd,
-    };
-    relay.left_watch_id = try d.watchFd(.{
-        .fd = endpoints.left,
-        .events = .{},
-        .handler = handler,
-    });
-    errdefer if (relay.left_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-    relay.right_watch_id = try d.watchFd(.{
-        .fd = endpoints.right,
-        .events = .{},
-        .handler = handler,
-    });
-    errdefer if (relay.right_watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-    try relay.updateWatches(d);
-}
-
-fn watchIdsEqual(a: dispatcher.FdWatchId, b: dispatcher.FdWatchId) bool {
-    return a.index == b.index and a.generation == b.generation;
+    relay.left_source = try d.fdSource(endpoints.left, .{});
+    errdefer relay.left_source.deinit();
+    relay.right_source = try d.fdSource(endpoints.right, .{});
+    errdefer relay.right_source.deinit();
+    relay.task = dispatcher.dispatchTask(DispatcherFrameRelay, allocator, relay, DispatcherFrameRelay.runTask);
+    relay.task.setSourceReadiness(.any);
+    try relay.task.requireSource(relay.left_source);
+    try relay.task.requireSource(relay.right_source);
+    relay.updateSources();
+    try relay.task.schedule(d);
 }
 
 const CircularBuffer = struct {
@@ -565,19 +558,20 @@ const CircularBuffer = struct {
 };
 
 test "ReadBuffer fills incrementally and reports eof shape" {
+    const blocking = core_blocking.fromTest();
     const pipe = try posix.pipe();
     defer test_helpers.closePipeForTest(pipe);
     try test_helpers.setNonBlockingFdForTest(pipe[0]);
 
     var storage: [5]u8 = undefined;
     var buffer = ReadBuffer.init(&storage);
-    try io.writeAll(pipe[1], "ab");
+    try blocking.writeAll(pipe[1], "ab");
 
     try std.testing.expectEqual(ReadStatus.partial, try buffer.readReady(pipe[0]));
     try std.testing.expectEqualStrings("ab", storage[0..buffer.filled]);
     try std.testing.expectEqual(ReadStatus.blocked, try buffer.readReady(pipe[0]));
 
-    try io.writeAll(pipe[1], "cde");
+    try blocking.writeAll(pipe[1], "cde");
     try std.testing.expectEqual(ReadStatus.filled, try buffer.readReady(pipe[0]));
     try std.testing.expectEqualStrings("abcde", storage[0..buffer.filled]);
     buffer.reset();
@@ -585,6 +579,7 @@ test "ReadBuffer fills incrementally and reports eof shape" {
 }
 
 test "ReadBuffer distinguishes clean eof from partial frame eof" {
+    const blocking = core_blocking.fromTest();
     const clean_pipe = try posix.pipe();
     try test_helpers.setNonBlockingFdForTest(clean_pipe[0]);
     _ = c.close(clean_pipe[1]);
@@ -596,7 +591,7 @@ test "ReadBuffer distinguishes clean eof from partial frame eof" {
     const partial_pipe = try posix.pipe();
     defer _ = c.close(partial_pipe[0]);
     try test_helpers.setNonBlockingFdForTest(partial_pipe[0]);
-    try io.writeAll(partial_pipe[1], "xy");
+    try blocking.writeAll(partial_pipe[1], "xy");
     _ = c.close(partial_pipe[1]);
     var partial_storage: [4]u8 = undefined;
     var partial = ReadBuffer.init(&partial_storage);
@@ -615,6 +610,7 @@ test "WriteBuffer tracks progress through caller-owned bytes" {
 }
 
 test "WriteBuffer writes to a nonblocking fd" {
+    const blocking = core_blocking.fromTest();
     const pipe = try posix.pipe();
     defer test_helpers.closePipeForTest(pipe);
     try test_helpers.setNonBlockingFdForTest(pipe[1]);
@@ -622,7 +618,7 @@ test "WriteBuffer writes to a nonblocking fd" {
     var buffer = WriteBuffer.init("hello");
     try std.testing.expectEqual(WriteStatus.drained, try buffer.writeReady(pipe[1]));
     var out: [5]u8 = undefined;
-    try io.readExact(pipe[0], &out);
+    try blocking.readExact(pipe[0], &out);
     try std.testing.expectEqualStrings("hello", &out);
 }
 
@@ -640,6 +636,7 @@ test "CircularBuffer writes into empty and wrapped storage" {
 }
 
 test "FrameForwarder streams multiple raw frames without decoding" {
+    const blocking = core_blocking.fromTest();
     const source = try posix.pipe();
     defer test_helpers.closePipeForTest(source);
     const dest = try posix.pipe();
@@ -654,9 +651,9 @@ test "FrameForwarder streams multiple raw frames without decoding" {
     defer std.testing.allocator.free(second);
     const third = try test_helpers.rawFrameForTest(std.testing.allocator, protocol.frame_header_len, "xyz");
     defer std.testing.allocator.free(third);
-    try io.writeAll(source[1], first);
-    try io.writeAll(source[1], second);
-    try io.writeAll(source[1], third);
+    try blocking.writeAll(source[1], first);
+    try blocking.writeAll(source[1], second);
+    try blocking.writeAll(source[1], third);
     _ = c.close(source[1]);
 
     var storage: [5]u8 = undefined;
@@ -688,6 +685,7 @@ test "FrameForwarder streams multiple raw frames without decoding" {
 }
 
 test "FrameForwarder applies output backpressure before reading frame body" {
+    const blocking = core_blocking.fromTest();
     const source = try posix.pipe();
     defer test_helpers.closePipeForTest(source);
     const dest = try posix.pipe();
@@ -698,7 +696,7 @@ test "FrameForwarder applies output backpressure before reading frame body" {
 
     const frame = try test_helpers.rawFrameForTest(std.testing.allocator, protocol.frame_header_len, "body");
     defer std.testing.allocator.free(frame);
-    try io.writeAll(source[1], frame);
+    try blocking.writeAll(source[1], frame);
 
     var storage: [protocol.frame_header_len]u8 = undefined;
     var forwarder = FrameForwarder.init(.{ .read = source[0], .write = dest[1] }, &storage);
@@ -772,10 +770,10 @@ test "dispatcher frame relay forwards attached-byte frames in both directions" {
     _ = c.close(right[0]);
     right_external_open = false;
     var iterations: usize = 0;
-    while (d.active_count != 0 and iterations < 10) : (iterations += 1) {
+    while (d.activeTaskCount() != 0 and iterations < 10) : (iterations += 1) {
         _ = try d.runOnce();
     }
-    try std.testing.expectEqual(@as(usize, 0), d.active_count);
+    try std.testing.expectEqual(@as(usize, 0), d.activeTaskCount());
 }
 
 test "dispatcher frame relay drains initial left-to-right write through dispatcher" {
@@ -822,13 +820,14 @@ test "dispatcher frame relay drains initial left-to-right write through dispatch
     _ = c.close(right[0]);
     right_external_open = false;
     var iterations: usize = 0;
-    while (d.active_count != 0 and iterations < 10) : (iterations += 1) {
+    while (d.activeTaskCount() != 0 and iterations < 10) : (iterations += 1) {
         _ = try d.runOnce();
     }
-    try std.testing.expectEqual(@as(usize, 0), d.active_count);
+    try std.testing.expectEqual(@as(usize, 0), d.activeTaskCount());
 }
 
 test "FrameForwarder reports truncated frame bodies" {
+    const blocking = core_blocking.fromTest();
     const source = try posix.pipe();
     defer _ = c.close(source[0]);
     const dest = try posix.pipe();
@@ -838,7 +837,7 @@ test "FrameForwarder reports truncated frame bodies" {
 
     const frame = try test_helpers.rawFrameForTest(std.testing.allocator, protocol.frame_header_len, "abcde");
     defer std.testing.allocator.free(frame);
-    try io.writeAll(source[1], frame[0 .. protocol.frame_header_len + 2]);
+    try blocking.writeAll(source[1], frame[0 .. protocol.frame_header_len + 2]);
     _ = c.close(source[1]);
 
     var storage: [32]u8 = undefined;

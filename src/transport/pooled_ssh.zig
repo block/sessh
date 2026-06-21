@@ -15,6 +15,7 @@ const core_fds = @import("../core/fds.zig");
 const daemon_cleanup = @import("../daemon/cleanup.zig");
 const daemon_log = @import("../daemon/log.zig");
 const daemon_socket_namespace = @import("../daemon/socket_namespace.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const io = @import("../core/io.zig");
 const string_list = @import("../core/string_list.zig");
@@ -125,7 +126,7 @@ const PooledSshTransportClientWriteKind = union(enum) {
 };
 
 const PooledSshTransportClientFrameWrite = mux_tunnel.TaggedFrameWrite(PooledSshTransportClientWriteKind);
-const PooledSshTransportClientFrameWriteQueue = mux_tunnel.TaggedFrameWriteQueue(PooledSshTransportClientWriteKind);
+const PooledSshTransportClientFrameWrites = mux_tunnel.TaggedFrameWrites(PooledSshTransportClientWriteKind);
 
 const PooledSshTransportClientRawWrite = mux_tunnel.TaggedRawWrite(PooledSshTransportClientWriteKind);
 
@@ -164,10 +165,11 @@ const PooledClientStartupTiming = pooled_client_startup_timing.PooledClientStart
 const PooledSshTransportClient = struct {
     fd: c.fd_t,
     transport: *PooledSshTransport = undefined,
-    watch_id: ?dispatcher.FdWatchId = null,
+    source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
     reader: protocol.FrameReader = undefined,
     write: ?PooledSshTransportClientWrite = null,
-    pending_frame_writes: PooledSshTransportClientFrameWriteQueue = undefined,
+    pending_frame_writes: PooledSshTransportClientFrameWrites = undefined,
     read_paused: bool = false,
     stream_id: u64 = 0,
     local_stream_id: u64 = 0,
@@ -188,10 +190,12 @@ const PooledSshTransportClient = struct {
 
     fn initReader(self: *PooledSshTransportClient, allocator: std.mem.Allocator) void {
         self.reader = protocol.FrameReader.init(allocator);
-        self.pending_frame_writes = PooledSshTransportClientFrameWriteQueue.init(allocator);
+        self.pending_frame_writes = PooledSshTransportClientFrameWrites.init(allocator);
     }
 
     fn deinit(self: *PooledSshTransportClient, allocator: std.mem.Allocator) void {
+        self.task.deinit();
+        self.source.deinit();
         self.reader.deinit();
         if (self.write) |*write| write.deinit(allocator);
         self.pending_frame_writes.deinit();
@@ -227,11 +231,14 @@ const PooledSshTransport = struct {
     state: PooledSshTransportState = .starting,
     clients: std.ArrayList(*PooledSshTransportClient) = .empty,
     remote_reader: protocol.FrameReader = undefined,
-    remote_watch_id: ?dispatcher.FdWatchId = null,
-    stderr_watch_id: ?dispatcher.FdWatchId = null,
-    stdin_watch_id: ?dispatcher.FdWatchId = null,
-    idle_timer_id: ?dispatcher.TimerWatchId = null,
-    bootstrap_failure_timer_id: ?dispatcher.TimerWatchId = null,
+    remote_source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    remote_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
+    stderr_source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    stderr_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
+    stdin_source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    stdin_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
+    idle_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
+    bootstrap_failure_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
     bootstrap_failure_started_ms: u64 = 0,
     bootstrap_failure_error: ?anyerror = null,
     connection: ?SshTransportProcess = null,
@@ -247,6 +254,14 @@ const PooledSshTransport = struct {
     cleanup_requests_in_flight: usize = 0,
 
     fn deinit(self: *PooledSshTransport) void {
+        self.remote_task.deinit();
+        self.remote_source.deinit();
+        self.stderr_task.deinit();
+        self.stderr_source.deinit();
+        self.stdin_task.deinit();
+        self.stdin_source.deinit();
+        self.idle_task.deinit();
+        self.bootstrap_failure_task.deinit();
         if (self.connection) |*connection| connection.terminate();
         self.remote_reader.deinit();
         if (self.remote_daemon_namespace) |namespace| self.allocator.free(namespace);
@@ -767,7 +782,7 @@ test "pooled mux backpressure is per logical stream" {
         .fd = -1,
         .transport = &transport,
         .state = .active,
-        .pending_frame_writes = PooledSshTransportClientFrameWriteQueue.init(allocator),
+        .pending_frame_writes = PooledSshTransportClientFrameWrites.init(allocator),
     };
     var open = PooledSshTransportClient{
         .fd = -1,
@@ -818,7 +833,7 @@ const PooledTransportStartOptions = struct {
     request: pb.ClientDaemonItem.SshTransportAcquire,
 };
 
-// Start a newly-created pooled transport and register the dispatcher watches
+// Start a newly-created pooled transport and register the dispatcher sources
 // needed for stdout frames, stderr diagnostics, and initial stdin bootstrap or
 // handshake writes.
 fn startNewPooledSshTransport(options: PooledTransportStartOptions) !void {
@@ -833,37 +848,9 @@ fn startNewPooledSshTransport(options: PooledTransportStartOptions) !void {
         .target = target,
         .request = request,
     });
-    errdefer {
-        if (transport.remote_watch_id) |watch_id| {
-            daemon_dispatcher.cancel(.{ .fd = watch_id });
-            transport.remote_watch_id = null;
-        }
-        if (transport.stderr_watch_id) |watch_id| {
-            daemon_dispatcher.cancel(.{ .fd = watch_id });
-            transport.stderr_watch_id = null;
-        }
-        if (transport.stdin_watch_id) |watch_id| {
-            daemon_dispatcher.cancel(.{ .fd = watch_id });
-            transport.stdin_watch_id = null;
-        }
-    }
     const remote_read_fd = transport.connection.?.stdoutFd();
-    transport.remote_watch_id = try daemon_dispatcher.watchFd(.{
-        .fd = remote_read_fd,
-        .events = .{ .readable = true },
-        .handler = .{
-            .ctx = transport,
-            .callback = readPooledSshTransportRemote,
-        },
-    });
-    transport.stderr_watch_id = try daemon_dispatcher.watchFd(.{
-        .fd = transport.stderr_fd,
-        .events = .{ .readable = true },
-        .handler = .{
-            .ctx = transport,
-            .callback = readPooledSshTransportStderr,
-        },
-    });
+    try ensurePooledSshTransportRemoteSource(daemon_dispatcher, transport, remote_read_fd);
+    try ensurePooledSshTransportStderrSource(daemon_dispatcher, transport);
 
     if (request.bootstrap) {
         const artifacts = if (transport.bootstrap_artifacts) |*value| value else return error.MissingBootstrapArtifacts;
@@ -878,6 +865,43 @@ fn startNewPooledSshTransport(options: PooledTransportStartOptions) !void {
     } else {
         try startPooledSshTransportHandshake(daemon_dispatcher, transport);
     }
+}
+
+fn ensurePooledSshTransportRemoteSource(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+    fd: c.fd_t,
+) !void {
+    if (!transport.remote_source.isInitialized()) {
+        transport.remote_source = try daemon_dispatcher.fdSource(fd, .{ .readable = true });
+        transport.remote_task = try dispatcher.fdDispatchTask(
+            PooledSshTransport,
+            transport.allocator,
+            transport,
+            transport.remote_source,
+            readPooledSshTransportRemote,
+        );
+    }
+    transport.remote_source.setFdEvents(.{ .readable = !transport.remote_read_paused });
+    try transport.remote_task.schedule(daemon_dispatcher);
+}
+
+fn ensurePooledSshTransportStderrSource(
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    transport: *PooledSshTransport,
+) !void {
+    if (!transport.stderr_source.isInitialized()) {
+        transport.stderr_source = try daemon_dispatcher.fdSource(transport.stderr_fd, .{ .readable = true });
+        transport.stderr_task = try dispatcher.fdDispatchTask(
+            PooledSshTransport,
+            transport.allocator,
+            transport,
+            transport.stderr_source,
+            readPooledSshTransportStderr,
+        );
+    }
+    transport.stderr_source.setFdEvents(.{ .readable = true });
+    try transport.stderr_task.schedule(daemon_dispatcher);
 }
 
 fn failStartingPooledSshTransport(
@@ -952,17 +976,22 @@ pub fn enqueueCleanupRequestToRemote(
     }
 }
 
-fn readPooledSshTransportRemote(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
-    const daemon_dispatcher = handler_event.dispatcher;
-    const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
-    readPooledSshTransportRemoteInner(transport, daemon_dispatcher, handler_event.event) catch |err| {
+fn readPooledSshTransportRemote(
+    transport: *PooledSshTransport,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    _: *dispatcher.DispatchTask,
+    fd_event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
+    readPooledSshTransportRemoteInner(transport, daemon_dispatcher, fd_event) catch |err| {
         daemon_log.infof(
             transport.allocator,
             "pooled ssh transport failed host={s} pool={s} error={t}",
             .{ transport.display_host, transport.key, err },
         );
         notifyPooledSshTransportRemoteClosed(daemon_dispatcher, transport);
+        return .done;
     };
+    return .pending;
 }
 
 // Read from the OpenSSH stdout side of the pooled tunnel. Startup states consume
@@ -971,12 +1000,8 @@ fn readPooledSshTransportRemote(ctx: *anyopaque, handler_event: dispatcher.Handl
 fn readPooledSshTransportRemoteInner(
     transport: *PooledSshTransport,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    event: dispatcher.Event,
+    fd_event: dispatcher.FdEvent,
 ) !void {
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedPooledSshTransportTimer,
-    };
     if (fd_event.error_event or fd_event.invalid) {
         notifyPooledSshTransportRemoteClosed(daemon_dispatcher, transport);
         return;
@@ -1348,7 +1373,6 @@ fn schedulePooledSshTransportBootstrapExitPoll(
 ) void {
     // After bootstrap read failure, briefly poll the SSH process for its final
     // exit term so the user sees the best available failure message.
-    if (transport.bootstrap_failure_timer_id != null) return;
     const now_ms = daemon_dispatcher.nowMs();
     if (transport.bootstrap_failure_started_ms == 0) {
         transport.bootstrap_failure_started_ms = now_ms;
@@ -1360,30 +1384,35 @@ fn schedulePooledSshTransportBootstrapExitPoll(
         return;
     }
     const remaining_ms = bootstrap_process_exit_timeout_ms - elapsed_ms;
-    transport.bootstrap_failure_timer_id = daemon_dispatcher.watchTimerAfter(@min(bootstrap_process_exit_poll_ms, remaining_ms), .{
-        .ctx = transport,
-        .callback = pollPooledSshTransportBootstrapExit,
-    }) catch {
+    if (!transport.bootstrap_failure_task.isInitialized()) {
+        transport.bootstrap_failure_task = dispatcher.timerDispatchTask(
+            PooledSshTransport,
+            transport.allocator,
+            transport,
+            pollPooledSshTransportBootstrapExit,
+        );
+    }
+    transport.bootstrap_failure_task.setTimerAfter(daemon_dispatcher, @min(bootstrap_process_exit_poll_ms, remaining_ms));
+    transport.bootstrap_failure_task.schedule(daemon_dispatcher) catch {
         failPooledSshTransportBootstrap(daemon_dispatcher, transport, .{ .err = transport.bootstrap_failure_error orelse err });
         return;
     };
 }
 
-fn pollPooledSshTransportBootstrapExit(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
-    const daemon_dispatcher = handler_event.dispatcher;
-    const event = handler_event.event;
-    const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
-    switch (event) {
-        .timer => {},
-        .fd => return error.UnexpectedPooledSshTransportFdEvent,
-    }
-    transport.bootstrap_failure_timer_id = null;
+fn pollPooledSshTransportBootstrapExit(
+    transport: *PooledSshTransport,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+    _: dispatcher.TimerEvent,
+) !dispatch_io.DispatchTaskStatus {
+    _ = task;
     const err = transport.bootstrap_failure_error orelse error.SshBootstrapFailed;
     if (pollPooledSshTransportExit(transport)) |term| {
         failPooledSshTransportBootstrap(daemon_dispatcher, transport, .{ .err = err, .term = term });
-        return;
+        return .done;
     }
     schedulePooledSshTransportBootstrapExitPoll(daemon_dispatcher, transport, err);
+    return .pending;
 }
 
 fn sendPooledSshTransportConnectionEvent(
@@ -1412,41 +1441,41 @@ fn sendPooledSshTransportConnectionEvent(
     if (started_write) pausePooledSshTransportRemoteRead(daemon_dispatcher, transport) catch {};
 }
 
-fn readPooledSshTransportStderr(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+fn readPooledSshTransportStderr(
+    transport: *PooledSshTransport,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+    fd_event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
+    _ = task;
     // OpenSSH stderr is diagnostic data that may arrive before, during, or after
-    // mux startup. Forward what is readable, then unregister the stderr watch
-    // once the pipe closes.
-    const daemon_dispatcher = handler_event.dispatcher;
-    const event = handler_event.event;
-    const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedPooledSshTransportTimer,
-    };
-    if (!fd_event.readable and !fd_event.hangup and !fd_event.error_event and !fd_event.invalid) return;
+    // mux startup. Forward what is readable, then cancel the stderr task once
+    // the pipe closes.
+    if (!fd_event.readable and !fd_event.hangup and !fd_event.error_event and !fd_event.invalid) return .pending;
     forwardPooledSshTransportStderr(daemon_dispatcher, transport) catch |err| {
         daemon_log.infof(
             transport.allocator,
             "pooled ssh transport stderr failed host={s} pool={s} error={t}",
             .{ transport.display_host, transport.key, err },
         );
-        if (transport.stderr_watch_id) |watch_id| {
-            daemon_dispatcher.cancel(.{ .fd = watch_id });
-            transport.stderr_watch_id = null;
-        }
+        transport.stderr_task.cancel();
+        return .done;
     };
     if (fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-        if (transport.stderr_watch_id) |watch_id| {
-            daemon_dispatcher.cancel(.{ .fd = watch_id });
-            transport.stderr_watch_id = null;
-        }
+        transport.stderr_task.cancel();
+        return .done;
     }
+    return .pending;
 }
 
-fn writePooledSshTransportRemote(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
-    const daemon_dispatcher = handler_event.dispatcher;
-    const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
-    writePooledSshTransportRemoteInner(transport, daemon_dispatcher, handler_event.event) catch |err| {
+fn writePooledSshTransportRemote(
+    transport: *PooledSshTransport,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+    fd_event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
+    _ = task;
+    writePooledSshTransportRemoteInner(transport, daemon_dispatcher, fd_event) catch |err| {
         daemon_log.infof(
             transport.allocator,
             "pooled ssh transport remote write failed host={s} pool={s} error={t}",
@@ -1457,17 +1486,17 @@ fn writePooledSshTransportRemote(ctx: *anyopaque, handler_event: dispatcher.Hand
         } else {
             failPooledSshTransportStartup(daemon_dispatcher, transport, .{ .err = err, .term = pollPooledSshTransportExit(transport) });
         }
+        return .done;
     };
+    return .pending;
 }
 
 fn waitForBootstrapReadAfterWriteFailure(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
 ) void {
-    if (transport.stdin_watch_id) |watch_id| {
-        daemon_dispatcher.cancel(.{ .fd = watch_id });
-        transport.stdin_watch_id = null;
-    }
+    _ = daemon_dispatcher;
+    transport.stdin_task.cancel();
     if (transport.remote_write) |*write| {
         write.deinit(transport.allocator);
         transport.remote_write = null;
@@ -1482,12 +1511,8 @@ fn waitForBootstrapReadAfterWriteFailure(
 fn writePooledSshTransportRemoteInner(
     transport: *PooledSshTransport,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    event: dispatcher.Event,
+    fd_event: dispatcher.FdEvent,
 ) !void {
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedPooledSshTransportTimer,
-    };
     if (fd_event.error_event or fd_event.invalid or fd_event.hangup) return error.SshTransportWriteClosed;
     if (!fd_event.writable) return;
     const write = if (transport.remote_write) |*value| value else return;
@@ -1501,10 +1526,7 @@ fn writePooledSshTransportRemoteInner(
 
     var completed = transport.remote_write.?;
     transport.remote_write = null;
-    if (transport.stdin_watch_id) |watch_id| {
-        daemon_dispatcher.cancel(.{ .fd = watch_id });
-        transport.stdin_watch_id = null;
-    }
+    transport.stdin_task.cancel();
 
     switch (completed) {
         .raw => |*raw| {
@@ -1667,30 +1689,37 @@ fn ensurePooledSshTransportRemoteWritable(
     transport: *PooledSshTransport,
     daemon_dispatcher: *dispatcher.Dispatcher,
 ) !void {
-    if (transport.stdin_watch_id == null) {
-        transport.stdin_watch_id = try daemon_dispatcher.watchFd(.{
-            .fd = transport.connection.?.stdinFd(),
-            .events = .{ .writable = true },
-            .handler = .{
-                .ctx = transport,
-                .callback = writePooledSshTransportRemote,
-            },
-        });
+    if (!transport.stdin_source.isInitialized()) {
+        transport.stdin_source = try daemon_dispatcher.fdSource(transport.connection.?.stdinFd(), .{ .writable = true });
+        transport.stdin_task = try dispatcher.fdDispatchTask(
+            PooledSshTransport,
+            transport.allocator,
+            transport,
+            transport.stdin_source,
+            writePooledSshTransportRemote,
+        );
     }
+    transport.stdin_source.setFdEvents(.{ .writable = true });
+    try transport.stdin_task.schedule(daemon_dispatcher);
 }
 
-fn readPooledSshTransportClient(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
-    const daemon_dispatcher = handler_event.dispatcher;
-    const client: *PooledSshTransportClient = @ptrCast(@alignCast(ctx));
+fn readPooledSshTransportClient(
+    client: *PooledSshTransportClient,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    _: *dispatcher.DispatchTask,
+    fd_event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
     const transport = client.transport;
-    readPooledSshTransportClientInner(client, daemon_dispatcher, handler_event.event) catch |err| {
+    readPooledSshTransportClientInner(client, daemon_dispatcher, fd_event) catch |err| {
         daemon_log.infof(
             transport.allocator,
             "pooled ssh transport client failed host={s} pool={s} stream_id={} error={t}",
             .{ transport.display_host, transport.key, client.stream_id, err },
         );
         finishPooledSshTransportClient(pooledClientContext(daemon_dispatcher, client), .send);
+        return .done;
     };
+    return .pending;
 }
 
 // Service one local client attached to the pool. Reads are paused whenever the
@@ -1699,13 +1728,9 @@ fn readPooledSshTransportClient(ctx: *anyopaque, handler_event: dispatcher.Handl
 fn readPooledSshTransportClientInner(
     client: *PooledSshTransportClient,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    event: dispatcher.Event,
+    fd_event: dispatcher.FdEvent,
 ) !void {
     const transport = client.transport;
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedPooledSshTransportTimer,
-    };
     if (fd_event.error_event or fd_event.invalid) {
         finishPooledSshTransportClient(pooledClientContext(daemon_dispatcher, client), .send);
         return;
@@ -1719,7 +1744,7 @@ fn readPooledSshTransportClientInner(
     }
     if (client.read_paused or transport.remote_write != null or client.write != null) {
         if (transport.remote_write != null) client.read_paused = true;
-        try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+        try updatePooledSshTransportClientSource(daemon_dispatcher, client);
         return;
     }
 
@@ -1784,7 +1809,7 @@ fn writePooledSshTransportClient(ctx: PooledClientContext) !bool {
     if (try startNextQueuedPooledSshTransportClientFrameWrite(ctx)) {
         return true;
     }
-    try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try updatePooledSshTransportClientSource(daemon_dispatcher, client);
 
     if (!pooledSshTransportHasClientWrites(transport)) {
         if (completed_raw and client.raw_proxy != null and client.state != .done) {
@@ -1835,7 +1860,7 @@ fn readPooledRawProxyClient(ctx: PooledClientContext) !void {
         errdefer transport.allocator.free(frame_bytes);
         client.outbound_next_offset +|= bytes.len;
         client.read_paused = true;
-        try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+        try updatePooledSshTransportClientSource(daemon_dispatcher, client);
         try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
         try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, .{ .bytes = frame_bytes, .kind = .{ .client_to_daemon = client } });
         return;
@@ -1899,11 +1924,11 @@ fn startPooledSshTransportClientFrameWrite(ctx: PooledClientContext, request: Po
     errdefer frame.deinit();
     if (client.write != null) {
         try client.pending_frame_writes.appendWrite(.{ .frame = frame, .kind = request.kind });
-        try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
+        try ensurePooledSshTransportClientSource(daemon_dispatcher, client);
         return;
     }
     client.write = .{ .frame = .{ .frame = frame, .kind = request.kind } };
-    try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try ensurePooledSshTransportClientSource(daemon_dispatcher, client);
 }
 
 fn startNextQueuedPooledSshTransportClientFrameWrite(ctx: PooledClientContext) !bool {
@@ -1912,7 +1937,7 @@ fn startNextQueuedPooledSshTransportClientFrameWrite(ctx: PooledClientContext) !
     if (client.write != null) return false;
     const next = client.pending_frame_writes.popFirst() orelse return false;
     client.write = .{ .frame = next };
-    try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try ensurePooledSshTransportClientSource(daemon_dispatcher, client);
     return true;
 }
 
@@ -1926,7 +1951,7 @@ fn startPooledSshTransportClientRawWrite(
     if (client.write != null or client.pending_frame_writes.hasPending()) return error.PooledSshTransportClientWriteAlreadyQueued;
     errdefer client.transport.allocator.free(bytes);
     client.write = .{ .raw = .{ .bytes = bytes, .kind = kind } };
-    try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try ensurePooledSshTransportClientSource(daemon_dispatcher, client);
 }
 
 fn startPooledClientConnectionEvent(
@@ -2021,42 +2046,35 @@ fn failPooledSshTransportClientWithError(ctx: PooledClientContext, error_info: P
     return false;
 }
 
-fn closeIdlePooledSshTransport(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+fn closeIdlePooledSshTransport(
+    transport: *PooledSshTransport,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+    _: dispatcher.TimerEvent,
+) !dispatch_io.DispatchTaskStatus {
+    _ = task;
     // Idle close is delayed so short sequential sessh invocations can reuse the
     // SSH connection. Any active client, cleanup request, or non-idle state
     // cancels the close attempt.
-    const daemon_dispatcher = handler_event.dispatcher;
-    const event = handler_event.event;
-    const transport: *PooledSshTransport = @ptrCast(@alignCast(ctx));
-    switch (event) {
-        .timer => {},
-        .fd => return error.UnexpectedPooledSshTransportFd,
-    }
-    transport.idle_timer_id = null;
     if (transport.clients.items.len != 0 or
         transport.pending_cleanup_requests.items.len != 0 or
         transport.cleanup_requests_in_flight != 0 or
-        transport.state == .closed) return;
+        transport.state == .closed) return .done;
     daemon_log.infof(
         transport.allocator,
         "pooled ssh transport idle host={s} pool={s}",
         .{ transport.display_host, transport.key },
     );
     finishPooledSshTransport(daemon_dispatcher, transport);
+    return .done;
 }
 
 // Move clients waiting on transport startup into stream-opening state once the
 // pooled tunnel is ready. Each client gets a fresh remote stream id from the
 // transport's pool.
 fn activatePendingPooledSshTransportClients(daemon_dispatcher: *dispatcher.Dispatcher, transport: *PooledSshTransport) void {
-    if (transport.idle_timer_id) |timer_id| {
-        daemon_dispatcher.cancel(.{ .timer = timer_id });
-        transport.idle_timer_id = null;
-    }
-    if (transport.bootstrap_failure_timer_id) |timer_id| {
-        daemon_dispatcher.cancel(.{ .timer = timer_id });
-        transport.bootstrap_failure_timer_id = null;
-    }
+    transport.idle_task.cancel();
+    transport.bootstrap_failure_task.cancel();
     var index: usize = 0;
     while (index < transport.clients.items.len) {
         const client = transport.clients.items[index];
@@ -2071,7 +2089,7 @@ fn activatePendingPooledSshTransportClients(daemon_dispatcher: *dispatcher.Dispa
                 destroyPooledSshTransportClient(daemon_dispatcher, transport, client);
                 continue;
             };
-        } else ensurePooledSshTransportClientWatch(daemon_dispatcher, client) catch {
+        } else ensurePooledSshTransportClientSource(daemon_dispatcher, client) catch {
             destroyPooledSshTransportClient(daemon_dispatcher, transport, client);
             continue;
         };
@@ -2086,11 +2104,17 @@ fn schedulePooledSshTransportIdleClose(daemon_dispatcher: *dispatcher.Dispatcher
         transport.pending_cleanup_requests.items.len != 0 or
         transport.cleanup_requests_in_flight != 0 or
         transport.remote_write != null or
-        transport.idle_timer_id != null) return;
-    transport.idle_timer_id = daemon_dispatcher.watchTimerAfter(@intCast(pooled_ssh_transport_idle_close_ms), .{
-        .ctx = transport,
-        .callback = closeIdlePooledSshTransport,
-    }) catch {
+        transport.idle_task.isScheduled()) return;
+    if (!transport.idle_task.isInitialized()) {
+        transport.idle_task = dispatcher.timerDispatchTask(
+            PooledSshTransport,
+            transport.allocator,
+            transport,
+            closeIdlePooledSshTransport,
+        );
+    }
+    transport.idle_task.setTimerAfter(daemon_dispatcher, @intCast(pooled_ssh_transport_idle_close_ms));
+    transport.idle_task.schedule(daemon_dispatcher) catch {
         finishPooledSshTransport(daemon_dispatcher, transport);
         return;
     };
@@ -2100,35 +2124,24 @@ fn beginClosingPooledSshTransport(daemon_dispatcher: *dispatcher.Dispatcher, tra
     // Stop observing the SSH process before closing it so no further callbacks
     // race against teardown. Clients are failed/finished by the caller or close
     // path that requested this transition.
+    _ = daemon_dispatcher;
     if (transport.state == .closed or transport.state == .closing) return;
     transport.state = .closing;
-    if (transport.remote_watch_id) |watch_id| {
-        daemon_dispatcher.cancel(.{ .fd = watch_id });
-        transport.remote_watch_id = null;
-    }
-    if (transport.stderr_watch_id) |watch_id| {
-        daemon_dispatcher.cancel(.{ .fd = watch_id });
-        transport.stderr_watch_id = null;
-    }
-    if (transport.stdin_watch_id) |watch_id| {
-        daemon_dispatcher.cancel(.{ .fd = watch_id });
-        transport.stdin_watch_id = null;
-    }
-    if (transport.idle_timer_id) |timer_id| {
-        daemon_dispatcher.cancel(.{ .timer = timer_id });
-        transport.idle_timer_id = null;
-    }
+    transport.remote_task.cancel();
+    transport.stderr_task.cancel();
+    transport.stdin_task.cancel();
+    transport.idle_task.cancel();
+    transport.bootstrap_failure_task.cancel();
     removePooledSshTransport(transport);
 }
 
-fn updatePooledSshTransportRemoteReadWatch(
+fn updatePooledSshTransportRemoteReadSource(
     daemon_dispatcher: *dispatcher.Dispatcher,
     transport: *PooledSshTransport,
 ) !void {
-    const watch_id = transport.remote_watch_id orelse return;
-    try daemon_dispatcher.updateFdEvents(watch_id, .{
-        .readable = !transport.remote_read_paused,
-    });
+    if (!transport.remote_source.isInitialized()) return;
+    transport.remote_source.setFdEvents(.{ .readable = !transport.remote_read_paused });
+    if (transport.remote_task.isInitialized()) try transport.remote_task.schedule(daemon_dispatcher);
 }
 
 fn pausePooledSshTransportRemoteRead(
@@ -2137,7 +2150,7 @@ fn pausePooledSshTransportRemoteRead(
 ) !void {
     if (transport.remote_read_paused) return;
     transport.remote_read_paused = true;
-    try updatePooledSshTransportRemoteReadWatch(daemon_dispatcher, transport);
+    try updatePooledSshTransportRemoteReadSource(daemon_dispatcher, transport);
 }
 
 fn resumePooledSshTransportRemoteRead(
@@ -2146,18 +2159,19 @@ fn resumePooledSshTransportRemoteRead(
 ) !void {
     if (!transport.remote_read_paused) return;
     transport.remote_read_paused = false;
-    try updatePooledSshTransportRemoteReadWatch(daemon_dispatcher, transport);
+    try updatePooledSshTransportRemoteReadSource(daemon_dispatcher, transport);
 }
 
-fn updatePooledSshTransportClientWatch(
+fn updatePooledSshTransportClientSource(
     daemon_dispatcher: *dispatcher.Dispatcher,
     client: *PooledSshTransportClient,
 ) !void {
-    const watch_id = client.watch_id orelse return;
-    try daemon_dispatcher.updateFdEvents(watch_id, .{
+    if (!client.source.isInitialized()) return;
+    client.source.setFdEvents(.{
         .readable = pooledSshTransportClientReadable(client),
         .writable = client.write != null,
     });
+    if (client.task.isInitialized()) try client.task.schedule(daemon_dispatcher);
 }
 
 fn pooledSshTransportClientReadable(client: *const PooledSshTransportClient) bool {
@@ -2167,28 +2181,29 @@ fn pooledSshTransportClientReadable(client: *const PooledSshTransportClient) boo
     };
 }
 
-fn ensurePooledSshTransportClientWatch(
+fn ensurePooledSshTransportClientSource(
     daemon_dispatcher: *dispatcher.Dispatcher,
     client: *PooledSshTransportClient,
 ) !void {
-    // A pooled client watch follows the client's current backpressure state.
+    // A pooled client source follows the client's current backpressure state.
     // Register once, then update readable/writable interests as queued writes or
     // paused reads change.
-    if (client.watch_id) |_| {
-        try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+    if (client.source.isInitialized()) {
+        try updatePooledSshTransportClientSource(daemon_dispatcher, client);
         return;
     }
-    client.watch_id = try daemon_dispatcher.watchFd(.{
-        .fd = client.fd,
-        .events = .{
-            .readable = pooledSshTransportClientReadable(client),
-            .writable = client.write != null,
-        },
-        .handler = .{
-            .ctx = client,
-            .callback = readPooledSshTransportClient,
-        },
+    client.source = try daemon_dispatcher.fdSource(client.fd, .{
+        .readable = pooledSshTransportClientReadable(client),
+        .writable = client.write != null,
     });
+    client.task = try dispatcher.fdDispatchTask(
+        PooledSshTransportClient,
+        client.transport.allocator,
+        client,
+        client.source,
+        readPooledSshTransportClient,
+    );
+    try client.task.schedule(daemon_dispatcher);
 }
 
 fn pausePooledSshTransportClientReads(
@@ -2198,7 +2213,7 @@ fn pausePooledSshTransportClientReads(
     for (transport.clients.items) |client| {
         if (client.state == .done or client.read_paused) continue;
         client.read_paused = true;
-        try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+        try updatePooledSshTransportClientSource(daemon_dispatcher, client);
     }
 }
 
@@ -2209,7 +2224,7 @@ fn resumePooledSshTransportClientReads(
     for (transport.clients.items) |client| {
         if (client.state == .done or !client.read_paused) continue;
         client.read_paused = false;
-        try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+        try updatePooledSshTransportClientSource(daemon_dispatcher, client);
     }
 }
 
@@ -2385,7 +2400,7 @@ fn sendPooledTerminalMuxOpen(
     const envelope_bytes = try mux_tunnel.encodeOpenEnvelopeBytes(transport.allocator, client.stream_id, client.inbound_next_offset);
     errdefer transport.allocator.free(envelope_bytes);
     client.read_paused = true;
-    try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try ensurePooledSshTransportClientSource(daemon_dispatcher, client);
     try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, .{
         .bytes = envelope_bytes,
@@ -2421,7 +2436,7 @@ fn sendPooledProxyMuxOpen(
     const bytes = try mux_tunnel.encodeMuxStreamFrameBytes(transport.allocator, mux_frame);
     errdefer transport.allocator.free(bytes);
     client.read_paused = true;
-    try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try updatePooledSshTransportClientSource(daemon_dispatcher, client);
     try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, .{ .bytes = bytes, .kind = .{ .client_to_daemon = client } });
     client.startup_timing.noteMuxOpenSent();
@@ -2450,7 +2465,7 @@ fn sendPooledRawProxyMuxOpen(ctx: PooledClientContext) !void {
     const envelope_bytes = try mux_tunnel.encodeOpenEnvelopeBytes(transport.allocator, client.stream_id, client.inbound_next_offset);
     errdefer transport.allocator.free(envelope_bytes);
     client.read_paused = true;
-    try ensurePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try ensurePooledSshTransportClientSource(daemon_dispatcher, client);
     try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, .{
         .bytes = envelope_bytes,
@@ -2477,7 +2492,7 @@ fn sendPooledProxyMuxFrame(
     const bytes = try mux_tunnel.encodeMuxStreamFrameBytes(transport.allocator, mux_frame);
     errdefer transport.allocator.free(bytes);
     client.read_paused = true;
-    try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try updatePooledSshTransportClientSource(daemon_dispatcher, client);
     try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, .{ .bytes = bytes, .kind = .{ .client_to_daemon = client } });
 }
@@ -2515,7 +2530,7 @@ fn maybeRegisterProxyDiagnosticsStream(
         .fd = client.fd,
         .sink = .{
             .ctx = client,
-            .queueFrame = queueProxyDiagnosticsFrameToPooledClient,
+            .writeFrame = queueProxyDiagnosticsFrameToPooledClient,
         },
     });
 }
@@ -2543,7 +2558,7 @@ fn sendPooledTerminalMuxPayload(
     });
     errdefer transport.allocator.free(bytes);
     client.read_paused = true;
-    try updatePooledSshTransportClientWatch(daemon_dispatcher, client);
+    try updatePooledSshTransportClientSource(daemon_dispatcher, client);
     try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, .{ .bytes = bytes, .kind = .{ .client_to_daemon = client } });
     client.outbound_next_offset +|= 1;
@@ -3091,6 +3106,7 @@ fn forwardPooledSshTransportStderr(
 // only path that decrements the active transport count and frees the registry
 // entry.
 fn finishPooledSshTransport(daemon_dispatcher: *dispatcher.Dispatcher, transport: *PooledSshTransport) void {
+    _ = daemon_dispatcher;
     if (transport.state == .closed) return;
     daemon_log.infof(
         transport.allocator,
@@ -3098,26 +3114,15 @@ fn finishPooledSshTransport(daemon_dispatcher: *dispatcher.Dispatcher, transport
         .{ transport.display_host, transport.key },
     );
     transport.state = .closed;
-    if (transport.remote_watch_id) |watch_id| {
-        daemon_dispatcher.cancel(.{ .fd = watch_id });
-        transport.remote_watch_id = null;
-    }
-    if (transport.stderr_watch_id) |watch_id| {
-        daemon_dispatcher.cancel(.{ .fd = watch_id });
-        transport.stderr_watch_id = null;
-    }
-    if (transport.stdin_watch_id) |watch_id| {
-        daemon_dispatcher.cancel(.{ .fd = watch_id });
-        transport.stdin_watch_id = null;
-    }
-    if (transport.idle_timer_id) |timer_id| {
-        daemon_dispatcher.cancel(.{ .timer = timer_id });
-        transport.idle_timer_id = null;
-    }
+    transport.remote_task.cancel();
+    transport.stderr_task.cancel();
+    transport.stdin_task.cancel();
+    transport.idle_task.cancel();
+    transport.bootstrap_failure_task.cancel();
     removePooledSshTransport(transport);
     while (transport.clients.items.len > 0) {
         const client = transport.clients.items[0];
-        destroyPooledSshTransportClient(daemon_dispatcher, transport, client);
+        destroyPooledSshTransportClient(null, transport, client);
     }
     active_pooled_ssh_transports -= 1;
     const allocator = transport.allocator;
@@ -3131,7 +3136,7 @@ fn destroyPooledSshTransportClient(
     client: *PooledSshTransportClient,
 ) void {
     // A pooled transport can outlive any individual visible client. Destroying a
-    // client therefore only removes its fd/watch and stream bookkeeping; the
+    // client therefore only removes its fd/source and stream bookkeeping; the
     // shared SSH process stays alive until idle policy closes the pool.
     if (client.done) return;
     logPooledSshTransportClientStartupTiming(transport, client);
@@ -3140,15 +3145,10 @@ fn destroyPooledSshTransportClient(
         "pooled ssh transport client finished host={s} pool={s} stream_id={}",
         .{ transport.display_host, transport.key, client.stream_id },
     );
+    _ = daemon_dispatcher;
     client.state = .done;
     client.done = true;
-    if (client.watch_id) |watch_id| {
-        // The dispatcher may already be dispatching this watch. Cancelling it is
-        // still useful because it prevents future events for the same fd slot.
-        // The current callback returns immediately after destroying the client.
-        if (daemon_dispatcher) |d| d.cancel(.{ .fd = watch_id });
-        client.watch_id = null;
-    }
+    client.task.cancel();
     var index: usize = 0;
     while (index < transport.clients.items.len) : (index += 1) {
         if (transport.clients.items[index] != client) continue;

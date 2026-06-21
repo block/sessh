@@ -232,7 +232,7 @@ test "foreground frame io writes frame with SCM_RIGHTS fd" {
     const received_fd = frame.takeFd() orelse return error.ExpectedFileDescriptor;
     defer _ = c.close(received_fd);
 
-    try @import("../core/io.zig").writeAll(received_fd, "raw-bytes");
+    try core_blocking.fromTest().writeAll(received_fd, "raw-bytes");
     var buf: [32]u8 = undefined;
     const n = c.read(raw[1], &buf, buf.len);
     if (n < 0) return error.ReadFailed;

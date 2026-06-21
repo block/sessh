@@ -340,7 +340,7 @@ fn queryKittyKeyboardFlags(blocking: core_blocking.Blocking, fds: TerminalFds) !
     var guard = try TerminalModeGuard.enable(fds.input);
     defer guard.restore();
 
-    try io.writeAll(fds.output, kitty_keyboard_query);
+    try blocking.writeAll(fds.output, kitty_keyboard_query);
     try readTerminalProbeResponses(blocking, fds.input, &probe, .kitty_keyboard_flags);
     mergeCachedProbe(fds, probe);
     return probe.kitty_keyboard_flags;
@@ -377,7 +377,7 @@ pub fn queryTerminalProbe(blocking: core_blocking.Blocking, fds: TerminalFds) !T
     var guard = try TerminalModeGuard.enable(fds.input);
     defer guard.restore();
 
-    try io.writeAll(fds.output, terminal_probe_request);
+    try blocking.writeAll(fds.output, terminal_probe_request);
 
     try readTerminalProbeResponses(blocking, fds.input, &probe, .complete);
 

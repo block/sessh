@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("blocking.zig");
 const core_fds = @import("fds.zig");
 const io = @import("io.zig");
 
@@ -494,6 +495,7 @@ fn cmsgSpace(payload_len: usize) usize {
 }
 
 test "sendBufferWithFdProgress transfers a usable descriptor" {
+    const blocking = core_blocking.fromTest();
     var control: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &control) != 0) return error.SocketPairFailed;
     defer _ = c.close(control[0]);
@@ -528,7 +530,7 @@ test "sendBufferWithFdProgress transfers a usable descriptor" {
     const received_fd = recv_progress.takeFd() orelse return error.MissingFileDescriptor;
     defer _ = c.close(received_fd);
 
-    try io.writeAll(received_fd, "raw-bytes");
+    try blocking.writeAll(received_fd, "raw-bytes");
     var raw_buf: [32]u8 = undefined;
     const n = c.read(raw[1], &raw_buf, raw_buf.len);
     if (n < 0) return error.ReadFailed;
@@ -536,6 +538,7 @@ test "sendBufferWithFdProgress transfers a usable descriptor" {
 }
 
 test "sendBufferWithFdProgress takes ownership after accepted send" {
+    const blocking = core_blocking.fromTest();
     var control: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &control) != 0) return error.SocketPairFailed;
     defer _ = c.close(control[0]);
@@ -572,7 +575,7 @@ test "sendBufferWithFdProgress takes ownership after accepted send" {
     }
     const received_fd = recv_progress.takeFd() orelse return error.MissingFileDescriptor;
     defer _ = c.close(received_fd);
-    try io.writeAll(received_fd, "still-open");
+    try blocking.writeAll(received_fd, "still-open");
 }
 
 test "sendBufferWithFdProgress supports partial byte progress after fd transfer" {

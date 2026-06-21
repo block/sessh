@@ -142,7 +142,7 @@ pub const ReconnectUi = struct {
             .clock = try NonSuspendingTimer.start(),
             .terminal_fds = options.terminal_fds,
             .line_fd = options.line_fd,
-            .title_state = diagnostics_display.TitleState.init(title_enabled, options.terminal_fds.output),
+            .title_state = diagnostics_display.TitleState.init(blocking, title_enabled, options.terminal_fds.output),
             .presentation = options.presentation,
             .last_size = terminal.currentWindowSize(),
         };
@@ -160,7 +160,7 @@ pub const ReconnectUi = struct {
     }
 
     pub fn deinit(self: *ReconnectUi) void {
-        self.reconnect_input_state.clearDisconnectedInputFlash(self.terminal_fds.output) catch {};
+        self.reconnect_input_state.clearDisconnectedInputFlash(self.blocking, self.terminal_fds.output) catch {};
         self.restoreTitleForEnd();
         self.diagnostic_notify_pipe.deinit();
         self.showCursor() catch {};
@@ -340,7 +340,7 @@ pub const ReconnectUi = struct {
         if (self.resize_generation == 0) self.resize_generation = 1;
         if (self.presentation != .overlay or c.isatty(self.terminal_fds.output) == 0) return;
 
-        const renderer = client_renderer.Renderer.init(self.terminal_fds.output);
+        const renderer = client_renderer.Renderer.init(self.blocking, self.terminal_fds.output);
         try renderer.restorePresentation(terminal.queryInitialKittyKeyboardFlags(self.blocking, self.terminal_fds));
         try renderer.clearVisible();
         self.overlay_state = null;
@@ -359,7 +359,7 @@ pub const ReconnectUi = struct {
     }
 
     fn refreshDisconnectedInputFlash(self: *ReconnectUi) !void {
-        try self.reconnect_input_state.refreshDisconnectedInputFlash(self.terminal_fds.output, self.nowMs());
+        try self.reconnect_input_state.refreshDisconnectedInputFlash(self.blocking, self.terminal_fds.output, self.nowMs());
     }
 
     fn nowMs(self: *ReconnectUi) u64 {
@@ -370,7 +370,7 @@ pub const ReconnectUi = struct {
         if (self.presentation != .overlay) return @intCast(self.viewport_offset);
         if (c.isatty(self.terminal_fds.output) == 0) return @intCast(self.viewport_offset);
         const state = self.overlay_state orelse return @intCast(self.viewport_offset);
-        const renderer = client_renderer.Renderer.init(self.terminal_fds.output);
+        const renderer = client_renderer.Renderer.init(self.blocking, self.terminal_fds.output);
         const size = terminal.currentWindowSize();
         try eraseOverlayRows(renderer, state, size);
         try restoreOverlayExpansion(renderer, state, size);
@@ -452,25 +452,25 @@ pub const ReconnectUi = struct {
         switch (self.presentation) {
             .none, .title => return,
             .jsonl => {
-                try diagnostics_display.writeJsonlStatus(self.line_fd, message);
+                try diagnostics_display.writeJsonlStatus(self.blocking, self.line_fd, message);
                 return;
             },
             .line => {
-                try io_helpers.writeAll(self.line_fd, message);
-                try io_helpers.writeAll(self.line_fd, "\r\n");
+                try self.blocking.writeAll(self.line_fd, message);
+                try self.blocking.writeAll(self.line_fd, "\r\n");
                 return;
             },
             .overlay => {},
         }
 
         if (c.isatty(self.terminal_fds.output) == 0) {
-            try io_helpers.writeAll(self.terminal_fds.output, "\r\n");
-            try io_helpers.writeAll(self.terminal_fds.output, message);
-            try io_helpers.writeAll(self.terminal_fds.output, "\r\n");
+            try self.blocking.writeAll(self.terminal_fds.output, "\r\n");
+            try self.blocking.writeAll(self.terminal_fds.output, message);
+            try self.blocking.writeAll(self.terminal_fds.output, "\r\n");
             for (self.diagnostic_lines[0..self.diagnostic_line_count]) |*line| {
                 if (line.isEmpty()) continue;
-                try io_helpers.writeAll(self.terminal_fds.output, line.slice());
-                try io_helpers.writeAll(self.terminal_fds.output, "\r\n");
+                try self.blocking.writeAll(self.terminal_fds.output, line.slice());
+                try self.blocking.writeAll(self.terminal_fds.output, "\r\n");
             }
             return;
         }
@@ -493,7 +493,7 @@ pub const ReconnectUi = struct {
             overlay_lines[overlay_line_count] = .{ .text = line.slice(), .alignment = .left };
             overlay_line_count += 1;
         }
-        const renderer = client_renderer.Renderer.init(self.terminal_fds.output);
+        const renderer = client_renderer.Renderer.init(self.blocking, self.terminal_fds.output);
         const state = try drawOverlayLines(.{
             .renderer = renderer,
             .size = size,
@@ -550,12 +550,12 @@ pub const ReconnectUi = struct {
             .diagnostic = diagnostic,
             .delayed = delayed,
         });
-        io_helpers.writeAll(self.line_fd, line_buf[0..len]) catch return;
-        io_helpers.writeAll(self.line_fd, "\r\n") catch {};
+        self.blocking.writeAll(self.line_fd, line_buf[0..len]) catch return;
+        self.blocking.writeAll(self.line_fd, "\r\n") catch {};
     }
 
     fn writeJsonlDiagnostic(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
-        diagnostics_display.writeJsonlDiagnostic(self.line_fd, diagnostic) catch return;
+        diagnostics_display.writeJsonlDiagnostic(self.blocking, self.line_fd, diagnostic) catch return;
     }
 
     fn appendDiagnosticLine(self: *ReconnectUi, diagnostic: *const client_log.UserDiagnosticLine) void {
@@ -576,14 +576,14 @@ pub const ReconnectUi = struct {
 
     fn hideCursor(self: *ReconnectUi) !void {
         if (c.isatty(self.terminal_fds.output) == 0) return;
-        try io_helpers.writeAll(self.terminal_fds.output, "\x1b[?25l");
+        try self.blocking.writeAll(self.terminal_fds.output, "\x1b[?25l");
         self.cursor_hidden = true;
     }
 
     fn showCursor(self: *ReconnectUi) !void {
         if (!self.cursor_hidden) return;
         self.cursor_hidden = false;
-        try io_helpers.writeAll(self.terminal_fds.output, "\x1b[?25h");
+        try self.blocking.writeAll(self.terminal_fds.output, "\x1b[?25h");
     }
 
     pub fn restoreTitleAfterReconnect(self: *ReconnectUi, app_title_present: ?bool, fallback_title: []const u8) void {
@@ -685,7 +685,7 @@ test "ReconnectUi reads reconnect controls from configured input fd" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    try io_helpers.writeAll(fds[1], &.{reconnect_control.ctrl_r});
+    try core_blocking.fromTest().writeAll(fds[1], &.{reconnect_control.ctrl_r});
 
     var ui = ReconnectUi{
         .blocking = core_blocking.fromTest(),

@@ -2,6 +2,7 @@ const std = @import("std");
 const c = std.c;
 
 const dispatcher = @import("../core/dispatcher.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const core_fds = @import("../core/fds.zig");
 const protocol = @import("../protocol/mod.zig");
 
@@ -27,18 +28,22 @@ pub fn registerFrameAndClose(options: RegisterOptions) !void {
         .allocator = options.allocator,
         .fd = options.fd,
         .writer = writer,
+        .source = try options.daemon_dispatcher.fdSource(options.fd, .{ .writable = true }),
+        .task = undefined,
     };
     writer = undefined;
 
     errdefer context.writer.deinit();
-    _ = try options.daemon_dispatcher.watchFd(.{
-        .fd = options.fd,
-        .events = .{ .writable = true },
-        .handler = .{
-            .ctx = context,
-            .callback = OneShotFrameWriter.onWritable,
-        },
-    });
+    errdefer context.source.deinit();
+    context.task = try dispatcher.fdDispatchTask(
+        OneShotFrameWriter,
+        options.allocator,
+        context,
+        context.source,
+        OneShotFrameWriter.onWritable,
+    );
+    errdefer context.task.deinit();
+    try context.task.schedule(options.daemon_dispatcher);
 }
 
 /// Owns one fd long enough to flush one framed setup response from the process
@@ -48,9 +53,12 @@ const OneShotFrameWriter = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     writer: protocol.FrameWriteState,
+    source: dispatcher.Source,
+    task: dispatcher.DispatchTask,
 
-    fn close(self: *OneShotFrameWriter, d: *dispatcher.Dispatcher, id: dispatcher.WatchId) void {
-        d.cancel(id);
+    fn close(self: *OneShotFrameWriter) void {
+        self.task.deinit();
+        self.source.deinit();
         self.writer.deinit();
         if (self.fd >= 0) {
             _ = c.close(self.fd);
@@ -61,29 +69,31 @@ const OneShotFrameWriter = struct {
         allocator.destroy(self);
     }
 
-    fn onWritable(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
+    fn onWritable(
+        self: *OneShotFrameWriter,
+        d: *dispatcher.Dispatcher,
+        task: *dispatcher.DispatchTask,
+        fd_event: dispatcher.FdEvent,
+    ) !dispatch_io.DispatchTaskStatus {
+        _ = d;
+        _ = task;
         // Keep ownership of the fd until the encoded frame is completely
         // flushed. Any peer close/error abandons the response and releases the
         // fd because there is no later state machine to recover it.
-        const d = handler_event.dispatcher;
-        const id = handler_event.id;
-        const event = handler_event.event;
-        const self: *OneShotFrameWriter = @ptrCast(@alignCast(ctx));
-        const fd_event = switch (event) {
-            .fd => |fd| fd,
-            .timer => return error.UnexpectedOneShotFrameWriterTimer,
-        };
         if (fd_event.error_event or fd_event.invalid or fd_event.hangup) {
-            self.close(d, id);
-            return;
+            self.close();
+            return .done;
         }
-        if (!fd_event.writable) return;
+        if (!fd_event.writable) return .pending;
         switch (self.writer.writeReady(self.fd) catch {
-            self.close(d, id);
-            return;
+            self.close();
+            return .done;
         }) {
-            .blocked, .progress => {},
-            .done => self.close(d, id),
+            .blocked, .progress => return .pending,
+            .done => {
+                self.close();
+                return .done;
+            },
         }
     }
 };

@@ -6,7 +6,7 @@ const c = std.c;
 
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
-const frame_write_queue = @import("frame_write_queue.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const protocol = @import("../protocol/mod.zig");
 const guid_ref = @import("../core/guid.zig");
 const pb = protocol.pb;
@@ -26,7 +26,7 @@ const Registration = struct {
 
 pub const StreamSink = struct {
     ctx: *anyopaque,
-    queueFrame: *const fn (*anyopaque, *dispatcher.Dispatcher, protocol.OwnedFrame) anyerror!void,
+    writeFrame: *const fn (*anyopaque, *dispatcher.Dispatcher, protocol.OwnedFrame) anyerror!void,
 };
 
 // PROCESS_GLOBAL_REGISTRY: process-isolated proxy mode keeps a long-lived
@@ -63,18 +63,19 @@ pub fn registerOpenFromDaemon(options: RegisterOpenFromDaemonOptions) !void {
         .fd = fd,
         .guid = guid,
         .reader = protocol.FrameReader.init(allocator),
-        .writer = frame_write_queue.FrameWriteQueue.init(allocator),
+        .writer = dispatch_io.FrameSink.init(.{ .allocator = allocator, .fd = -1 }),
     };
     errdefer context.reader.deinit();
     errdefer context.writer.deinit();
-    context.watch_id = try options.daemon_dispatcher.watchFd(.{
-        .fd = fd,
-        .events = .{ .readable = true },
-        .handler = .{
-            .ctx = context,
-            .callback = readVisibleConnection,
-        },
-    });
+    context.source = try options.daemon_dispatcher.fdSource(fd, .{ .readable = true });
+    context.task = try dispatcher.fdDispatchTask(
+        VisibleConnection,
+        allocator,
+        context,
+        context.source,
+        readVisibleConnection,
+    );
+    try context.task.schedule(options.daemon_dispatcher);
 }
 
 const VisibleConnection = struct {
@@ -82,14 +83,14 @@ const VisibleConnection = struct {
     fd: c.fd_t = -1,
     guid: []u8,
     reader: protocol.FrameReader,
-    writer: frame_write_queue.FrameWriteQueue,
-    watch_id: ?dispatcher.FdWatchId = null,
+    writer: dispatch_io.FrameSink,
+    source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
 
     fn deinit(self: *VisibleConnection, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
-        if (daemon_dispatcher) |d| {
-            if (self.watch_id) |watch_id| d.cancel(.{ .fd = watch_id });
-        }
-        self.watch_id = null;
+        _ = daemon_dispatcher;
+        self.task.deinit();
+        self.source.deinit();
         if (self.fd >= 0) {
             unregisterVisible(self.fd);
             _ = c.close(self.fd);
@@ -104,33 +105,34 @@ const VisibleConnection = struct {
     }
 };
 
-fn readVisibleConnection(ctx: *anyopaque, handler_event: dispatcher.HandlerEvent) !void {
-    const daemon_dispatcher = handler_event.dispatcher;
-    const connection: *VisibleConnection = @ptrCast(@alignCast(ctx));
-    readVisibleConnectionInner(connection, daemon_dispatcher, handler_event.event) catch {
+fn readVisibleConnection(
+    connection: *VisibleConnection,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    _: *dispatcher.DispatchTask,
+    fd_event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
+    readVisibleConnectionInner(connection, daemon_dispatcher, fd_event) catch {
         connection.deinit(daemon_dispatcher);
+        return .done;
     };
+    return .pending;
 }
 
 fn readVisibleConnectionInner(
     connection: *VisibleConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    event: dispatcher.Event,
+    fd_event: dispatcher.FdEvent,
 ) !void {
     // Diagnostics clients are optional side channels for visible proxy UI. They
     // receive connection events from the daemon but must never be allowed to
     // block the daemon's pooled SSH transport or proxy streams.
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return error.UnexpectedProxyDiagnosticsTimer,
-    };
     if (fd_event.error_event or fd_event.invalid) {
         connection.deinit(daemon_dispatcher);
         return;
     }
-    if (fd_event.writable and connection.writer.hasPending()) {
-        _ = try connection.writer.writeReady(connection.fd);
-        try updateVisibleConnectionWatch(daemon_dispatcher, connection);
+    if (fd_event.writable and connection.writer.hasPendingWrite()) {
+        _ = try connection.writer.writeReadyTo(connection.fd);
+        try updateVisibleConnectionSource(daemon_dispatcher, connection);
     }
     if (!fd_event.readable) {
         if (fd_event.hangup) connection.deinit(daemon_dispatcher);
@@ -154,12 +156,13 @@ fn readVisibleConnectionInner(
     }
 }
 
-fn updateVisibleConnectionWatch(daemon_dispatcher: *dispatcher.Dispatcher, connection: *VisibleConnection) !void {
-    const watch_id = connection.watch_id orelse return;
-    try daemon_dispatcher.updateFdEvents(watch_id, .{
+fn updateVisibleConnectionSource(daemon_dispatcher: *dispatcher.Dispatcher, connection: *VisibleConnection) !void {
+    if (!connection.source.isInitialized()) return;
+    connection.source.setFdEvents(.{
         .readable = true,
-        .writable = connection.writer.hasPending(),
+        .writable = connection.writer.hasPendingWrite(),
     });
+    if (connection.task.isInitialized()) try connection.task.schedule(daemon_dispatcher);
 }
 
 fn registerVisible(allocator: std.mem.Allocator, guid: []const u8, connection: *VisibleConnection) !void {
@@ -243,7 +246,7 @@ fn visibleFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFram
 fn forwardToStream(daemon_dispatcher: *dispatcher.Dispatcher, guid: []const u8, frame: protocol.OwnedFrame) !void {
     const registration = streamRegistration(guid) orelse return;
     const sink = registration.stream_sink orelse return;
-    sink.queueFrame(sink.ctx, daemon_dispatcher, frame) catch |err| {
+    sink.writeFrame(sink.ctx, daemon_dispatcher, frame) catch |err| {
         unregisterStream(registration.stream_fd);
         return err;
     };
@@ -262,11 +265,11 @@ pub fn forwardFromStream(options: ForwardFromStreamOptions) !void {
     const guid = options.guid;
     if (!try streamFrameIsAllowed(allocator, frame)) return error.UnexpectedProxyDiagnosticsFrame;
     const visible = visibleConnection(guid) orelse return;
-    visible.writer.queueFrame(frame.message_type, frame.payload) catch |err| {
+    visible.writer.writeFrame(frame.message_type, frame.payload) catch |err| {
         unregisterVisible(visible.fd);
         return err;
     };
-    try updateVisibleConnectionWatch(options.daemon_dispatcher, visible);
+    try updateVisibleConnectionSource(options.daemon_dispatcher, visible);
 }
 
 fn streamFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !bool {
@@ -299,13 +302,13 @@ test "routes diagnostics and retry by proxy guid" {
     const protocol_test_helpers = @import("../protocol/test_helpers.zig");
     const TestSink = struct {
         fd: c.fd_t,
-        writer: frame_write_queue.FrameWriteQueue,
+        writer: dispatch_io.FrameSink,
 
-        fn queueFrame(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, frame: protocol.OwnedFrame) !void {
+        fn writeFrame(ctx: *anyopaque, daemon_dispatcher: *dispatcher.Dispatcher, frame: protocol.OwnedFrame) !void {
             _ = daemon_dispatcher;
             const sink: *@This() = @ptrCast(@alignCast(ctx));
-            try sink.writer.queueFrame(frame.message_type, frame.payload);
-            _ = try sink.writer.writeReady(sink.fd);
+            try sink.writer.writeFrame(frame.message_type, frame.payload);
+            _ = try sink.writer.writeReadyTo(sink.fd);
         }
     };
 
@@ -337,14 +340,14 @@ test "routes diagnostics and retry by proxy guid" {
         .fd = visible[0],
         .guid = visible_guid,
         .reader = protocol.FrameReader.init(allocator),
-        .writer = frame_write_queue.FrameWriteQueue.init(allocator),
+        .writer = dispatch_io.FrameSink.init(.{ .allocator = allocator, .fd = -1 }),
     };
     defer visible_context.deinit(null);
     try registerVisible(allocator, guid, visible_context);
 
     var stream_sink = TestSink{
         .fd = stream[0],
-        .writer = frame_write_queue.FrameWriteQueue.init(allocator),
+        .writer = dispatch_io.FrameSink.init(.{ .allocator = allocator, .fd = -1 }),
     };
     defer stream_sink.writer.deinit();
     try registerStream(.{
@@ -353,7 +356,7 @@ test "routes diagnostics and retry by proxy guid" {
         .fd = stream[0],
         .sink = .{
             .ctx = &stream_sink,
-            .queueFrame = TestSink.queueFrame,
+            .writeFrame = TestSink.writeFrame,
         },
     });
 
@@ -370,7 +373,7 @@ test "routes diagnostics and retry by proxy guid" {
             .payload = stderr_payload,
         },
     });
-    _ = try visible_context.writer.writeReady(visible[0]);
+    _ = try visible_context.writer.writeReadyTo(visible[0]);
 
     var visible_frame = try protocol_test_helpers.readFrameForTest(allocator, visible[1]);
     defer visible_frame.deinit(allocator);

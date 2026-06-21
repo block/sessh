@@ -89,21 +89,21 @@ pub const State = struct {
         };
         if (bytes.len > 0) {
             self.input_during_disconnect = true;
-            try self.alertDisconnectedInput(options.terminal_fds.output, options.now_ms);
+            try self.alertDisconnectedInput(blocking, options.terminal_fds.output, options.now_ms);
         }
         return .wait_elapsed;
     }
 
-    pub fn refreshDisconnectedInputFlash(self: *State, output_fd: c.fd_t, now_ms: u64) !void {
+    pub fn refreshDisconnectedInputFlash(self: *State, blocking: core_blocking.Blocking, output_fd: c.fd_t, now_ms: u64) !void {
         if (self.disconnected_input_flash_until_ms <= 0) return;
         if (now_ms < self.disconnected_input_flash_until_ms) return;
-        try self.clearDisconnectedInputFlash(output_fd);
+        try self.clearDisconnectedInputFlash(blocking, output_fd);
     }
 
-    pub fn clearDisconnectedInputFlash(self: *State, output_fd: c.fd_t) !void {
+    pub fn clearDisconnectedInputFlash(self: *State, blocking: core_blocking.Blocking, output_fd: c.fd_t) !void {
         if (self.disconnected_input_flash_until_ms <= 0) return;
         self.disconnected_input_flash_until_ms = 0;
-        if (c.isatty(output_fd) != 0) try io_helpers.writeAll(output_fd, "\x1b[?5l");
+        if (c.isatty(output_fd) != 0) try blocking.writeAll(output_fd, "\x1b[?5l");
     }
 
     fn effectivePollTimeout(self: *const State, timeout_ms: i32, overlay_presentation: bool, now_ms: u64) i32 {
@@ -117,11 +117,11 @@ pub const State = struct {
         return @min(effective_timeout, flash_timeout);
     }
 
-    fn alertDisconnectedInput(self: *State, output_fd: c.fd_t, now_ms: u64) !void {
-        try io_helpers.writeAll(output_fd, "\x07");
+    fn alertDisconnectedInput(self: *State, blocking: core_blocking.Blocking, output_fd: c.fd_t, now_ms: u64) !void {
+        try blocking.writeAll(output_fd, "\x07");
         if (c.isatty(output_fd) == 0) return;
         if (self.disconnected_input_flash_until_ms <= 0) {
-            try io_helpers.writeAll(output_fd, "\x1b[?5h");
+            try blocking.writeAll(output_fd, "\x1b[?5h");
         }
         self.disconnected_input_flash_until_ms = now_ms +| disconnected_input_flash_ms;
     }
@@ -159,7 +159,7 @@ test "reconnect input returns reconnect_now for ctrl-r" {
     defer posix.close(output[0]);
     defer posix.close(output[1]);
 
-    try io_helpers.writeAll(input[1], &.{reconnect_control.ctrl_r});
+    try core_blocking.fromTest().writeAll(input[1], &.{reconnect_control.ctrl_r});
 
     var state = State{};
     try std.testing.expectEqual(
@@ -187,7 +187,7 @@ test "reconnect input records ordinary input during disconnect" {
     defer posix.close(output[0]);
     defer posix.close(output[1]);
 
-    try io_helpers.writeAll(input[1], "x");
+    try core_blocking.fromTest().writeAll(input[1], "x");
 
     var state = State{};
     try std.testing.expectEqual(

@@ -29,39 +29,6 @@ pub fn noteWrite(fd: c.fd_t, bytes: []const u8) void {
     if (write_hook) |hook| hook(fd, bytes);
 }
 
-// Convenience helpers for callers that know their fd is ready or blocking is
-// acceptable at the syscall itself. The wait loops live in core/blocking.zig so
-// foreground blocking remains visible through a Blocking token.
-pub fn readExact(fd: c.fd_t, buf: []u8) !void {
-    var offset: usize = 0;
-    while (offset < buf.len) {
-        const n = c.read(fd, buf[offset..].ptr, buf.len - offset);
-        if (n < 0) switch (posix.errno(n)) {
-            .AGAIN => return error.WouldBlock,
-            .INTR => continue,
-            else => return error.ReadFailed,
-        };
-        if (n == 0) return error.EndOfStream;
-        offset += @intCast(n);
-    }
-    noteRead(fd, buf);
-}
-
-pub fn writeAll(fd: c.fd_t, bytes: []const u8) !void {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const n = c.write(fd, bytes[offset..].ptr, bytes.len - offset);
-        if (n < 0) switch (posix.errno(n)) {
-            .AGAIN => return error.WouldBlock,
-            .INTR => continue,
-            else => return error.WriteFailed,
-        };
-        if (n == 0) return error.WriteFailed;
-        offset += @intCast(n);
-    }
-    noteWrite(fd, bytes);
-}
-
 pub const WriteSomeResult = union(enum) {
     wrote: usize,
     would_block,
@@ -112,13 +79,8 @@ pub fn writeSomeNonBlocking(fd: c.fd_t, bytes: []const u8) !WriteSomeResult {
     }
 }
 
-pub fn stderrPrint(comptime fmt: []const u8, args: anytype) !void {
-    var buf: [1024]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, fmt, args);
-    try writeAll(posix.STDERR_FILENO, text);
-}
-
 test "readSomeNonBlocking reports bytes, would-block, and eof" {
+    const blocking = @import("blocking.zig").fromTest();
     const pipe_fds = try posix.pipe();
     var read_end = core_fds.OwnedFd.init(pipe_fds[0]);
     defer read_end.deinit();
@@ -128,7 +90,7 @@ test "readSomeNonBlocking reports bytes, would-block, and eof" {
     var buf: [8]u8 = undefined;
     try std.testing.expectEqual(ReadSomeResult.would_block, try readSomeNonBlocking(read_end.get(), &buf));
 
-    try writeAll(write_end.get(), "abc");
+    try blocking.writeAll(write_end.get(), "abc");
     switch (try readSomeNonBlocking(read_end.get(), &buf)) {
         .bytes => |bytes| try std.testing.expectEqualStrings("abc", bytes),
         else => return error.ExpectedBytes,

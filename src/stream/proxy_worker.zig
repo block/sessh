@@ -16,7 +16,7 @@ const non_suspending_timer = @import("../core/non_suspending_timer.zig");
 const daemon_log = @import("../daemon/log.zig");
 const protocol = @import("../protocol/mod.zig");
 const protocol_test_helpers = if (builtin.is_test) @import("../protocol/test_helpers.zig") else struct {};
-const frame_write_queue = @import("../transport/frame_write_queue.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const client_log = @import("../core/client_log.zig");
 const proxy_diagnostics = @import("proxy_diagnostics_channel.zig");
 const reconnect = @import("../reconnect/mod.zig");
@@ -63,7 +63,7 @@ pub const handleProxyMuxOpen = mux_proxy.handleProxyMuxOpen;
 pub const forwardProxyRemoteFrameToMux = mux_proxy.forwardProxyRemoteFrameToMux;
 pub const handleProxyRemoteControlFrame = mux_proxy.handleProxyRemoteControlFrame;
 pub const findProxyMuxStreamIndex = mux_proxy.findProxyMuxStreamIndex;
-pub const findProxyMuxStreamIndexByWatch = mux_proxy.findProxyMuxStreamIndexByWatch;
+pub const findProxyMuxStreamIndexBySource = mux_proxy.findProxyMuxStreamIndexBySource;
 pub const drainProxyProcessWrites = mux_proxy.drainProxyProcessWrites;
 const StreamReconnectStatus = status_output.Status;
 
@@ -147,7 +147,7 @@ const StreamActiveClient = struct {
     state: *StreamState,
     transport_fds: TransportFds,
     transport_reader: protocol.FrameReader,
-    transport_writer: frame_write_queue.FrameWriteQueue = undefined,
+    transport_writer: dispatch_io.FrameSink = undefined,
     transport_writer_initialized: bool = false,
     control_reader: proxy_diagnostics.Reader,
     options: StreamActiveClientOptions,
@@ -171,7 +171,7 @@ const StreamActiveClient = struct {
             .state = state,
             .transport_fds = transport_fds,
             .transport_reader = protocol.FrameReader.init(state.allocator),
-            .transport_writer = frame_write_queue.FrameWriteQueue.init(state.allocator),
+            .transport_writer = dispatch_io.FrameSink.init(.{ .allocator = state.allocator, .fd = -1 }),
             .transport_writer_initialized = true,
             .control_reader = proxy_diagnostics.Reader.init(state.allocator),
             .options = options,
@@ -192,22 +192,22 @@ const StreamActiveClient = struct {
 
     fn ensureTransportWriter(self: *StreamActiveClient) void {
         if (self.transport_writer_initialized) return;
-        self.transport_writer = frame_write_queue.FrameWriteQueue.init(self.state.allocator);
+        self.transport_writer = dispatch_io.FrameSink.init(.{ .allocator = self.state.allocator, .fd = -1 });
         self.transport_writer_initialized = true;
     }
 
     fn hasPendingTransportWrite(self: *StreamActiveClient) bool {
-        return self.transport_writer_initialized and self.transport_writer.hasPending();
+        return self.transport_writer_initialized and self.transport_writer.hasPendingWrite();
     }
 
-    fn queueDaemonTunnelPayload(self: *StreamActiveClient, payload: protocol.DaemonTunnelPayload) !void {
+    fn writeDaemonTunnelPayload(self: *StreamActiveClient, payload: protocol.DaemonTunnelPayload) !void {
         self.ensureTransportWriter();
-        try self.transport_writer.queueDaemonTunnelPayload(payload);
+        try self.transport_writer.writeDaemonTunnelPayload(payload);
     }
 
-    fn queueMuxStreamFrame(self: *StreamActiveClient, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
+    fn writeMuxStreamFrame(self: *StreamActiveClient, message: pb.DaemonTunnelItem.MuxStreamFrame) !void {
         self.ensureTransportWriter();
-        try self.transport_writer.queueMuxStreamFrame(message);
+        try self.transport_writer.writeMuxStreamFrame(message);
     }
 
     const ResumeMessageMode = enum {
@@ -219,14 +219,14 @@ const StreamActiveClient = struct {
         // Every proxy transport starts by advertising the inbound offset it has
         // already delivered. Replacement transports may also resend the proxy
         // open payload so the other side can rebuild stream routing.
-        try self.queueMuxStreamFrame(.{
+        try self.writeMuxStreamFrame(.{
             .stream_id = proxy_mux_stream_id,
             .message = .{ .open = .{
                 .recv_next_offset = self.state.inbound.recv_next_offset,
             } },
         });
         if (mode != .send_proxy_open) return;
-        try self.queueMuxStreamFrame(.{
+        try self.writeMuxStreamFrame(.{
             .stream_id = proxy_mux_stream_id,
             .message = .{ .payload = .{
                 .offset = 0,
@@ -240,7 +240,7 @@ const StreamActiveClient = struct {
     }
 
     fn queueOpenOk(self: *StreamActiveClient) !void {
-        try self.queueMuxStreamFrame(.{
+        try self.writeMuxStreamFrame(.{
             .stream_id = proxy_mux_stream_id,
             .message = .{ .open_ok = .{
                 .recv_next_offset = self.state.inbound.recv_next_offset,
@@ -249,7 +249,7 @@ const StreamActiveClient = struct {
     }
 
     fn queueAck(self: *StreamActiveClient, offset: u64) !void {
-        try self.queueMuxStreamFrame(.{
+        try self.writeMuxStreamFrame(.{
             .stream_id = proxy_mux_stream_id,
             .message = .{ .ack = .{
                 .recv_next_offset = offset,
@@ -258,18 +258,18 @@ const StreamActiveClient = struct {
     }
 
     fn queueData(self: *StreamActiveClient, payload: ProxyDataPayload) !void {
-        try self.queueMuxStreamFrame(muxProxyDataFrame(payload));
+        try self.writeMuxStreamFrame(muxProxyDataFrame(payload));
     }
 
     fn queueEof(self: *StreamActiveClient, offset: u64) !void {
-        try self.queueMuxStreamFrame(.{
+        try self.writeMuxStreamFrame(.{
             .stream_id = proxy_mux_stream_id,
             .message = .{ .eof = .{ .final_offset = offset } },
         });
     }
 
     fn queueReset(self: *StreamActiveClient, code: []const u8, message: []const u8) !void {
-        try self.queueMuxStreamFrame(protocol.muxStreamResetFrame(proxy_mux_stream_id, code, message));
+        try self.writeMuxStreamFrame(protocol.muxStreamResetFrame(proxy_mux_stream_id, code, message));
     }
 
     // Queue outbound data/EOS that the peer has not acknowledged yet. The same
@@ -311,9 +311,9 @@ const StreamActiveClient = struct {
         }
     }
 
-    fn drainTransportWrites(self: *StreamActiveClient) !frame_write_queue.WriteQueueStatus {
+    fn drainTransportWrites(self: *StreamActiveClient) !dispatch_io.SinkWriteStatus {
         if (!self.transport_writer_initialized) return .drained;
-        return self.transport_writer.writeReady(self.transport_fds.write);
+        return self.transport_writer.writeReadyTo(self.transport_fds.write);
     }
 
     fn hasPendingSinkWrite(self: *const StreamActiveClient) bool {
@@ -383,7 +383,7 @@ const StreamActiveClient = struct {
         if (!poll.hasFdEvent()) {
             if (self.liveness.timedOut(now_after_poll_ms)) return .unresponsive;
             if (self.liveness.pingDue(now_after_poll_ms)) {
-                if (!self.hasPendingTransportWrite()) try self.queueDaemonTunnelPayload(.{ .ping = .{} });
+                if (!self.hasPendingTransportWrite()) try self.writeDaemonTunnelPayload(.{ .ping = .{} });
                 self.liveness.notePingSent(now_after_poll_ms);
                 return .progress;
             }
@@ -1130,9 +1130,9 @@ fn handleTransportFrame(
         .error_message => {
             var message = try protocol.decodePayload(protocol.hpb.Error, active_client.state.allocator, mutable.payload);
             defer message.deinit(active_client.state.allocator);
-            try io.stderrPrint("sessh: {s}\n", .{message.message});
+            try options.blocking.stderrPrint("sessh: {s}\n", .{message.message});
             if (message.hint) |hint| {
-                if (hint.len > 0) try io.stderrPrint("{s}\n", .{hint});
+                if (hint.len > 0) try options.blocking.stderrPrint("{s}\n", .{hint});
             }
             return error.StreamReset;
         },
@@ -1165,7 +1165,7 @@ fn handleTransportControlFrame(
             // A ping response must not make frame decoding depend on a
             // successful write to the same fd. Queueing keeps transport
             // liveness on the same nonblocking path as other control output.
-            try active_client.queueDaemonTunnelPayload(.{ .pong = .{} });
+            try active_client.writeDaemonTunnelPayload(.{ .pong = .{} });
         },
         .pong => {},
     }
@@ -1269,7 +1269,7 @@ fn handleInboundEof(
 
 const test_frames = if (builtin.is_test) struct {
     // Test helpers use blocking writes only to build pipe fixtures. Production
-    // proxy-stream output goes through StreamActiveClient's FrameWriteQueue so a
+    // proxy-stream output goes through StreamActiveClient's FrameSink so a
     // stalled transport cannot block the worker state machine.
     const SendDataRequest = struct {
         state: *StreamState,
@@ -1706,7 +1706,7 @@ const test_support = if (builtin.is_test) struct {
                 .write = transport_write_fd,
             },
             .transport_reader = protocol.FrameReader.init(std.testing.allocator),
-            .transport_writer = frame_write_queue.FrameWriteQueue.init(std.testing.allocator),
+            .transport_writer = dispatch_io.FrameSink.init(.{ .allocator = std.testing.allocator, .fd = -1 }),
             .transport_writer_initialized = true,
             .control_reader = proxy_diagnostics.Reader.init(std.testing.allocator),
             .options = options,
@@ -1715,7 +1715,7 @@ const test_support = if (builtin.is_test) struct {
     }
 
     fn drainActiveClient(active_client: *StreamActiveClient) !void {
-        try std.testing.expectEqual(frame_write_queue.WriteQueueStatus.drained, try active_client.drainTransportWrites());
+        try std.testing.expectEqual(dispatch_io.SinkWriteStatus.drained, try active_client.drainTransportWrites());
     }
 
     fn fillPipe(write_fd: c.fd_t) !void {
@@ -1841,7 +1841,7 @@ test "stream receiver keeps suffix from overlapping data frame" {
     try test_support.drainActiveClient(&active_client);
 
     var delivered: [6]u8 = undefined;
-    try io.readExact(sink[0], &delivered);
+    try core_blocking.fromTest().readExact(sink[0], &delivered);
     try std.testing.expectEqualStrings("second", delivered[0..]);
 
     try test_support.expectAckFrame(ack[0], 11);

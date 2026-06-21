@@ -10,7 +10,6 @@ const config = @import("core/config.zig");
 const dispatcher = @import("core/dispatcher.zig");
 const daemon = @import("daemon/mod.zig");
 const daemon_client = @import("daemon/client.zig");
-const io = @import("core/io.zig");
 const process_exit = @import("core/process_exit.zig");
 const user_error = @import("core/user_error.zig");
 const terminal_worker = @import("session/terminal_worker.zig");
@@ -34,7 +33,7 @@ pub fn main() !void {
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
-        user_error.printLine("error: {t}", .{err}) catch {};
+        user_error.printLine(blocking, "error: {t}", .{err}) catch {};
         std.process.exit(1);
     };
     dispatcher.deinitGlobal();
@@ -72,14 +71,14 @@ fn runMain(blocking: core_blocking.Blocking) !void {
         return proxy_worker_process.run(blocking, allocator, args[1..]);
     }
 
-    if (args.len == 1) return usage(0);
+    if (args.len == 1) return usage(blocking, 0);
 
     if (std.mem.eql(u8, args[1], ":daemon:")) {
-        return daemon.reexecDaemonOrRun(allocator, args[0], args[2..]);
+        return daemon.reexecDaemonOrRun(blocking, allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":broker:")) {
-        return daemon.reexecBrokerOrForward(allocator, args[0], args[2..]);
+        return daemon.reexecBrokerOrForward(blocking, allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":terminal-remote:")) {
@@ -90,9 +89,9 @@ fn runMain(blocking: core_blocking.Blocking) !void {
         return proxy_worker_process.run(blocking, allocator, args[2..]);
     }
 
-    if (topLevelArgIs(args, &.{ "--help", "-h" })) return usage(0);
+    if (topLevelArgIs(args, &.{ "--help", "-h" })) return usage(blocking, 0);
     if (topLevelArgIs(args, &.{"--version"}) or sesshShortVersionRequested(args)) {
-        try io.writeAll(posix.STDOUT_FILENO, "sessh " ++ config.version ++ "\n");
+        try blocking.writeAll(posix.STDOUT_FILENO, "sessh " ++ config.version ++ "\n");
         return;
     }
     if (topLevelArgIs(args, &.{"--daemon-log"})) return daemon_client.printDaemonLog(blocking, allocator, args[0]);
@@ -141,7 +140,7 @@ test "user manual documents public usage options and config defaults" {
     }
 }
 
-fn usage(code: u8) !void {
+fn usage(blocking: core_blocking.Blocking, code: u8) !void {
     const text =
         \\usage:
         \\  sessh [ssh-option ...] destination [command argument ...]
@@ -155,7 +154,7 @@ fn usage(code: u8) !void {
         \\  https://github.com/block/sessh/blob/main/docs/USER_MANUAL.md
         \\
     ;
-    try io.writeAll(if (code == 0) posix.STDOUT_FILENO else posix.STDERR_FILENO, text);
+    try blocking.writeAll(if (code == 0) posix.STDOUT_FILENO else posix.STDERR_FILENO, text);
     return process_exit.request(code);
 }
 

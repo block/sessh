@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
+const core_blocking = @import("../core/blocking.zig");
 const config = @import("../core/config.zig");
 const io = @import("../core/io.zig");
 const process_exit = @import("../core/process_exit.zig");
@@ -46,12 +47,12 @@ pub const Recorder = struct {
         self.* = undefined;
     }
 
-    pub fn warnEnabled(self: *const Recorder) !void {
-        try io.writeAll(posix.STDERR_FILENO, "sessh: WARNING: tty transcript capture is enabled.\r\n");
-        try io.writeAll(posix.STDERR_FILENO, "sessh: WARNING: captured data may include passwords, tokens, pasted text, private keys, terminal output, and command history.\r\n");
-        try io.writeAll(posix.STDERR_FILENO, "sessh: WARNING: transcript bytes are buffered in memory and written only on clean exit to: ");
-        try io.writeAll(posix.STDERR_FILENO, self.path);
-        try io.writeAll(posix.STDERR_FILENO, "\r\n");
+    pub fn warnEnabled(self: *const Recorder, blocking: core_blocking.Blocking) !void {
+        try blocking.writeAll(posix.STDERR_FILENO, "sessh: WARNING: tty transcript capture is enabled.\r\n");
+        try blocking.writeAll(posix.STDERR_FILENO, "sessh: WARNING: captured data may include passwords, tokens, pasted text, private keys, terminal output, and command history.\r\n");
+        try blocking.writeAll(posix.STDERR_FILENO, "sessh: WARNING: transcript bytes are buffered in memory and written only on clean exit to: ");
+        try blocking.writeAll(posix.STDERR_FILENO, self.path);
+        try blocking.writeAll(posix.STDERR_FILENO, "\r\n");
     }
 
     pub fn record(self: *Recorder, stream: Stream, bytes: []const u8) void {
@@ -201,9 +202,9 @@ fn finishActive() !void {
     if (active_recorder) |recorder| try recorder.finish();
 }
 
-pub fn finishActiveOrReport() !void {
+pub fn finishActiveOrReport(blocking: core_blocking.Blocking) !void {
     finishActive() catch |err| {
-        try io.stderrPrint("sessh: failed to write tty transcript: {t}\n", .{err});
+        try blocking.stderrPrint("sessh: failed to write tty transcript: {t}\n", .{err});
         return process_exit.request(1);
     };
 }

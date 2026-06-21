@@ -5,7 +5,7 @@ const std = @import("std");
 const c = std.c;
 const posix = std.posix;
 
-const io = @import("../core/io.zig");
+const core_blocking = @import("../core/blocking.zig");
 const protocol = @import("../protocol/mod.zig");
 const pb = protocol.pb;
 
@@ -43,87 +43,88 @@ pub const Event = enum {
     }
 };
 
-fn writeEvent(fd: c.fd_t, event: Event) !void {
-    try io.writeAll(fd, "{\"event\":");
-    try writeString(fd, event.label());
-    try io.writeAll(fd, "}\n");
+fn writeEvent(blocking: core_blocking.Blocking, fd: c.fd_t, event: Event) !void {
+    try blocking.writeAll(fd, "{\"event\":");
+    try writeString(blocking, fd, event.label());
+    try blocking.writeAll(fd, "}\n");
 }
 
-fn writeMessage(fd: c.fd_t, event: Event, message: []const u8) !void {
-    try io.writeAll(fd, "{\"event\":");
-    try writeString(fd, event.label());
-    try io.writeAll(fd, ",\"message\":");
-    try writeString(fd, message);
-    try io.writeAll(fd, "}\n");
+fn writeMessage(blocking: core_blocking.Blocking, fd: c.fd_t, event: Event, message: []const u8) !void {
+    try blocking.writeAll(fd, "{\"event\":");
+    try writeString(blocking, fd, event.label());
+    try blocking.writeAll(fd, ",\"message\":");
+    try writeString(blocking, fd, message);
+    try blocking.writeAll(fd, "}\n");
 }
 
-pub fn writeRetryScheduled(fd: c.fd_t, retry_at_unix_ms: u64) !void {
+pub fn writeRetryScheduled(blocking: core_blocking.Blocking, fd: c.fd_t, retry_at_unix_ms: u64) !void {
     var buf: [128]u8 = undefined;
     const line = try std.fmt.bufPrint(
         &buf,
         "{{\"event\":\"retry_scheduled\",\"retry_at_unix_ms\":{}}}\n",
         .{retry_at_unix_ms},
     );
-    try io.writeAll(fd, line);
+    try blocking.writeAll(fd, line);
 }
 
-fn writeRetryNow(fd: c.fd_t) !void {
-    try writeEvent(fd, .retry_now);
+fn writeRetryNow(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
+    try writeEvent(blocking, fd, .retry_now);
 }
 
-pub fn writeConnectionEvent(fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
+pub fn writeConnectionEvent(blocking: core_blocking.Blocking, fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
     switch (event) {
-        .binary_bootstrapping => try writeEvent(fd, .binary_bootstrapping),
-        .daemon_connecting => try writeEvent(fd, .daemon_connecting),
-        .daemon_connected => try writeEvent(fd, .daemon_connected),
-        .daemon_disconnected => try writeEvent(fd, .daemon_disconnected),
-        .unresponsive => try writeEvent(fd, .unresponsive),
-        .ssh_connecting => try writeEvent(fd, .ssh_connecting),
-        .ssh_connected => try writeEvent(fd, .ssh_connected),
-        .ssh_stderr => |stderr| try writeMessage(fd, .ssh_stderr, stderr.data),
+        .binary_bootstrapping => try writeEvent(blocking, fd, .binary_bootstrapping),
+        .daemon_connecting => try writeEvent(blocking, fd, .daemon_connecting),
+        .daemon_connected => try writeEvent(blocking, fd, .daemon_connected),
+        .daemon_disconnected => try writeEvent(blocking, fd, .daemon_disconnected),
+        .unresponsive => try writeEvent(blocking, fd, .unresponsive),
+        .ssh_connecting => try writeEvent(blocking, fd, .ssh_connecting),
+        .ssh_connected => try writeEvent(blocking, fd, .ssh_connected),
+        .ssh_stderr => |stderr| try writeMessage(blocking, fd, .ssh_stderr, stderr.data),
     }
 }
 
-pub fn writeDiagnostic(fd: c.fd_t, message: []const u8) !void {
-    try writeMessage(fd, .diagnostic, message);
+pub fn writeDiagnostic(blocking: core_blocking.Blocking, fd: c.fd_t, message: []const u8) !void {
+    try writeMessage(blocking, fd, .diagnostic, message);
 }
 
-pub fn writeStatus(fd: c.fd_t, message: []const u8) !void {
-    try writeMessage(fd, .status, message);
+pub fn writeStatus(blocking: core_blocking.Blocking, fd: c.fd_t, message: []const u8) !void {
+    try writeMessage(blocking, fd, .status, message);
 }
 
-fn writeFinalFailure(fd: c.fd_t, message: []const u8) !void {
-    try writeMessage(fd, .final_failure, message);
+fn writeFinalFailure(blocking: core_blocking.Blocking, fd: c.fd_t, message: []const u8) !void {
+    try writeMessage(blocking, fd, .final_failure, message);
 }
 
-fn writeString(fd: c.fd_t, value: []const u8) !void {
+fn writeString(blocking: core_blocking.Blocking, fd: c.fd_t, value: []const u8) !void {
     // Minimal JSON string writer for diagnostics. It escapes control characters
     // so JSONL consumers can parse each event as one physical line.
-    try io.writeAll(fd, "\"");
+    try blocking.writeAll(fd, "\"");
     for (value) |byte| switch (byte) {
-        '"' => try io.writeAll(fd, "\\\""),
-        '\\' => try io.writeAll(fd, "\\\\"),
-        '\n' => try io.writeAll(fd, "\\n"),
-        '\r' => try io.writeAll(fd, "\\r"),
-        '\t' => try io.writeAll(fd, "\\t"),
+        '"' => try blocking.writeAll(fd, "\\\""),
+        '\\' => try blocking.writeAll(fd, "\\\\"),
+        '\n' => try blocking.writeAll(fd, "\\n"),
+        '\r' => try blocking.writeAll(fd, "\\r"),
+        '\t' => try blocking.writeAll(fd, "\\t"),
         else => {
             if (byte < 0x20) {
                 var buf: [6]u8 = undefined;
                 const escaped = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{byte});
-                try io.writeAll(fd, escaped);
+                try blocking.writeAll(fd, escaped);
             } else {
-                try io.writeAll(fd, (&[_]u8{byte})[0..]);
+                try blocking.writeAll(fd, (&[_]u8{byte})[0..]);
             }
         },
     };
-    try io.writeAll(fd, "\"");
+    try blocking.writeAll(fd, "\"");
 }
 
 test "message escapes JSON string content" {
+    const blocking = core_blocking.fromTest();
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    try writeDiagnostic(fds[1], "quote \" slash \\ newline\n tab\t control\x01");
+    try writeDiagnostic(blocking, fds[1], "quote \" slash \\ newline\n tab\t control\x01");
     posix.close(fds[1]);
 
     var buf: [256]u8 = undefined;
@@ -135,17 +136,18 @@ test "message escapes JSON string content" {
 }
 
 test "JSONL connection schema uses stable event names and fields" {
+    const blocking = core_blocking.fromTest();
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    try writeConnectionEvent(fds[1], .{ .daemon_disconnected = .{} });
-    try writeRetryScheduled(fds[1], 1700000000123);
-    try writeRetryNow(fds[1]);
-    try writeConnectionEvent(fds[1], .{ .unresponsive = .{} });
-    try writeConnectionEvent(fds[1], .{ .ssh_stderr = .{ .data = "ssh: nope\n" } });
-    try writeConnectionEvent(fds[1], .{ .daemon_connecting = .{} });
-    try writeConnectionEvent(fds[1], .{ .daemon_connected = .{} });
-    try writeFinalFailure(fds[1], "gave up");
+    try writeConnectionEvent(blocking, fds[1], .{ .daemon_disconnected = .{} });
+    try writeRetryScheduled(blocking, fds[1], 1700000000123);
+    try writeRetryNow(blocking, fds[1]);
+    try writeConnectionEvent(blocking, fds[1], .{ .unresponsive = .{} });
+    try writeConnectionEvent(blocking, fds[1], .{ .ssh_stderr = .{ .data = "ssh: nope\n" } });
+    try writeConnectionEvent(blocking, fds[1], .{ .daemon_connecting = .{} });
+    try writeConnectionEvent(blocking, fds[1], .{ .daemon_connected = .{} });
+    try writeFinalFailure(blocking, fds[1], "gave up");
     posix.close(fds[1]);
 
     var output: std.ArrayList(u8) = .empty;

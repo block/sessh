@@ -8,7 +8,6 @@ const config = @import("../core/config.zig");
 const core_blocking = @import("../core/blocking.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
-const io = @import("../core/io.zig");
 const user_error = @import("../core/user_error.zig");
 const client_config = @import("../session/client_config.zig");
 const daemon_accept = @import("accept.zig");
@@ -48,13 +47,13 @@ pub fn forwardBrokerToDaemon(blocking: core_blocking.Blocking, allocator: std.me
     return daemon_broker_bridge.forwardBrokerToDaemon(blocking, allocator, exe, args);
 }
 
-pub fn reexecBrokerOrForward(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
-    return daemon_broker_bridge.reexecBrokerOrForward(allocator, exe, args);
+pub fn reexecBrokerOrForward(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+    return daemon_broker_bridge.reexecBrokerOrForward(blocking, allocator, exe, args);
 }
 
-pub fn reexecDaemonOrRun(allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+pub fn reexecDaemonOrRun(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
     if (args.len > 1) {
-        try user_error.line(":daemon: accepts at most one daemon socket namespace");
+        try user_error.line(blocking, ":daemon: accepts at most one daemon socket namespace");
         return error.InvalidDaemonArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
@@ -79,7 +78,7 @@ pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: 
     core_fds.closeInheritedNonStdioFileDescriptorsExceptList(&.{ ready_fd, startup_lock_fd });
 
     if (args.len > 1) {
-        try user_error.line(":daemon: accepts at most one daemon socket namespace");
+        try user_error.line(blocking, ":daemon: accepts at most one daemon socket namespace");
         return error.InvalidDaemonArgs;
     }
     const dir_name = if (args.len == 1) args[0] else try socket_namespace.selectedDirName(allocator);
@@ -117,6 +116,16 @@ pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: 
         .listen_fd = listen_fd,
         .active_local_clients = &active_local_clients,
     };
+    accept_context.listen_source = try daemon_dispatcher.fdSource(listen_fd, .{ .readable = true });
+    defer accept_context.listen_source.deinit();
+    accept_context.listen_task = try dispatcher.fdDispatchTask(
+        daemon_accept.Context,
+        allocator,
+        &accept_context,
+        accept_context.listen_source,
+        daemon_accept.acceptDaemonClient,
+    );
+    defer accept_context.listen_task.deinit();
     const file_config = client_config.loadFileConfig(allocator) catch client_config.FileConfig{};
     var cleanup_context = daemon_cleanup_scheduler.Context{
         .allocator = allocator,
@@ -131,14 +140,7 @@ pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: 
         .active_local_clients = &active_local_clients,
         .last_live_work_ms = daemon_dispatcher.nowMs(),
     };
-    _ = try daemon_dispatcher.watchFd(.{
-        .fd = listen_fd,
-        .events = .{ .readable = true },
-        .handler = .{
-            .ctx = &accept_context,
-            .callback = daemon_accept.acceptDaemonClient,
-        },
-    });
+    try accept_context.listen_task.schedule(daemon_dispatcher);
     try daemon_shutdown.watchIdle(&idle_context, daemon_dispatcher);
     try blocking.runLoop();
 }

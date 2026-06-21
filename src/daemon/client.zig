@@ -6,6 +6,7 @@ const c = std.c;
 const posix = std.posix;
 
 const core_blocking = @import("../core/blocking.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const io = @import("../core/io.zig");
 const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
@@ -121,9 +122,9 @@ pub fn printDaemonLog(blocking: core_blocking.Blocking, allocator: std.mem.Alloc
 
     const fd = try connectOrStartForDirName(blocking, allocator, exe, dir_name);
     defer _ = c.close(fd);
-    try io.writeAll(posix.STDOUT_FILENO, "daemon socket ");
-    try io.writeAll(posix.STDOUT_FILENO, path);
-    try io.writeAll(posix.STDOUT_FILENO, "\n");
+    try blocking.writeAll(posix.STDOUT_FILENO, "daemon socket ");
+    try blocking.writeAll(posix.STDOUT_FILENO, path);
+    try blocking.writeAll(posix.STDOUT_FILENO, "\n");
 
     var subscriber = try DaemonLogSubscriber.init(blocking, allocator, fd, posix.STDOUT_FILENO);
     defer subscriber.deinit();
@@ -144,7 +145,8 @@ const DaemonLogSubscriber = struct {
     output_fd: c.fd_t,
     reader: protocol.FrameReader,
     request_writer: ?protocol.FrameWriteState,
-    watch_id: ?dispatcher.FdWatchId = null,
+    source: dispatcher.Source,
+    task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
     err: ?anyerror = null,
 
     fn init(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, daemon_fd: c.fd_t, output_fd: c.fd_t) !DaemonLogSubscriber {
@@ -161,24 +163,29 @@ const DaemonLogSubscriber = struct {
             .output_fd = output_fd,
             .reader = protocol.FrameReader.init(allocator),
             .request_writer = request_writer,
+            .source = try dispatcher.get().fdSource(daemon_fd, .{ .writable = true }),
         };
     }
 
     fn deinit(self: *DaemonLogSubscriber) void {
+        self.task.deinit();
+        self.source.deinit();
         if (self.request_writer) |*writer| writer.deinit();
         self.reader.deinit();
         self.* = undefined;
     }
 
     fn run(self: *DaemonLogSubscriber) !void {
-        self.watch_id = try self.dispatcher.watchFd(.{
-            .fd = self.daemon_fd,
-            .events = .{ .writable = true },
-            .handler = .{
-                .ctx = self,
-                .callback = handleDaemonLogEvent,
-            },
-        });
+        if (!self.task.isInitialized()) {
+            self.task = try dispatcher.fdDispatchTask(
+                DaemonLogSubscriber,
+                self.allocator,
+                self,
+                self.source,
+                handleDaemonLogEvent,
+            );
+        }
+        try self.task.schedule(self.dispatcher);
         _ = try self.blocking.loop();
         if (self.err) |err| return err;
     }
@@ -195,7 +202,7 @@ const DaemonLogSubscriber = struct {
                 defer entry.deinit(self.allocator);
                 const line = try daemonLogLine(self.allocator, entry.unix_ms, entry.message);
                 defer self.allocator.free(line);
-                try io.writeAll(self.output_fd, line);
+                try self.blocking.writeAll(self.output_fd, line);
             },
             else => return error.UnexpectedDaemonFrame,
         }
@@ -203,12 +210,12 @@ const DaemonLogSubscriber = struct {
 };
 
 fn finishDaemonLogRequest(subscriber: *DaemonLogSubscriber, event_dispatcher: *dispatcher.Dispatcher) !void {
+    _ = event_dispatcher;
     if (subscriber.request_writer) |*writer| {
         writer.deinit();
         subscriber.request_writer = null;
     }
-    const watch_id = subscriber.watch_id orelse return;
-    try event_dispatcher.updateFdEvents(watch_id, .{ .readable = true });
+    subscriber.source.setFdEvents(.{ .readable = true });
 }
 
 fn writeDaemonLogRequest(
@@ -228,59 +235,48 @@ fn writeDaemonLogRequest(
 }
 
 fn handleDaemonLogEvent(
-    ctx: *anyopaque,
-    handler_event: dispatcher.HandlerEvent,
-) !void {
+    subscriber: *DaemonLogSubscriber,
+    event_dispatcher: *dispatcher.Dispatcher,
+    task: *dispatcher.DispatchTask,
+    fd_event: dispatcher.FdEvent,
+) !dispatch_io.DispatchTaskStatus {
+    _ = task;
     // `sessh --daemon-log` first writes a subscription request, then switches
     // the same socket to a read-only stream of log frames. Keeping both phases
     // in one watch avoids a helper thread just to tail daemon output.
-    const event_dispatcher = handler_event.dispatcher;
-    const id = handler_event.id;
-    const event = handler_event.event;
-    const subscriber: *DaemonLogSubscriber = @ptrCast(@alignCast(ctx));
-    const watch_id = subscriber.watch_id orelse return;
-    switch (id) {
-        .fd => |fd_id| if (fd_id.index != watch_id.index or fd_id.generation != watch_id.generation) return,
-        .timer => return,
-    }
-
-    const fd_event = switch (event) {
-        .fd => |fd| fd,
-        .timer => return,
-    };
     if (fd_event.error_event or fd_event.invalid) {
         subscriber.stop(error.DaemonTransportClosed);
-        return;
+        return .done;
     }
     if (subscriber.request_writer != null and try writeDaemonLogRequest(subscriber, event_dispatcher, fd_event)) {
         if (fd_event.hangup) subscriber.stop(null);
-        return;
+        return .pending;
     }
     if (!fd_event.readable) {
         if (fd_event.hangup) subscriber.stop(null);
-        return;
+        return if (fd_event.hangup) .done else .pending;
     }
     while (true) {
         switch (try subscriber.reader.readReady(subscriber.daemon_fd)) {
             .blocked, .progress => {
                 if (fd_event.hangup) subscriber.stop(null);
-                return;
+                return if (fd_event.hangup) .done else .pending;
             },
             .frame => |frame| {
                 var owned_frame = frame;
                 defer owned_frame.deinit(subscriber.allocator);
                 subscriber.handleFrame(&owned_frame) catch |err| {
                     subscriber.stop(err);
-                    return;
+                    return .done;
                 };
             },
             .eof => {
                 subscriber.stop(null);
-                return;
+                return .done;
             },
             .truncated_frame => {
                 subscriber.stop(error.TruncatedFrame);
-                return;
+                return .done;
             },
         }
     }

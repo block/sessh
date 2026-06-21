@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 
 const app_allocator = @import("../core/app_allocator.zig");
+const core_blocking = @import("../core/blocking.zig");
 const client_loop = @import("client_loop.zig");
 const fixed_buffer = @import("../core/fixed_buffer.zig");
 const guid_ref = @import("../core/guid.zig");
@@ -91,13 +92,13 @@ pub const VisibleClientSessionState = struct {
         self.input_ack_tracker.discardPending();
     }
 
-    pub fn restoreVisibleClientEndPresentation(self: *VisibleClientSessionState) void {
-        presentation_guard.restoreVisibleClientEndBytes(&self.visible_client_end_restore);
+    pub fn restoreVisibleClientEndPresentation(self: *VisibleClientSessionState, blocking: core_blocking.Blocking) void {
+        presentation_guard.restoreVisibleClientEndBytes(blocking, &self.visible_client_end_restore);
     }
 
-    pub fn restoreVisibleClientEndPresentationForExit(self: *VisibleClientSessionState) void {
-        self.restoreVisibleClientEndPresentation();
-        presentation_guard.restoreLocal(self.initial_kitty_keyboard_flags);
+    pub fn restoreVisibleClientEndPresentationForExit(self: *VisibleClientSessionState, blocking: core_blocking.Blocking) void {
+        self.restoreVisibleClientEndPresentation(blocking);
+        presentation_guard.restoreLocal(blocking, self.initial_kitty_keyboard_flags);
     }
 
     pub fn deinit(self: *VisibleClientSessionState) void {

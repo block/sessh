@@ -13,11 +13,11 @@ pub fn run(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, args:
     var scratch = sessh_cli.Scratch{ .allocator = allocator };
     defer scratch.deinit();
     const parsed = sessh_cli.parse(&scratch, args) catch |err| {
-        try transport_ssh.printSshArgError(err);
+        try transport_ssh.printSshArgError(blocking, err);
         return process_exit.request(64);
     };
     if (std.mem.eql(u8, parsed.host, ".")) {
-        try user_error.line("\".\" is not a valid ssh host");
+        try user_error.line(blocking, "\".\" is not a valid ssh host");
         return process_exit.request(64);
     }
 

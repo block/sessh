@@ -438,7 +438,7 @@ test "readBootstrapLine returns the first line without the newline" {
     defer _ = c.close(fds[0]);
     defer _ = c.close(fds[1]);
 
-    try io.writeAll(fds[1], "MISSING linux x86_64\nextra\n");
+    try core_blocking.fromTest().writeAll(fds[1], "MISSING linux x86_64\nextra\n");
     const line = try readBootstrapLine(core_blocking.fromTest(), std.testing.allocator, fds[0], .{});
     defer std.testing.allocator.free(line);
 

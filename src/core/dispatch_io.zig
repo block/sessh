@@ -1,13 +1,15 @@
-// Dispatcher-facing IO primitives. Source and Sink are deliberately small
-// interfaces: the Dispatcher should know that a dependency can be read or
-// written, but it should not know whether that dependency is a byte stream, a
-// protobuf frame stream, or an fd-passing frame stream.
+// Dispatcher-facing IO primitives. Concrete byte/frame sources and sinks hide
+// partial read/write state from callers; the Dispatcher owns the mapping from
+// fds to these objects and uses their readiness methods to schedule work.
 const std = @import("std");
 const c = std.c;
 
+const core_blocking = @import("blocking.zig");
 const fd_passing = @import("fd_passing.zig");
 const io = @import("io.zig");
 const protocol = @import("../protocol/mod.zig");
+
+const pb = protocol.pb;
 
 pub const SourceReadStatus = enum {
     blocked,
@@ -27,80 +29,17 @@ pub const DispatchTaskStatus = enum {
     pending,
 };
 
-pub const Source = struct {
-    ctx: *anyopaque,
-    fdFn: *const fn (*anyopaque) c.fd_t,
-    readReadyFn: *const fn (*anyopaque) anyerror!SourceReadStatus,
-    hasReadyUnitFn: *const fn (*anyopaque) bool,
-
-    pub fn fd(self: Source) c.fd_t {
-        return self.fdFn(self.ctx);
-    }
-
-    pub fn readReady(self: Source) !SourceReadStatus {
-        return self.readReadyFn(self.ctx);
-    }
-
-    pub fn hasReadyUnit(self: Source) bool {
-        return self.hasReadyUnitFn(self.ctx);
-    }
-};
-
-pub const Sink = struct {
-    ctx: *anyopaque,
-    fdFn: *const fn (*anyopaque) c.fd_t,
-    writeReadyFn: *const fn (*anyopaque) anyerror!SinkWriteStatus,
-    hasQueuedBytesFn: *const fn (*anyopaque) bool,
-    belowWatermarkFn: *const fn (*anyopaque) bool,
-
-    pub fn fd(self: Sink) c.fd_t {
-        return self.fdFn(self.ctx);
-    }
-
-    pub fn writeReady(self: Sink) !SinkWriteStatus {
-        return self.writeReadyFn(self.ctx);
-    }
-
-    pub fn hasQueuedBytes(self: Sink) bool {
-        return self.hasQueuedBytesFn(self.ctx);
-    }
-
-    pub fn belowWatermark(self: Sink) bool {
-        return self.belowWatermarkFn(self.ctx);
-    }
-};
-
-pub const DispatchTask = struct {
-    ctx: *anyopaque,
-    sources: []const Source = &.{},
-    sinks: []const Sink = &.{},
-    not_before_ms: ?u64 = null,
-    runFn: *const fn (*anyopaque) anyerror!DispatchTaskStatus,
-
-    pub fn readyAt(self: DispatchTask, now_ms: u64) bool {
-        if (self.not_before_ms) |deadline| {
-            if (deadline > now_ms) return false;
-        }
-        for (self.sinks) |sink| {
-            if (!sink.belowWatermark()) return false;
-        }
-        for (self.sources) |source| {
-            if (!source.hasReadyUnit()) return false;
-        }
-        return true;
-    }
-
-    pub fn run(self: DispatchTask) !DispatchTaskStatus {
-        return self.runFn(self.ctx);
-    }
-};
-
 pub const ByteSource = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     buffer: []u8,
     filled: usize = 0,
     eof: bool = false,
+
+    pub const Read = union(enum) {
+        bytes: []const u8,
+        eof,
+    };
 
     pub fn init(allocator: std.mem.Allocator, fd: c.fd_t, capacity: usize) !ByteSource {
         return .{
@@ -115,67 +54,52 @@ pub const ByteSource = struct {
         self.* = undefined;
     }
 
-    pub fn source(self: *ByteSource) Source {
-        return .{
-            .ctx = self,
-            .fdFn = byteSourceFd,
-            .readReadyFn = byteSourceReadReady,
-            .hasReadyUnitFn = byteSourceHasReadyUnit,
-        };
-    }
-
-    pub fn queuedBytes(self: *const ByteSource) []const u8 {
-        return self.buffer[0..self.filled];
-    }
-
-    pub fn discardQueuedBytes(self: *ByteSource) void {
-        self.filled = 0;
+    pub fn read(self: *ByteSource) ?Read {
+        if (self.filled != 0) {
+            const bytes = self.buffer[0..self.filled];
+            self.filled = 0;
+            return .{ .bytes = bytes };
+        }
+        if (self.eof) {
+            self.eof = false;
+            return .eof;
+        }
+        return null;
     }
 
     pub fn readReady(self: *ByteSource) !SourceReadStatus {
-        if (self.filled == self.buffer.len) return .ready;
+        if (self.filled != 0 or self.eof) return .ready;
         switch (try io.readSomeNonBlocking(self.fd, self.buffer[self.filled..])) {
             .would_block => return .blocked,
             .eof => {
+                std.debug.assert(self.filled == 0);
                 self.eof = true;
                 return .eof;
             },
             .bytes => |bytes| {
                 self.filled += bytes.len;
-                return if (self.filled == 0) .progress else .ready;
+                return .ready;
             },
         }
     }
+    pub fn hasReadyUnit(self: *const ByteSource) bool {
+        return self.filled != 0 or self.eof;
+    }
 };
-
-fn byteSourceFd(ctx: *anyopaque) c.fd_t {
-    const self: *ByteSource = @ptrCast(@alignCast(ctx));
-    return self.fd;
-}
-
-fn byteSourceReadReady(ctx: *anyopaque) !SourceReadStatus {
-    const self: *ByteSource = @ptrCast(@alignCast(ctx));
-    return self.readReady();
-}
-
-fn byteSourceHasReadyUnit(ctx: *anyopaque) bool {
-    const self: *ByteSource = @ptrCast(@alignCast(ctx));
-    return self.filled != 0 or self.eof;
-}
 
 pub const ByteSink = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     bytes: std.ArrayList(u8) = .empty,
     written: usize = 0,
-    max_queued_bytes: usize,
+    max_pending_bytes: usize,
     low_watermark: usize,
 
     pub fn init(options: ByteSinkOptions) ByteSink {
         return .{
             .allocator = options.allocator,
             .fd = options.fd,
-            .max_queued_bytes = options.max_queued_bytes,
+            .max_pending_bytes = options.max_pending_bytes,
             .low_watermark = options.low_watermark,
         };
     }
@@ -185,22 +109,20 @@ pub const ByteSink = struct {
         self.* = undefined;
     }
 
-    pub fn sink(self: *ByteSink) Sink {
-        return .{
-            .ctx = self,
-            .fdFn = byteSinkFd,
-            .writeReadyFn = byteSinkWriteReady,
-            .hasQueuedBytesFn = byteSinkHasQueuedBytes,
-            .belowWatermarkFn = byteSinkBelowWatermark,
-        };
-    }
-
-    pub fn queuedBytes(self: *const ByteSink) usize {
+    pub fn pendingBytes(self: *const ByteSink) usize {
         return self.bytes.items.len - self.written;
     }
 
-    pub fn queueBytes(self: *ByteSink, bytes: []const u8) !void {
-        if (bytes.len > self.max_queued_bytes or self.queuedBytes() > self.max_queued_bytes - bytes.len) {
+    pub fn hasPendingWrite(self: *const ByteSink) bool {
+        return self.pendingBytes() != 0;
+    }
+
+    pub fn belowWatermark(self: *const ByteSink) bool {
+        return self.pendingBytes() <= self.low_watermark;
+    }
+
+    pub fn writeBytes(self: *ByteSink, bytes: []const u8) !void {
+        if (bytes.len > self.max_pending_bytes or self.pendingBytes() > self.max_pending_bytes - bytes.len) {
             return error.ByteSinkFull;
         }
         if (self.written == self.bytes.items.len) {
@@ -233,29 +155,9 @@ pub const ByteSink = struct {
 pub const ByteSinkOptions = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    max_queued_bytes: usize = std.math.maxInt(usize),
+    max_pending_bytes: usize = std.math.maxInt(usize),
     low_watermark: usize = 0,
 };
-
-fn byteSinkFd(ctx: *anyopaque) c.fd_t {
-    const self: *ByteSink = @ptrCast(@alignCast(ctx));
-    return self.fd;
-}
-
-fn byteSinkWriteReady(ctx: *anyopaque) !SinkWriteStatus {
-    const self: *ByteSink = @ptrCast(@alignCast(ctx));
-    return self.writeReady();
-}
-
-fn byteSinkHasQueuedBytes(ctx: *anyopaque) bool {
-    const self: *ByteSink = @ptrCast(@alignCast(ctx));
-    return self.queuedBytes() != 0;
-}
-
-fn byteSinkBelowWatermark(ctx: *anyopaque) bool {
-    const self: *ByteSink = @ptrCast(@alignCast(ctx));
-    return self.queuedBytes() <= self.low_watermark;
-}
 
 pub const FrameSource = struct {
     allocator: std.mem.Allocator,
@@ -263,6 +165,12 @@ pub const FrameSource = struct {
     reader: protocol.FrameReader,
     frames: std.ArrayList(protocol.OwnedFrame) = .empty,
     eof: bool = false,
+
+    pub const Read = union(enum) {
+        blocked,
+        eof,
+        frame: protocol.OwnedFrame,
+    };
 
     pub fn init(allocator: std.mem.Allocator, fd: c.fd_t) FrameSource {
         return .{
@@ -279,18 +187,26 @@ pub const FrameSource = struct {
         self.* = undefined;
     }
 
-    pub fn source(self: *FrameSource) Source {
-        return .{
-            .ctx = self,
-            .fdFn = frameSourceFd,
-            .readReadyFn = frameSourceReadReady,
-            .hasReadyUnitFn = frameSourceHasReadyUnit,
-        };
-    }
-
     pub fn popFrame(self: *FrameSource) ?protocol.OwnedFrame {
         if (self.frames.items.len == 0) return null;
         return self.frames.orderedRemove(0);
+    }
+
+    pub fn readFrame(self: *FrameSource) !Read {
+        if (self.popFrame()) |frame| return .{ .frame = frame };
+        if (self.eof) {
+            self.eof = false;
+            return .eof;
+        }
+        const status = try self.readReady();
+        return switch (status) {
+            .blocked, .progress => .blocked,
+            .ready => .{ .frame = self.popFrame() orelse return error.ExpectedFrame },
+            .eof => blk: {
+                self.eof = false;
+                break :blk .eof;
+            },
+        };
     }
 
     pub fn readReady(self: *FrameSource) !SourceReadStatus {
@@ -314,35 +230,23 @@ pub const FrameSource = struct {
             }
         }
     }
+    pub fn hasReadyUnit(self: *const FrameSource) bool {
+        return self.frames.items.len != 0 or self.eof;
+    }
 };
-
-fn frameSourceFd(ctx: *anyopaque) c.fd_t {
-    const self: *FrameSource = @ptrCast(@alignCast(ctx));
-    return self.fd;
-}
-
-fn frameSourceReadReady(ctx: *anyopaque) !SourceReadStatus {
-    const self: *FrameSource = @ptrCast(@alignCast(ctx));
-    return self.readReady();
-}
-
-fn frameSourceHasReadyUnit(ctx: *anyopaque) bool {
-    const self: *FrameSource = @ptrCast(@alignCast(ctx));
-    return self.frames.items.len != 0 or self.eof;
-}
 
 pub const FrameSink = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     entries: std.ArrayList(FrameSinkEntry) = .empty,
-    max_queued_bytes: usize,
+    max_pending_bytes: usize,
     low_watermark: usize,
 
     pub fn init(options: FrameSinkOptions) FrameSink {
         return .{
             .allocator = options.allocator,
             .fd = options.fd,
-            .max_queued_bytes = options.max_queued_bytes,
+            .max_pending_bytes = options.max_pending_bytes,
             .low_watermark = options.low_watermark,
         };
     }
@@ -353,27 +257,21 @@ pub const FrameSink = struct {
         self.* = undefined;
     }
 
-    pub fn sink(self: *FrameSink) Sink {
-        return .{
-            .ctx = self,
-            .fdFn = frameSinkFd,
-            .writeReadyFn = frameSinkWriteReady,
-            .hasQueuedBytesFn = frameSinkHasQueuedBytes,
-            .belowWatermarkFn = frameSinkBelowWatermark,
-        };
-    }
-
-    pub fn hasPending(self: *const FrameSink) bool {
+    pub fn hasPendingWrite(self: *const FrameSink) bool {
         return self.entries.items.len != 0;
     }
 
-    pub fn queuedBytes(self: *const FrameSink) usize {
+    pub fn pendingBytes(self: *const FrameSink) usize {
         var total: usize = 0;
-        for (self.entries.items) |*entry| total += entry.queuedBytes();
+        for (self.entries.items) |*entry| total += entry.pendingBytes();
         return total;
     }
 
-    pub fn queueFrame(
+    pub fn belowWatermark(self: *const FrameSink) bool {
+        return self.pendingBytes() <= self.low_watermark;
+    }
+
+    pub fn writeFrame(
         self: *FrameSink,
         message_type: protocol.MessageType,
         payload: []const u8,
@@ -383,18 +281,13 @@ pub const FrameSink = struct {
         try self.appendEntry(entry, null);
     }
 
-    pub fn queueFrameWithByteLimit(
-        self: *FrameSink,
-        message_type: protocol.MessageType,
-        payload: []const u8,
-        max_queued_bytes: usize,
-    ) !void {
-        var entry = try FrameSinkEntry.initFrame(self.allocator, message_type, payload);
+    pub fn writeFrameBounded(self: *FrameSink, request: BoundedFrameWrite) !void {
+        var entry = try FrameSinkEntry.initFrame(self.allocator, request.message_type, request.payload);
         errdefer entry.deinit();
-        try self.appendEntry(entry, max_queued_bytes);
+        try self.appendEntry(entry, request.max_pending_bytes);
     }
 
-    pub fn queueFrameWithScmRightsFd(
+    pub fn writeFrameWithScmRightsFd(
         self: *FrameSink,
         message_type: protocol.MessageType,
         payload: []const u8,
@@ -405,15 +298,52 @@ pub const FrameSink = struct {
         try self.appendEntry(entry, null);
     }
 
-    pub fn queueOwnedFrame(self: *FrameSink, frame: *protocol.OwnedFrame) !void {
+    pub fn writeOwnedFrame(self: *FrameSink, frame: *protocol.OwnedFrame) !void {
         if (frame.fd) |fd| {
             frame.fd = null;
-            try self.queueFrameWithScmRightsFd(frame.message_type, frame.payload, fd);
+            try self.writeFrameWithScmRightsFd(frame.message_type, frame.payload, fd);
             return;
         }
         var entry = try FrameSinkEntry.initOwnedFrame(self.allocator, frame.*);
         errdefer entry.deinit();
         try self.appendEntry(entry, null);
+    }
+
+    pub fn writeDaemonTunnelPayload(
+        self: *FrameSink,
+        payload: protocol.DaemonTunnelPayload,
+    ) !void {
+        const encoded = try protocol.encodeDaemonTunnelPayload(self.allocator, payload);
+        defer self.allocator.free(encoded);
+        try self.writeFrame(.daemon_tunnel, encoded);
+    }
+
+    pub fn writeClientRemotePayload(
+        self: *FrameSink,
+        payload: protocol.ClientRemotePayload,
+    ) !void {
+        const encoded = try protocol.encodeClientRemotePayload(self.allocator, payload);
+        defer self.allocator.free(encoded);
+        try self.writeFrame(.client_remote, encoded);
+    }
+
+    pub fn writeTerminalEmulatorPayload(
+        self: *FrameSink,
+        payload: protocol.TerminalEmulatorPayload,
+    ) !void {
+        try self.writeClientRemotePayload(.{ .terminal_emulator = .{ .payload = payload } });
+    }
+
+    pub fn writeMuxStreamFrame(
+        self: *FrameSink,
+        message: pb.DaemonTunnelItem.MuxStreamFrame,
+    ) !void {
+        try self.writeDaemonTunnelPayload(.{ .mux_stream = message });
+    }
+
+    pub fn writeReadyTo(self: *FrameSink, fd: c.fd_t) !SinkWriteStatus {
+        self.fd = fd;
+        return self.writeReady();
     }
 
     pub fn writeReady(self: *FrameSink) !SinkWriteStatus {
@@ -434,10 +364,10 @@ pub const FrameSink = struct {
     }
 
     fn appendEntry(self: *FrameSink, entry: FrameSinkEntry, override_limit: ?usize) !void {
-        const limit = override_limit orelse self.max_queued_bytes;
-        const entry_len = entry.queuedBytes();
-        if (entry_len > limit or self.queuedBytes() > limit - entry_len) {
-            return error.FrameWriteQueueFull;
+        const limit = override_limit orelse self.max_pending_bytes;
+        const entry_len = entry.pendingBytes();
+        if (entry_len > limit or self.pendingBytes() > limit - entry_len) {
+            return error.FrameSinkFull;
         }
         try self.entries.append(self.allocator, entry);
     }
@@ -446,29 +376,15 @@ pub const FrameSink = struct {
 pub const FrameSinkOptions = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    max_queued_bytes: usize = std.math.maxInt(usize),
+    max_pending_bytes: usize = std.math.maxInt(usize),
     low_watermark: usize = 0,
 };
 
-fn frameSinkFd(ctx: *anyopaque) c.fd_t {
-    const self: *FrameSink = @ptrCast(@alignCast(ctx));
-    return self.fd;
-}
-
-fn frameSinkWriteReady(ctx: *anyopaque) !SinkWriteStatus {
-    const self: *FrameSink = @ptrCast(@alignCast(ctx));
-    return self.writeReady();
-}
-
-fn frameSinkHasQueuedBytes(ctx: *anyopaque) bool {
-    const self: *FrameSink = @ptrCast(@alignCast(ctx));
-    return self.hasPending();
-}
-
-fn frameSinkBelowWatermark(ctx: *anyopaque) bool {
-    const self: *FrameSink = @ptrCast(@alignCast(ctx));
-    return self.queuedBytes() <= self.low_watermark;
-}
+pub const BoundedFrameWrite = struct {
+    message_type: protocol.MessageType,
+    payload: []const u8,
+    max_pending_bytes: usize,
+};
 
 const FrameSinkEntry = union(enum) {
     frame: protocol.FrameWriteState,
@@ -505,10 +421,10 @@ const FrameSinkEntry = union(enum) {
         self.* = undefined;
     }
 
-    fn queuedBytes(self: *const FrameSinkEntry) usize {
+    fn pendingBytes(self: *const FrameSinkEntry) usize {
         return switch (self.*) {
             .frame => |*frame| frame.bytes.len - frame.written,
-            .scm_rights_frame => |*frame| frame.queuedBytes(),
+            .scm_rights_frame => |*frame| frame.pendingBytes(),
         };
     }
 
@@ -564,7 +480,7 @@ const ScmRightsFrameWriteState = struct {
         self.* = undefined;
     }
 
-    fn queuedBytes(self: *const ScmRightsFrameWriteState) usize {
+    fn pendingBytes(self: *const ScmRightsFrameWriteState) usize {
         return self.prefix.remaining().len + self.marker.remaining().len;
     }
 
@@ -584,7 +500,7 @@ const ScmRightsFrameWriteState = struct {
     }
 };
 
-test "byte sink preserves queued byte order" {
+test "byte sink preserves pending byte order" {
     const posix = std.posix;
     const pipe = try posix.pipe();
     defer {
@@ -595,19 +511,38 @@ test "byte sink preserves queued byte order" {
     var sink = ByteSink.init(.{
         .allocator = std.testing.allocator,
         .fd = pipe[1],
-        .max_queued_bytes = 64,
+        .max_pending_bytes = 64,
     });
     defer sink.deinit();
 
-    try sink.queueBytes("ab");
-    try sink.queueBytes("cd");
-    try std.testing.expect(sink.sink().hasQueuedBytes());
-    try std.testing.expectEqual(SinkWriteStatus.drained, try sink.sink().writeReady());
+    try sink.writeBytes("ab");
+    try sink.writeBytes("cd");
+    try std.testing.expect(sink.hasPendingWrite());
+    try std.testing.expectEqual(SinkWriteStatus.drained, try sink.writeReady());
 
     var buf: [4]u8 = undefined;
     const n = c.read(pipe[0], &buf, buf.len);
     if (n < 0) return error.ReadFailed;
     try std.testing.expectEqualStrings("abcd", buf[0..@intCast(n)]);
+}
+
+test "byte source is ready after any bytes are read" {
+    const posix = std.posix;
+    const pipe = try posix.pipe();
+    defer {
+        _ = c.close(pipe[0]);
+        _ = c.close(pipe[1]);
+    }
+
+    var source = try ByteSource.init(std.testing.allocator, pipe[0], 8);
+    defer source.deinit();
+
+    try core_blocking.fromTest().writeAll(pipe[1], "x");
+    try std.testing.expectEqual(SourceReadStatus.ready, try source.readReady());
+    switch (source.read() orelse return error.ExpectedRead) {
+        .bytes => |bytes| try std.testing.expectEqualStrings("x", bytes),
+        .eof => return error.UnexpectedEof,
+    }
 }
 
 test "frame source and sink preserve frame order" {
@@ -632,8 +567,8 @@ test "frame source and sink preserve frame order" {
     } });
     defer std.testing.allocator.free(second);
 
-    try sink.queueFrame(.client_daemon, first);
-    try sink.queueFrame(.client_daemon, second);
+    try sink.writeFrame(.client_daemon, first);
+    try sink.writeFrame(.client_daemon, second);
     try std.testing.expectEqual(SinkWriteStatus.drained, try sink.writeReady());
 
     var source = FrameSource.init(std.testing.allocator, pipe[0]);
@@ -656,6 +591,7 @@ test "frame source and sink preserve frame order" {
 }
 
 test "frame sink can send an SCM_RIGHTS frame" {
+    const blocking = core_blocking.fromTest();
     var control: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &control) != 0) return error.SocketPairFailed;
     defer {
@@ -675,7 +611,7 @@ test "frame sink can send an SCM_RIGHTS frame" {
 
     const payload = try protocol.encodeClientDaemonPayload(std.testing.allocator, .{ .proxy_fd_pass_open = .{} });
     defer std.testing.allocator.free(payload);
-    try sink.queueFrameWithScmRightsFd(.client_daemon, payload, raw[0]);
+    try sink.writeFrameWithScmRightsFd(.client_daemon, payload, raw[0]);
     try std.testing.expectEqual(SinkWriteStatus.drained, try sink.writeReady());
 
     var source = FrameSource.init(std.testing.allocator, control[1]);
@@ -687,7 +623,7 @@ test "frame sink can send an SCM_RIGHTS frame" {
     const received_fd = frame.takeFd() orelse return error.ExpectedFileDescriptor;
     defer _ = c.close(received_fd);
 
-    try io.writeAll(received_fd, "raw");
+    try blocking.writeAll(received_fd, "raw");
     var buf: [3]u8 = undefined;
     const n = c.read(raw[1], &buf, buf.len);
     if (n < 0) return error.ReadFailed;

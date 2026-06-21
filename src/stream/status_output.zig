@@ -333,8 +333,8 @@ pub const Status = struct {
             },
             .binary_bootstrapping => switch (self.mode) {
                 .line => {
-                    io.writeAll(self.fd, "sessh: bootstrapping...") catch return;
-                    io.writeAll(self.fd, "\r\n") catch return;
+                    self.blocking.writeAll(self.fd, "sessh: bootstrapping...") catch return;
+                    self.blocking.writeAll(self.fd, "\r\n") catch return;
                 },
                 .status_line => {
                     self.line.setTruncate("sessh: bootstrapping...");
@@ -366,21 +366,21 @@ pub const Status = struct {
     fn writePlainStatusLine(self: *Status) void {
         if (self.mode != .line) return;
         const message = self.line.slice();
-        io.writeAll(self.fd, message) catch return;
-        io.writeAll(self.fd, "\r\n") catch return;
+        self.blocking.writeAll(self.fd, message) catch return;
+        self.blocking.writeAll(self.fd, "\r\n") catch return;
     }
 
     fn writeStatusLine(self: *Status) void {
         if (self.mode != .status_line or self.fd < 0) return;
         const message = self.line.slice();
-        io.writeAll(self.fd, "\r\x1b[K") catch return;
-        io.writeAll(self.fd, message) catch return;
+        self.blocking.writeAll(self.fd, "\r\x1b[K") catch return;
+        self.blocking.writeAll(self.fd, message) catch return;
         self.status_line_visible = true;
     }
 
     fn clearStatusLine(self: *Status) void {
         if (self.mode != .status_line or self.fd < 0 or !self.status_line_visible) return;
-        io.writeAll(self.fd, "\r\x1b[K") catch return;
+        self.blocking.writeAll(self.fd, "\r\x1b[K") catch return;
         self.status_line_visible = false;
     }
 
@@ -400,20 +400,20 @@ pub const Status = struct {
 
     fn writeJsonlRetry(self: *Status, delay_ms: u64) void {
         if (self.mode != .jsonl or self.fd < 0) return;
-        diagnostics_jsonl.writeRetryScheduled(self.fd, nowUnixMs() +| delay_ms) catch return;
+        diagnostics_jsonl.writeRetryScheduled(self.blocking, self.fd, nowUnixMs() +| delay_ms) catch return;
     }
 
     fn writeJsonlConnectionEvent(self: *Status, event: pb.ConnectionEvent.event_union) void {
         if (self.mode != .jsonl or self.fd < 0) return;
-        diagnostics_jsonl.writeConnectionEvent(self.fd, event) catch return;
+        diagnostics_jsonl.writeConnectionEvent(self.blocking, self.fd, event) catch return;
     }
 
     fn writeTitleRetry(self: *Status, delay_ms: u64) void {
         if (!self.canWriteTitle()) return;
         if (self.ctrl_r_enabled) {
-            reconnect_title.writeRetryNowTitle(self.fd, delay_ms) catch return;
+            reconnect_title.writeRetryNowTitle(self.blocking, self.fd, delay_ms) catch return;
         } else {
-            reconnect_title.writeRetryTitle(self.fd, delay_ms) catch return;
+            reconnect_title.writeRetryTitle(self.blocking, self.fd, delay_ms) catch return;
         }
         self.title_visible = true;
     }
@@ -421,9 +421,9 @@ pub const Status = struct {
     fn writeTitleReconnecting(self: *Status) void {
         if (!self.canWriteTitle()) return;
         if (self.ctrl_r_enabled) {
-            reconnect_title.writeReconnectingNowTitle(self.fd) catch return;
+            reconnect_title.writeReconnectingNowTitle(self.blocking, self.fd) catch return;
         } else {
-            reconnect_title.writeReconnectingTitle(self.fd) catch return;
+            reconnect_title.writeReconnectingTitle(self.blocking, self.fd) catch return;
         }
         self.title_visible = true;
     }
@@ -455,7 +455,7 @@ pub const Status = struct {
             self.title_tracker.titleSlice()
         else
             self.title_fallback.slice();
-        reconnect_title.writeTitle(self.fd, title) catch {};
+        reconnect_title.writeTitle(self.blocking, self.fd, title) catch {};
         self.title_visible = false;
     }
 
@@ -486,13 +486,13 @@ pub const Status = struct {
             switch (self.mode) {
                 .status_line => {
                     self.clearStatusLine();
-                    io.writeAll(self.fd, line) catch return;
-                    io.writeAll(self.fd, "\r\n") catch return;
+                    self.blocking.writeAll(self.fd, line) catch return;
+                    self.blocking.writeAll(self.fd, "\r\n") catch return;
                     if (self.connection_status_active) self.writeStatusLine();
                 },
                 .line => {
-                    io.writeAll(self.fd, line) catch return;
-                    io.writeAll(self.fd, "\r\n") catch return;
+                    self.blocking.writeAll(self.fd, line) catch return;
+                    self.blocking.writeAll(self.fd, "\r\n") catch return;
                 },
                 .jsonl => self.writeJsonlDiagnostic(line),
                 .client_control => proxy_diagnostics.writeConnectionEventForeground(self.blocking, self.fd, .{ .ssh_stderr = .{ .data = line } }) catch return,
@@ -508,16 +508,16 @@ pub const Status = struct {
     fn writeEscapeHelpText(self: *Status) void {
         if (self.fd < 0) return;
         self.escape_help_pending = false;
-        io.writeAll(self.fd, "\r\n") catch return;
+        self.blocking.writeAll(self.fd, "\r\n") catch return;
         inline for (terminal.escape_help_lines) |line| {
-            io.writeAll(self.fd, line) catch return;
-            io.writeAll(self.fd, "\r\n") catch return;
+            self.blocking.writeAll(self.fd, line) catch return;
+            self.blocking.writeAll(self.fd, "\r\n") catch return;
         }
     }
 
     fn writeJsonlDiagnostic(self: *Status, line: []const u8) void {
         if (self.mode != .jsonl or self.fd < 0) return;
-        diagnostics_jsonl.writeDiagnostic(self.fd, line) catch return;
+        diagnostics_jsonl.writeDiagnostic(self.blocking, self.fd, line) catch return;
     }
 };
 

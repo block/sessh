@@ -6,7 +6,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const c = std.c;
 const posix = std.posix;
 
-const io = @import("../core/io.zig");
+const core_blocking = @import("../core/blocking.zig");
 const terminal = @import("../tty/terminal.zig");
 
 const PrivateModeState = enum {
@@ -116,17 +116,22 @@ pub const Renderer = struct {
     output: Output,
     caps: Capabilities,
 
-    const Output = union(enum) {
+    const FdOutput = struct {
+        blocking: core_blocking.Blocking,
         fd: c.fd_t,
+    };
+
+    const Output = union(enum) {
+        fd: FdOutput,
         buffer: *std.ArrayList(u8),
     };
 
-    pub fn init(fd: c.fd_t) Renderer {
-        return .{ .output = .{ .fd = fd }, .caps = Capabilities.detectFromEnv() };
+    pub fn init(blocking: core_blocking.Blocking, fd: c.fd_t) Renderer {
+        return .{ .output = .{ .fd = .{ .blocking = blocking, .fd = fd } }, .caps = Capabilities.detectFromEnv() };
     }
 
-    pub fn withCapabilities(fd: c.fd_t, caps: Capabilities) Renderer {
-        return .{ .output = .{ .fd = fd }, .caps = caps };
+    pub fn withCapabilities(blocking: core_blocking.Blocking, fd: c.fd_t, caps: Capabilities) Renderer {
+        return .{ .output = .{ .fd = .{ .blocking = blocking, .fd = fd } }, .caps = caps };
     }
 
     pub fn buffered(buffer: *std.ArrayList(u8), caps: Capabilities) Renderer {
@@ -139,7 +144,7 @@ pub const Renderer = struct {
 
     pub fn outputFd(self: Renderer) ?c.fd_t {
         return switch (self.output) {
-            .fd => |fd| fd,
+            .fd => |fd| fd.fd,
             .buffer => null,
         };
     }
@@ -507,7 +512,7 @@ pub const Renderer = struct {
 
     fn write(self: Renderer, bytes: []const u8) !void {
         switch (self.output) {
-            .fd => |fd| try io.writeAll(fd, bytes),
+            .fd => |fd| try fd.blocking.writeAll(fd.fd, bytes),
             .buffer => |buffer| try buffer.appendSlice(app_allocator.allocator(), bytes),
         }
     }
@@ -575,7 +580,7 @@ test "render row emits style and color sequences" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     const cells = [_]Cell{.{
         .text = "X",
         .attrs = .{
@@ -599,7 +604,7 @@ test "render row wraps hyperlink cells in OSC 8" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     const cells = [_]Cell{.{
         .text = "link",
         .hyperlink = "https://example.test/",
@@ -618,7 +623,7 @@ test "set title emits an OSC title sequence" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     try renderer.setTitle("/tmp/sessh-title");
     posix.close(fds[1]);
 
@@ -631,7 +636,7 @@ test "default colors emit OSC 10 and OSC 11 sequences" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     try renderer.applyDefaultColors(.{
         .foreground = .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } },
         .background = .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } },
@@ -651,7 +656,7 @@ test "clear scrollback emits only retained scrollback clear" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     try renderer.clearScrollback();
     posix.close(fds[1]);
 
@@ -665,7 +670,7 @@ test "restore presentation does not clear or swap the screen" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     try renderer.restorePresentation(0);
 
     var buf: [512]u8 = undefined;
@@ -681,7 +686,7 @@ test "restore presentation resets every modeled local terminal side effect" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     try renderer.restorePresentation(0);
 
     var buf: [512]u8 = undefined;
@@ -707,7 +712,7 @@ test "restore presentation restores initial kitty keyboard flags" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     try renderer.restorePresentation(7);
 
     var buf: [512]u8 = undefined;
@@ -722,7 +727,7 @@ test "restore state presentation preserves input and event modes" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     try renderer.restoreOverlayPresentation();
 
     var buf: [512]u8 = undefined;
@@ -744,7 +749,7 @@ test "apply terminal modes enables input and event modes" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     try renderer.applyTerminalModes(.{
         .mode_flags = TerminalModes.application_cursor_keys |
             TerminalModes.focus_reporting |
@@ -770,7 +775,7 @@ test "apply terminal modes disables input and event modes" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
-    const renderer = Renderer.withCapabilities(fds[1], Capabilities.xterm_compatible);
+    const renderer = Renderer.withCapabilities(core_blocking.fromTest(), fds[1], Capabilities.xterm_compatible);
     try renderer.applyTerminalModes(.{});
     posix.close(fds[1]);
 
