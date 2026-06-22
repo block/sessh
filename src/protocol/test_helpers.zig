@@ -7,6 +7,7 @@ const posix = std.posix;
 
 const core_fds = @import("../core/fds.zig");
 const core_blocking = @import("../core/blocking.zig");
+const fd_passing = @import("../core/fd_passing.zig");
 const frame = @import("frame.zig");
 const typed_send = @import("typed_send.zig");
 
@@ -136,15 +137,46 @@ pub fn sendTerminalEmulatorPayloadFrameBlocking(
 }
 
 pub fn readFrameForTest(allocator: std.mem.Allocator, fd: c.fd_t) !frame.OwnedFrame {
-    var reader = frame.FrameReader.init(allocator);
-    defer reader.deinit();
+    const blocking = core_blocking.fromTest();
+    var header: [frame.frame_header_len]u8 = undefined;
+    try blocking.readExact(fd, &header);
+
+    const message_len = frame.messageLenFromHeader(&header);
+    if (message_len == 0) return error.UnknownFrame;
+    const message = try allocator.alloc(u8, message_len);
+    defer allocator.free(message);
+    try blocking.readExact(fd, message);
+
+    var decoded = try frame.decodeMessageEnvelopeAlloc(allocator, message);
+    errdefer decoded.frame.deinit(allocator);
+    if (decoded.attached_bytes_len == 0) return decoded.frame;
+
+    switch (decoded.attached_kind) {
+        .RAW => {
+            decoded.frame.attached_bytes = try allocator.alloc(u8, decoded.attached_bytes_len);
+            try blocking.readExact(fd, decoded.frame.attached_bytes);
+            return decoded.frame;
+        },
+        .SCM_RIGHTS => {
+            if (decoded.attached_bytes_len != 1) return error.InvalidFileDescriptorCarrierFrame;
+            decoded.frame.fd = try recvScmRightsForTest(fd);
+            return decoded.frame;
+        },
+        _ => return error.InvalidFrame,
+    }
+}
+
+fn recvScmRightsForTest(fd: c.fd_t) !c.fd_t {
+    var marker: [1]u8 = undefined;
+    var progress = fd_passing.RecvBufferWithFdProgress.init(&marker, null);
+    defer progress.deinit();
+
     while (true) {
-        switch (try reader.readReady(fd)) {
+        switch (try fd_passing.recvBufferWithFdProgress(fd, &progress)) {
             .blocked => try waitReadableForTest(fd),
             .progress => continue,
-            .frame => |owned_frame| return owned_frame,
-            .eof => return error.EndOfStream,
-            .truncated_frame => return error.TruncatedFrame,
+            .complete => return progress.takeFd() orelse error.MissingFileDescriptor,
+            .eof => return error.TruncatedFrame,
         }
     }
 }

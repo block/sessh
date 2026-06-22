@@ -7,9 +7,9 @@ const posix = std.posix;
 
 const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
+const core_io = @import("../core/io.zig");
 const fd_passing = @import("../core/fd_passing.zig");
 const protocol = @import("../protocol/mod.zig");
-const protocol_frame = @import("../protocol/frame.zig");
 
 const cancellation_poll_ms: i32 = 50;
 
@@ -22,43 +22,35 @@ pub const ReadOptions = struct {
 };
 
 pub fn readFrame(options: ReadOptions) !protocol.OwnedFrame {
-    // Read one complete frame during foreground setup. The loop is synchronous
-    // by design, but uses poll so callers with reconnect cancellation can wake
-    // periodically instead of blocking forever in read(2).
-    var reader = protocol_frame.FrameReader.init(options.allocator);
-    defer reader.deinit();
+    // Foreground setup/reconnect reads happen before a dispatcher-owned source
+    // owns the fd. Keep the phases explicit here instead of routing through the
+    // async FrameSource state machine.
+    var header: [protocol.frame_header_len]u8 = undefined;
+    try readExactForeground(options, &header, error.EndOfStream, error.TruncatedFrame);
 
-    // foreground setup/reconnect reads are process-local
-    // waits before a richer relay loop owns the fd. Use direct `poll(2)` here
-    // instead of allocating a helper Dispatcher; the Dispatcher abstraction is
-    // reserved for whole-process event loops.
-    while (true) {
-        if (isCancelled(options.cancelled)) return options.cancel_error;
+    const message_len = protocol.messageLenFromHeader(&header);
+    if (message_len == 0) return error.UnknownFrame;
+    const message = try options.allocator.alloc(u8, message_len);
+    defer options.allocator.free(message);
+    try readExactForeground(options, message, error.TruncatedFrame, error.TruncatedFrame);
 
-        var pollfds = [_]posix.pollfd{.{
-            .fd = options.fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const timeout_ms: i32 = if (options.cancelled == null) -1 else cancellation_poll_ms;
-        _ = try options.blocking.poll(pollfds[0..], timeout_ms);
-        if (isCancelled(options.cancelled)) return options.cancel_error;
+    var decoded = try protocol.decodeMessageEnvelopeAlloc(options.allocator, message);
+    errdefer decoded.frame.deinit(options.allocator);
 
-        const revents = pollfds[0].revents;
-        if ((revents & posix.POLL.IN) != 0) {
-            while (true) {
-                switch (try reader.readReady(options.fd)) {
-                    .blocked => break,
-                    .progress => continue,
-                    .frame => |frame| return frame,
-                    .eof => return error.EndOfStream,
-                    .truncated_frame => return error.TruncatedFrame,
-                }
-            }
-        }
-        if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-            return error.EndOfStream;
-        }
+    if (decoded.attached_bytes_len == 0) return decoded.frame;
+
+    switch (decoded.attached_kind) {
+        .RAW => {
+            decoded.frame.attached_bytes = try options.allocator.alloc(u8, decoded.attached_bytes_len);
+            try readExactForeground(options, decoded.frame.attached_bytes, error.TruncatedFrame, error.TruncatedFrame);
+            return decoded.frame;
+        },
+        .SCM_RIGHTS => {
+            if (decoded.attached_bytes_len != 1) return error.InvalidFileDescriptorCarrierFrame;
+            decoded.frame.fd = try readScmRightsMarkerForeground(options);
+            return decoded.frame;
+        },
+        _ => return error.InvalidFrame,
     }
 }
 
@@ -76,21 +68,9 @@ pub const WriteOptions = struct {
 };
 
 pub fn writeFrame(options: WriteOptions) !void {
-    var writer = try protocol.FrameWriteState.init(options.allocator, options.message_type, options.payload);
-    defer writer.deinit();
-
-    // FrameWriteState expects a non-blocking fd to report backpressure as
-    // `.blocked`; restore the caller's fd flags after the setup frame flushes.
-    var flags_guard = try core_fds.StatusFlagsGuard.setNonBlocking(options.fd);
-    defer flags_guard.restore();
-
-    while (true) {
-        try waitForegroundWritable(options.blocking, options.fd);
-        switch (writer.writeReady(options.fd) catch return error.WriteFailed) {
-            .blocked, .progress => {},
-            .done => return,
-        }
-    }
+    const frame = try protocol.encodeFrame(options.allocator, options.message_type, options.payload);
+    defer options.allocator.free(frame);
+    try options.blocking.writeAll(options.fd, frame);
 }
 
 pub const ScmRightsWriteOptions = struct {
@@ -173,6 +153,68 @@ fn waitForegroundWritable(blocking: core_blocking.Blocking, fd: c.fd_t) !void {
         _ = try blocking.poll(pollfds[0..], -1);
         const revents = pollfds[0].revents;
         if ((revents & posix.POLL.OUT) != 0) return;
+        if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+            return error.EndOfStream;
+        }
+    }
+}
+
+fn readExactForeground(
+    options: ReadOptions,
+    buf: []u8,
+    empty_eof_error: anyerror,
+    partial_eof_error: anyerror,
+) !void {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        if (isCancelled(options.cancelled)) return options.cancel_error;
+        switch (try core_io.readSomeNonBlocking(options.fd, buf[filled..])) {
+            .would_block => {
+                try waitForegroundReadable(options);
+            },
+            .eof => return if (filled == 0) empty_eof_error else partial_eof_error,
+            .bytes => |bytes| {
+                core_io.noteRead(options.fd, bytes);
+                filled += bytes.len;
+            },
+        }
+    }
+}
+
+fn readScmRightsMarkerForeground(options: ReadOptions) !c.fd_t {
+    var marker: [1]u8 = undefined;
+    var progress = fd_passing.RecvBufferWithFdProgress.init(&marker, null);
+    defer progress.deinit();
+
+    while (true) {
+        if (isCancelled(options.cancelled)) return options.cancel_error;
+        switch (try fd_passing.recvBufferWithFdProgress(options.fd, &progress)) {
+            .blocked => try waitForegroundReadable(options),
+            .progress => continue,
+            .complete => return progress.takeFd() orelse error.MissingFileDescriptor,
+            .eof => return error.TruncatedFrame,
+        }
+    }
+}
+
+fn waitForegroundReadable(options: ReadOptions) !void {
+    // This module is only used by short setup paths before a dispatcher-owned
+    // relay loop exists. Use direct `poll(2)` here so cancellation-aware
+    // foreground callers can wake periodically without building a second event
+    // loop.
+    while (true) {
+        if (isCancelled(options.cancelled)) return options.cancel_error;
+        var pollfds = [_]posix.pollfd{.{
+            .fd = options.fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const timeout_ms: i32 = if (options.cancelled == null) -1 else cancellation_poll_ms;
+        _ = try options.blocking.poll(pollfds[0..], timeout_ms);
+        if (isCancelled(options.cancelled)) return options.cancel_error;
+
+        const revents = pollfds[0].revents;
+        if ((revents & posix.POLL.IN) != 0) return;
         if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
             return error.EndOfStream;
         }

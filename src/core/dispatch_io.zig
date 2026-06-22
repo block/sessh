@@ -7,7 +7,6 @@ const c = std.c;
 const core_blocking = @import("blocking.zig");
 const fd_passing = @import("fd_passing.zig");
 const io = @import("io.zig");
-const protocol_frame = @import("../protocol/frame.zig");
 const protocol = @import("../protocol/mod.zig");
 
 const pb = protocol.pb;
@@ -245,15 +244,23 @@ pub const ByteSinkOptions = struct {
 
 /// Non-blocking reader for sessh frames from one fd.
 ///
-/// This wraps `protocol.FrameReader`, which understands the four-byte frame
-/// length, the protobuf Frame message, optional attached raw bytes, and
-/// optional SCM_RIGHTS descriptor marker. The source returns complete frames
-/// only; task code never sees a partially decoded protocol message.
+/// The source owns the incremental decode state for one frame at a time:
+/// four-byte length, protobuf `Frame` message, optional attached raw bytes, and
+/// the one-byte SCM_RIGHTS marker used by local daemon IPC. Task code only sees
+/// complete `OwnedFrame` values.
 pub const FrameSource = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    reader: protocol_frame.FrameReader,
-    frames: std.ArrayList(protocol.OwnedFrame) = .empty,
+    header: [protocol.frame_header_len]u8 = undefined,
+    header_filled: usize = 0,
+    message: []u8 = &.{},
+    message_filled: usize = 0,
+    decoded_frame: ?protocol.OwnedFrame = null,
+    ready_frame: ?protocol.OwnedFrame = null,
+    attached_filled: usize = 0,
+    attached_kind: pb.Frame.Attached.Kind = .RAW,
+    scm_rights_progress: fd_passing.RecvBufferWithFdProgress = .{},
+    scm_rights_storage: [1]u8 = undefined,
     eof: bool = false,
 
     pub const Read = union(enum) {
@@ -266,20 +273,22 @@ pub const FrameSource = struct {
         return .{
             .allocator = allocator,
             .fd = fd,
-            .reader = protocol_frame.FrameReader.init(allocator),
         };
     }
 
     pub fn deinit(self: *FrameSource) void {
-        for (self.frames.items) |*frame| frame.deinit(self.allocator);
-        self.frames.deinit(self.allocator);
-        self.reader.deinit();
+        self.resetPartial();
+        if (self.ready_frame) |*frame| {
+            frame.deinit(self.allocator);
+            self.ready_frame = null;
+        }
         self.* = undefined;
     }
 
     pub fn popFrame(self: *FrameSource) ?protocol.OwnedFrame {
-        if (self.frames.items.len == 0) return null;
-        return self.frames.orderedRemove(0);
+        const frame = self.ready_frame orelse return null;
+        self.ready_frame = null;
+        return frame;
     }
 
     pub fn readFrame(self: *FrameSource) !Read {
@@ -304,24 +313,160 @@ pub const FrameSource = struct {
         // frame can involve several syscalls, but stopping at one completed
         // frame gives the DispatchTask scheduler a chance to run unrelated
         // ready work before this connection consumes more input.
-        while (true) {
-            switch (try self.reader.readReady(self.fd)) {
-                .blocked => return .blocked,
-                .progress => return .progress,
+        if (self.ready_frame != null) return .ready;
+        if (self.eof) return .eof;
+
+        if (self.header_filled < protocol.frame_header_len) {
+            switch (try io.readSomeNonBlocking(self.fd, self.header[self.header_filled..])) {
+                .would_block => return .blocked,
                 .eof => {
-                    self.eof = true;
-                    return .eof;
+                    if (self.header_filled == 0) {
+                        self.eof = true;
+                        return .eof;
+                    }
+                    self.resetPartialStorageOnly();
+                    return error.TruncatedFrame;
                 },
-                .truncated_frame => return error.TruncatedFrame,
-                .frame => |frame| {
-                    try self.frames.append(self.allocator, frame);
-                    return .ready;
+                .bytes => |bytes| {
+                    self.header_filled += bytes.len;
+                    io.noteRead(self.fd, bytes);
+                    if (self.header_filled < protocol.frame_header_len) return .progress;
                 },
             }
         }
+
+        if (self.message.len == 0 and self.header_filled == protocol.frame_header_len) {
+            const message_len = protocol.messageLenFromHeader(&self.header);
+            if (message_len == 0) {
+                self.resetPartialStorageOnly();
+                return error.UnknownFrame;
+            }
+            self.message = try self.allocator.alloc(u8, message_len);
+            self.message_filled = 0;
+        }
+
+        if (self.message_filled < self.message.len) {
+            switch (try io.readSomeNonBlocking(self.fd, self.message[self.message_filled..])) {
+                .would_block => return .blocked,
+                .eof => {
+                    self.resetPartialStorageOnly();
+                    return error.TruncatedFrame;
+                },
+                .bytes => |bytes| {
+                    self.message_filled += bytes.len;
+                    io.noteRead(self.fd, bytes);
+                    if (self.message_filled < self.message.len) return .progress;
+                },
+            }
+        }
+
+        if (self.decoded_frame == null) {
+            const decoded = protocol.decodeMessageEnvelopeAlloc(self.allocator, self.message) catch |err| {
+                self.resetPartialStorageOnly();
+                return err;
+            };
+            if (decoded.attached_bytes_len == 0) {
+                self.ready_frame = decoded.frame;
+                self.resetPartialStorageOnly();
+                return .ready;
+            }
+
+            var frame = decoded.frame;
+            self.attached_kind = decoded.attached_kind;
+            switch (decoded.attached_kind) {
+                .RAW => {
+                    frame.attached_bytes = self.allocator.alloc(u8, decoded.attached_bytes_len) catch |err| {
+                        frame.deinit(self.allocator);
+                        self.resetPartialStorageOnly();
+                        return err;
+                    };
+                },
+                .SCM_RIGHTS => {
+                    if (decoded.attached_bytes_len != 1) {
+                        frame.deinit(self.allocator);
+                        self.resetPartialStorageOnly();
+                        return error.InvalidFileDescriptorCarrierFrame;
+                    }
+                    self.scm_rights_progress = fd_passing.RecvBufferWithFdProgress.init(self.scm_rights_storage[0..1], null);
+                },
+                _ => {
+                    frame.deinit(self.allocator);
+                    self.resetPartialStorageOnly();
+                    return error.InvalidFrame;
+                },
+            }
+            self.decoded_frame = frame;
+            self.attached_filled = 0;
+        }
+
+        var frame = &(self.decoded_frame.?);
+        switch (self.attached_kind) {
+            .RAW => {
+                if (self.attached_filled < frame.attached_bytes.len) {
+                    switch (try io.readSomeNonBlocking(self.fd, frame.attached_bytes[self.attached_filled..])) {
+                        .would_block => return .blocked,
+                        .eof => {
+                            self.resetPartial();
+                            return error.TruncatedFrame;
+                        },
+                        .bytes => |bytes| {
+                            self.attached_filled += bytes.len;
+                            io.noteRead(self.fd, bytes);
+                            if (self.attached_filled < frame.attached_bytes.len) return .progress;
+                        },
+                    }
+                }
+            },
+            .SCM_RIGHTS => {
+                if (!self.scm_rights_progress.complete()) {
+                    switch (try fd_passing.recvBufferWithFdProgress(self.fd, &self.scm_rights_progress)) {
+                        .blocked => return .blocked,
+                        .eof => {
+                            self.resetPartial();
+                            return error.TruncatedFrame;
+                        },
+                        .progress => return .progress,
+                        .complete => {},
+                    }
+                }
+                frame.fd = self.scm_rights_progress.takeFd() orelse {
+                    self.resetPartial();
+                    return error.MissingFileDescriptor;
+                };
+            },
+            _ => {
+                self.resetPartial();
+                return error.InvalidFrame;
+            },
+        }
+
+        self.ready_frame = self.decoded_frame.?;
+        self.decoded_frame = null;
+        self.resetPartialStorageOnly();
+        return .ready;
     }
+
     pub fn hasReadyUnit(self: *const FrameSource) bool {
-        return self.frames.items.len != 0 or self.eof;
+        return self.ready_frame != null or self.eof;
+    }
+
+    fn resetPartial(self: *FrameSource) void {
+        self.resetPartialStorageOnly();
+        if (self.decoded_frame) |*frame| {
+            frame.deinit(self.allocator);
+            self.decoded_frame = null;
+        }
+    }
+
+    fn resetPartialStorageOnly(self: *FrameSource) void {
+        self.allocator.free(self.message);
+        self.message = &.{};
+        self.header_filled = 0;
+        self.message_filled = 0;
+        self.attached_filled = 0;
+        self.scm_rights_progress.deinit();
+        self.scm_rights_progress = .{};
+        self.attached_kind = .RAW;
     }
 };
 
@@ -507,23 +652,88 @@ pub const BoundedFrameWrite = struct {
     max_pending_bytes: usize,
 };
 
+const FrameEntryWriteStatus = enum {
+    blocked,
+    progress,
+    done,
+};
+
+const FrameBytesEntry = struct {
+    allocator: std.mem.Allocator,
+    bytes: []u8 = &.{},
+    written: usize = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        message_type: protocol.MessageType,
+        payload: []const u8,
+    ) !FrameBytesEntry {
+        return initWithAttachedKindAndBytes(allocator, .{
+            .message_type = message_type,
+            .payload = payload,
+        });
+    }
+
+    fn initWithAttachedKindAndBytes(
+        allocator: std.mem.Allocator,
+        options: protocol.AttachedFrameOptions,
+    ) !FrameBytesEntry {
+        return .{
+            .allocator = allocator,
+            .bytes = try protocol.encodeFrameWithAttachedKindAndBytes(allocator, options),
+        };
+    }
+
+    fn initOwnedFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !FrameBytesEntry {
+        if (frame.fd != null) return error.FdSendUnsupported;
+        return initWithAttachedKindAndBytes(allocator, .{
+            .message_type = frame.message_type,
+            .payload = frame.payload,
+            .attached_bytes = frame.attached_bytes,
+        });
+    }
+
+    fn deinit(self: *FrameBytesEntry) void {
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+
+    fn pendingBytes(self: *const FrameBytesEntry) usize {
+        return self.bytes.len - self.written;
+    }
+
+    fn writeReady(self: *FrameBytesEntry, fd: c.fd_t) !FrameEntryWriteStatus {
+        if (self.written == self.bytes.len) return .done;
+        const remaining = self.bytes[self.written..];
+        switch (try io.writeSomeNonBlocking(fd, remaining)) {
+            .would_block => return .blocked,
+            .wrote => |count| {
+                if (count == 0) return error.WriteFailed;
+                io.noteWrite(fd, remaining[0..count]);
+                self.written += count;
+                return if (self.written == self.bytes.len) .done else .progress;
+            },
+        }
+    }
+};
+
 // One queued logical frame. Ordinary frames are a contiguous byte string, while
 // SCM_RIGHTS frames have to write a normal prefix first and then a one-byte
 // marker with sendmsg so the descriptor is attached to that exact byte.
 const FrameSinkEntry = union(enum) {
-    frame: protocol.FrameWriteState,
-    scm_rights_frame: ScmRightsFrameWriteState,
+    frame: FrameBytesEntry,
+    scm_rights_frame: ScmRightsFrameEntry,
 
     fn initFrame(
         allocator: std.mem.Allocator,
         message_type: protocol.MessageType,
         payload: []const u8,
     ) !FrameSinkEntry {
-        return .{ .frame = try protocol.FrameWriteState.init(allocator, message_type, payload) };
+        return .{ .frame = try FrameBytesEntry.init(allocator, message_type, payload) };
     }
 
     fn initOwnedFrame(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !FrameSinkEntry {
-        return .{ .frame = try protocol.FrameWriteState.initOwnedFrame(allocator, frame) };
+        return .{ .frame = try FrameBytesEntry.initOwnedFrame(allocator, frame) };
     }
 
     fn initScmRightsFrame(
@@ -533,7 +743,7 @@ const FrameSinkEntry = union(enum) {
         passed_fd: c.fd_t,
     ) !FrameSinkEntry {
         return .{
-            .scm_rights_frame = try ScmRightsFrameWriteState.init(allocator, message_type, payload, passed_fd),
+            .scm_rights_frame = try ScmRightsFrameEntry.init(allocator, message_type, payload, passed_fd),
         };
     }
 
@@ -547,12 +757,12 @@ const FrameSinkEntry = union(enum) {
 
     fn pendingBytes(self: *const FrameSinkEntry) usize {
         return switch (self.*) {
-            .frame => |*frame| frame.bytes.len - frame.written,
+            .frame => |*frame| frame.pendingBytes(),
             .scm_rights_frame => |*frame| frame.pendingBytes(),
         };
     }
 
-    fn writeReady(self: *FrameSinkEntry, fd: c.fd_t) !protocol.FrameWriteStatus {
+    fn writeReady(self: *FrameSinkEntry, fd: c.fd_t) !FrameEntryWriteStatus {
         return switch (self.*) {
             .frame => |*frame| frame.writeReady(fd),
             .scm_rights_frame => |*frame| frame.writeReady(fd),
@@ -567,7 +777,7 @@ const FrameSinkEntry = union(enum) {
 // with sendmsg/SCM_RIGHTS; the prefix is ordinary stream data. Splitting the
 // state this way keeps fd passing localized without making every frame write
 // use sendmsg.
-const ScmRightsFrameWriteState = struct {
+const ScmRightsFrameEntry = struct {
     allocator: std.mem.Allocator,
     bytes: []u8,
     prefix: fd_passing.SendByteProgress,
@@ -578,7 +788,7 @@ const ScmRightsFrameWriteState = struct {
         message_type: protocol.MessageType,
         payload: []const u8,
         passed_fd: c.fd_t,
-    ) !ScmRightsFrameWriteState {
+    ) !ScmRightsFrameEntry {
         var owned_fd = @import("fds.zig").OwnedFd.init(passed_fd);
         errdefer owned_fd.deinit();
 
@@ -605,17 +815,17 @@ const ScmRightsFrameWriteState = struct {
         };
     }
 
-    fn deinit(self: *ScmRightsFrameWriteState) void {
+    fn deinit(self: *ScmRightsFrameEntry) void {
         self.marker.deinit();
         self.allocator.free(self.bytes);
         self.* = undefined;
     }
 
-    fn pendingBytes(self: *const ScmRightsFrameWriteState) usize {
+    fn pendingBytes(self: *const ScmRightsFrameEntry) usize {
         return self.prefix.remaining().len + self.marker.remaining().len;
     }
 
-    fn writeReady(self: *ScmRightsFrameWriteState, fd: c.fd_t) !protocol.FrameWriteStatus {
+    fn writeReady(self: *ScmRightsFrameEntry, fd: c.fd_t) !FrameEntryWriteStatus {
         switch (try fd_passing.sendByteProgress(fd, &self.prefix)) {
             .blocked => return .blocked,
             .progress => return .progress,

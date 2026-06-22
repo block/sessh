@@ -8,9 +8,6 @@ pub const hpb = frame.hpb;
 pub const MessageType = frame.MessageType;
 pub const frame_header_len = frame.frame_header_len;
 pub const OwnedFrame = frame.OwnedFrame;
-pub const FrameReadStatus = frame.FrameReadStatus;
-pub const FrameWriteStatus = frame.FrameWriteStatus;
-pub const FrameWriteState = frame.FrameWriteState;
 pub const DecodedMessageEnvelope = frame.DecodedMessageEnvelope;
 pub const AttachedFrameOptions = frame.AttachedFrameOptions;
 

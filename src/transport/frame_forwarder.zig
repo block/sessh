@@ -9,7 +9,6 @@ const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const dispatch_io = @import("../core/dispatch_io.zig");
 const protocol = @import("../protocol/mod.zig");
-const protocol_frame = @import("../protocol/frame.zig");
 const test_helpers = if (builtin.is_test) @import("../protocol/test_helpers.zig") else struct {};
 
 pub const InitialFrame = struct {
@@ -308,18 +307,14 @@ test "dispatcher frame relay drains queued frame before closing after eof" {
 
 const testing = if (builtin.is_test) struct {
     fn readRelayedFrame(d: *dispatcher.Dispatcher, fd: c.fd_t) !protocol.OwnedFrame {
-        var reader = protocol_frame.FrameReader.init(std.testing.allocator);
-        defer reader.deinit();
+        var source = try d.frameSource(fd);
+        defer source.deinit();
         var iterations: usize = 0;
         while (iterations < 100) : (iterations += 1) {
-            while (true) {
-                switch (try reader.readReady(fd)) {
-                    .blocked => break,
-                    .progress => continue,
-                    .frame => |frame| return frame,
-                    .eof => return error.UnexpectedEof,
-                    .truncated_frame => return error.UnexpectedTruncatedFrame,
-                }
+            switch (try source.frame().readFrame()) {
+                .blocked => {},
+                .frame => |frame| return frame,
+                .eof => return error.UnexpectedEof,
             }
             _ = try d.runOnce();
         }

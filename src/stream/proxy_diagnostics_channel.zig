@@ -83,8 +83,8 @@ pub const Reader = struct {
 
 // Proxy control paths do not own a dispatcher watch for the diagnostics fd. The
 // caller waits for this one frame to flush, but the write itself still advances
-// through FrameWriteState so backpressure is explicit rather than hidden inside
-// a raw writeAll helper.
+// through the foreground frame writer so SCM_RIGHTS-capable frame encoding
+// stays in one place instead of being hidden inside ad hoc raw writes.
 pub fn writeConnectionEventForeground(blocking: core_blocking.Blocking, fd: c.fd_t, event: pb.ConnectionEvent.event_union) !void {
     const payload = try protocol.encodeConnectionEventPayload(app_allocator.allocator(), event);
     defer app_allocator.allocator().free(payload);
