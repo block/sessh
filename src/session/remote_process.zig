@@ -3,7 +3,6 @@ const c = std.c;
 const posix = std.posix;
 
 const core_fds = @import("../core/fds.zig");
-const io = @import("../core/io.zig");
 const process_wait = @import("../core/waitpid.zig");
 const pty_process = @import("../tty/pty_process.zig");
 const terminal = @import("../tty/terminal.zig");
@@ -56,10 +55,6 @@ pub const Process = struct {
     pub fn closePtyForHangup(self: *Process) void {
         self.closePty();
         self.pty_closed_for_hangup = true;
-    }
-
-    pub fn writeSomeInput(self: *const Process, bytes: []const u8) !io.WriteSomeResult {
-        return io.writeSomeNonBlocking(self.pty_fd, bytes);
     }
 };
 

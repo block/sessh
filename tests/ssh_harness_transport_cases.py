@@ -70,7 +70,7 @@ def test_ssh_clean_completion_deletes_cleanup_records(tmp):
     wait_for_no_cleanup_records(env)
 
 
-def test_ssh_transport_uploads_artifact_and_reaches_broker(tmp):
+def test_ssh_transport_uploads_artifact_and_reaches_bridge(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-ssh-bin"
     fake_log = tmp / "fake-ssh.log"

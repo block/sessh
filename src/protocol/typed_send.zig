@@ -11,7 +11,9 @@ pub const ClientDaemonPayload = pb.ClientDaemonItem.payload_union;
 pub const ClientRemotePayload = pb.ClientRemoteItem.payload_union;
 pub const DaemonTunnelPayload = pb.DaemonTunnelItem.payload_union;
 pub const MuxStreamMessage = pb.DaemonTunnelItem.MuxStreamFrame.message_union;
+pub const MuxStreamPayloadItem = pb.DaemonTunnelItem.MuxStreamFrame.Payload.item_union;
 pub const TerminalEmulatorPayload = pb.TerminalEmulatorItem.payload_union;
+pub const ProxyStreamPayload = pb.ProxyStreamItem.payload_union;
 pub const TransportControl = enum {
     ping,
     pong,
@@ -75,6 +77,107 @@ pub fn encodeMuxStreamFramePayload(
     return encodeDaemonTunnelPayload(allocator, .{ .mux_stream = message });
 }
 
+pub fn terminalEmulatorItem(payload: TerminalEmulatorPayload) pb.TerminalEmulatorItem {
+    return .{ .payload = payload };
+}
+
+pub fn proxyStreamItem(payload: ProxyStreamPayload) pb.ProxyStreamItem {
+    return .{ .payload = payload };
+}
+
+pub fn muxStreamOpenFrame(
+    stream_id: u64,
+    recv_next_offset: u64,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return muxStreamOpenMessageFrame(stream_id, .{ .recv_next_offset = recv_next_offset });
+}
+
+pub fn muxStreamOpenMessageFrame(
+    stream_id: u64,
+    open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return .{
+        .stream_id = stream_id,
+        .message = .{ .open = open },
+    };
+}
+
+pub fn muxStreamOpenOkFrame(
+    stream_id: u64,
+    recv_next_offset: u64,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return .{
+        .stream_id = stream_id,
+        .message = .{ .open_ok = .{ .recv_next_offset = recv_next_offset } },
+    };
+}
+
+pub fn muxStreamAckFrame(
+    stream_id: u64,
+    recv_next_offset: u64,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return .{
+        .stream_id = stream_id,
+        .message = .{ .ack = .{ .recv_next_offset = recv_next_offset } },
+    };
+}
+
+pub fn muxStreamEofFrame(
+    stream_id: u64,
+    final_offset: u64,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return .{
+        .stream_id = stream_id,
+        .message = .{ .eof = .{ .final_offset = final_offset } },
+    };
+}
+
+pub fn muxStreamPayloadFrame(
+    stream_id: u64,
+    offset: u64,
+    item: MuxStreamPayloadItem,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return .{
+        .stream_id = stream_id,
+        .message = .{ .payload = .{
+            .offset = offset,
+            .item = item,
+        } },
+    };
+}
+
+pub fn terminalMuxPayloadFrame(
+    stream_id: u64,
+    offset: u64,
+    item: pb.TerminalEmulatorItem,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return muxStreamPayloadFrame(stream_id, offset, .{ .terminal_emulator = item });
+}
+
+pub fn terminalMuxPayloadFromPayloadFrame(
+    stream_id: u64,
+    offset: u64,
+    payload: TerminalEmulatorPayload,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return terminalMuxPayloadFrame(stream_id, offset, terminalEmulatorItem(payload));
+}
+
+pub fn proxyMuxPayloadFrame(
+    stream_id: u64,
+    offset: u64,
+    item: pb.ProxyStreamItem,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return muxStreamPayloadFrame(stream_id, offset, .{ .proxy = item });
+}
+
+pub fn proxyMuxPayloadFromPayloadFrame(
+    stream_id: u64,
+    offset: u64,
+    payload: ProxyStreamPayload,
+) pb.DaemonTunnelItem.MuxStreamFrame {
+    return proxyMuxPayloadFrame(stream_id, offset, proxyStreamItem(payload));
+}
+
 pub fn muxStreamResetFrame(
     stream_id: u64,
     code: []const u8,
@@ -87,6 +190,30 @@ pub fn muxStreamResetFrame(
             .message = message,
         } },
     };
+}
+
+test "mux stream builders keep envelope and typed payload fields in one place" {
+    const open = muxStreamOpenFrame(7, 11);
+    try std.testing.expectEqual(@as(u64, 7), open.stream_id);
+    try std.testing.expectEqual(@as(u64, 11), open.message.?.open.recv_next_offset);
+
+    const ack = muxStreamAckFrame(7, 19);
+    try std.testing.expectEqual(@as(u64, 19), ack.message.?.ack.recv_next_offset);
+
+    const eof = muxStreamEofFrame(7, 23);
+    try std.testing.expectEqual(@as(u64, 23), eof.message.?.eof.final_offset);
+
+    const terminal_payload = terminalMuxPayloadFromPayloadFrame(7, 29, .{ .session_hangup_request = .{} });
+    const payload = terminal_payload.message.?.payload;
+    try std.testing.expectEqual(@as(u64, 29), payload.offset);
+    try std.testing.expect(payload.item.? == .terminal_emulator);
+    try std.testing.expect(payload.item.?.terminal_emulator.payload.? == .session_hangup_request);
+
+    const proxy_payload = proxyMuxPayloadFromPayloadFrame(8, 31, .{ .data = "hello" });
+    const proxy = proxy_payload.message.?.payload;
+    try std.testing.expectEqual(@as(u64, 31), proxy.offset);
+    try std.testing.expect(proxy.item.? == .proxy);
+    try std.testing.expectEqualStrings("hello", proxy.item.?.proxy.payload.?.data);
 }
 
 pub fn encodeErrorPayload(allocator: std.mem.Allocator, info: ErrorInfo) ![]u8 {

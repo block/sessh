@@ -40,7 +40,18 @@ pub const ReadSomeResult = union(enum) {
     eof,
 };
 
+pub const ReadSomeOptions = struct {
+    /// PTY masters on Linux report "slave side closed" as EIO rather than a
+    /// zero-length read. Ordinary byte streams should keep the default so EIO
+    /// remains an error; PTY-backed dispatcher sources opt into EOF semantics.
+    eio_is_eof: bool = false,
+};
+
 pub fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
+    return readSomeWithOptions(fd, buf, .{});
+}
+
+pub fn readSomeWithOptions(fd: c.fd_t, buf: []u8, options: ReadSomeOptions) !ReadSomeResult {
     while (true) {
         const n = c.read(fd, buf.ptr, buf.len);
         if (n > 0) return .{ .bytes = buf[0..@intCast(n)] };
@@ -49,15 +60,20 @@ pub fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
         switch (posix.errno(n)) {
             .AGAIN => return .would_block,
             .INTR => continue,
+            .IO => if (options.eio_is_eof) return .eof else return error.InputOutput,
             else => return error.ReadFailed,
         }
     }
 }
 
 pub fn readSomeNonBlocking(fd: c.fd_t, buf: []u8) !ReadSomeResult {
+    return readSomeNonBlockingWithOptions(fd, buf, .{});
+}
+
+pub fn readSomeNonBlockingWithOptions(fd: c.fd_t, buf: []u8, options: ReadSomeOptions) !ReadSomeResult {
     var flags_guard = core_fds.StatusFlagsGuard.setNonBlocking(fd) catch return error.ReadFailed;
     defer flags_guard.restore();
-    return readSome(fd, buf);
+    return readSomeWithOptions(fd, buf, options);
 }
 
 pub fn writeSomeNonBlocking(fd: c.fd_t, bytes: []const u8) !WriteSomeResult {

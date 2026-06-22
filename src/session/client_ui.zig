@@ -9,6 +9,7 @@ const app_allocator = @import("../core/app_allocator.zig");
 const client_log = @import("../core/client_log.zig");
 const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const fixed_buffer = @import("../core/fixed_buffer.zig");
 const client_renderer = @import("renderer.zig");
 const connection_event = @import("../diagnostics/connection_event.zig");
@@ -172,41 +173,7 @@ pub const ReconnectUi = struct {
     /// diagnostic log lines so the overlay/title/line output stays current
     /// without busy waiting.
     pub fn waitForReconnect(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
-        self.append_only_retry_announced = false;
-        try self.drawReconnectOverlay(delay_ms);
-        var timer = try NonSuspendingTimer.start();
-        var next_overlay_update_ms = diagnostics_display.nextOverlayUpdateDelayMs(delay_ms);
-
-        while (true) {
-            const elapsed_ms = elapsedTimerMs(&timer);
-            if (elapsed_ms >= delay_ms) {
-                self.showReconnectingTitle();
-                try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{}));
-                return .wait_elapsed;
-            }
-
-            const next_wake_ms = @min(delay_ms, next_overlay_update_ms);
-            const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-            const decision = try self.pollInput(wait_ms);
-            try self.refreshForResize();
-            try self.refreshOverlayIfDiagnosticsChanged();
-            switch (decision) {
-                .client_hangup => return decision,
-                .reconnect_now => {
-                    self.showReconnectingTitle();
-                    try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{}));
-                    return .reconnect_now;
-                },
-                .wait_elapsed => {},
-            }
-
-            const after_poll_ms = elapsedTimerMs(&timer);
-            if (after_poll_ms >= next_overlay_update_ms and after_poll_ms < delay_ms) {
-                const remaining_ms = delay_ms - after_poll_ms;
-                try self.drawReconnectOverlay(remaining_ms);
-                next_overlay_update_ms = after_poll_ms + diagnostics_display.nextOverlayUpdateDelayMs(remaining_ms);
-            }
-        }
+        return self.runReconnectWait(.{ .retry = delay_ms });
     }
 
     pub fn showDisconnectedReconnectInProgress(self: *ReconnectUi) !void {
@@ -254,7 +221,53 @@ pub const ReconnectUi = struct {
 
     pub fn waitForReconnectSwitch(self: *ReconnectUi, disposition: ReconnectSwitchDisposition) !ReconnectDecision {
         if (self.hasReconnectAcknowledgement()) return .reconnect_now;
-        try self.showReconnectReady(disposition);
+        return self.runReconnectWait(.{ .ready = .{ .disposition = disposition } });
+    }
+
+    pub fn waitForReconnectSwitchOrTimeout(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
+        // After a replacement transport is ready, keep showing "ready" state for
+        // a bounded window so late user input can force an immediate switch
+        // without hiding the fact that sessh has already reconnected.
+        if (self.hasReconnectAcknowledgement()) return .reconnect_now;
+        return self.runReconnectWait(.{ .ready = .{ .disposition = .delayed, .delay_ms = delay_ms } });
+    }
+
+    const ReconnectWaitState = union(enum) {
+        retry: u64,
+        ready: struct {
+            disposition: ReconnectSwitchDisposition,
+            delay_ms: ?u64 = null,
+        },
+    };
+
+    const TimedReconnectDraw = union(enum) {
+        retry,
+        ready: ReconnectSwitchDisposition,
+    };
+
+    fn runReconnectWait(self: *ReconnectUi, state: ReconnectWaitState) !ReconnectDecision {
+        // All reconnect UI waits use the same state machine: render the current
+        // reconnect state, let dispatcher-backed input/timer polling run until
+        // either a local control arrives or the timer expires, then render any
+        // countdown update needed by the active presentation.
+        return switch (state) {
+            .retry => |delay_ms| blk: {
+                self.append_only_retry_announced = false;
+                try self.drawReconnectOverlay(delay_ms);
+                break :blk self.runTimedReconnectWait(delay_ms, .retry);
+            },
+            .ready => |ready| blk: {
+                if (ready.delay_ms) |delay_ms| {
+                    try self.drawReconnectReadyOverlay(ready.disposition, delay_ms);
+                    break :blk self.runTimedReconnectWait(delay_ms, .{ .ready = ready.disposition });
+                }
+                try self.showReconnectReady(ready.disposition);
+                break :blk self.runUntimedReconnectWait();
+            },
+        };
+    }
+
+    fn runUntimedReconnectWait(self: *ReconnectUi) !ReconnectDecision {
         while (true) {
             switch (try self.pollDecision(-1)) {
                 .client_hangup => |decision| return decision,
@@ -264,31 +277,41 @@ pub const ReconnectUi = struct {
         }
     }
 
-    pub fn waitForReconnectSwitchOrTimeout(self: *ReconnectUi, delay_ms: u64) !ReconnectDecision {
-        // After a replacement transport is ready, keep showing "ready" state for
-        // a bounded window so late user input can force an immediate switch
-        // without hiding the fact that sessh has already reconnected.
-        if (self.hasReconnectAcknowledgement()) return .reconnect_now;
-        try self.drawReconnectReadyOverlay(.delayed, delay_ms);
+    fn runTimedReconnectWait(self: *ReconnectUi, delay_ms: u64, draw: TimedReconnectDraw) !ReconnectDecision {
         var timer = try NonSuspendingTimer.start();
         var next_overlay_update_ms = diagnostics_display.nextOverlayUpdateDelayMs(delay_ms);
 
         while (true) {
             const elapsed_ms = elapsedTimerMs(&timer);
-            if (elapsed_ms >= delay_ms) return .wait_elapsed;
+            if (elapsed_ms >= delay_ms) {
+                if (draw == .retry) {
+                    self.showReconnectingTitle();
+                    try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{}));
+                }
+                return .wait_elapsed;
+            }
 
             const next_wake_ms = @min(delay_ms, next_overlay_update_ms);
             const wait_ms: i32 = @intCast(@min(next_wake_ms - elapsed_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
             switch (try self.pollDecision(wait_ms)) {
                 .client_hangup => |decision| return decision,
-                .reconnect_now => return .reconnect_now,
+                .reconnect_now => {
+                    if (draw == .retry) {
+                        self.showReconnectingTitle();
+                        try self.drawReconnectStaticOverlay(reconnect_title.reconnectingStatus(.{}));
+                    }
+                    return .reconnect_now;
+                },
                 .wait_elapsed => {},
             }
 
             const after_poll_ms = elapsedTimerMs(&timer);
             if (after_poll_ms >= next_overlay_update_ms and after_poll_ms < delay_ms) {
                 const remaining_ms = delay_ms - after_poll_ms;
-                try self.drawReconnectReadyOverlay(.delayed, remaining_ms);
+                switch (draw) {
+                    .retry => try self.drawReconnectOverlay(remaining_ms),
+                    .ready => |disposition| try self.drawReconnectReadyOverlay(disposition, remaining_ms),
+                }
                 next_overlay_update_ms = after_poll_ms + diagnostics_display.nextOverlayUpdateDelayMs(remaining_ms);
             }
         }
@@ -686,6 +709,8 @@ test "ReconnectUi reads reconnect controls from configured input fd" {
     defer posix.close(fds[1]);
 
     try core_blocking.fromTest().writeAll(fds[1], &.{reconnect_control.ctrl_r});
+    try dispatcher.initGlobal(std.testing.allocator);
+    defer dispatcher.deinitGlobal();
 
     var ui = ReconnectUi{
         .blocking = core_blocking.fromTest(),

@@ -204,7 +204,7 @@ case "$mode" in
     run "$zig_bin" build install-dev
     setup_isolation
     trap cleanup_isolation EXIT
-    run_isolated python3 tests/ssh_harness.py --case "ssh transport uploads artifact and reaches broker"
+    run_isolated python3 tests/ssh_harness.py --case "ssh transport uploads artifact and reaches bridge"
     run git diff --check
     ;;
   ci|full)

@@ -9,6 +9,7 @@ const posix = std.posix;
 const client_log = @import("../core/client_log.zig");
 const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const fixed_buffer = @import("../core/fixed_buffer.zig");
 const connection_event = @import("../diagnostics/connection_event.zig");
 const diagnostics_display = @import("../diagnostics/display.zig");
@@ -635,6 +636,8 @@ test "stream reconnect status emits client control messages" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
     try core_fds.setNonBlocking(fds[0]);
+    try dispatcher.initGlobal(std.testing.allocator);
+    defer dispatcher.deinitGlobal();
 
     var status = Status.init(.{
         .blocking = core_blocking.fromTest(),

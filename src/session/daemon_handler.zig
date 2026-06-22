@@ -111,13 +111,12 @@ pub fn registerFrameWithTerminalRemoteFromDaemon(options: TerminalRemoteRegistra
     defer session_open.deinit(allocator);
     const client_remote_payload = try protocol.encodeTerminalEmulatorItemPayload(allocator, .{ .payload = .{ .open = session_open } });
     defer allocator.free(client_remote_payload);
-    const initial_write = try protocol.FrameWriteState.init(allocator, .client_remote, client_remote_payload);
 
     try frame_forwarder.registerFrameRelayWithInitialWrites(.{
         .allocator = allocator,
         .dispatcher = daemon_dispatcher,
         .endpoints = .{ .left = client_fd.get(), .right = process_fd.get() },
-        .initial_writes = .{ .left_to_right = initial_write },
+        .initial_writes = .{ .left_to_right = .{ .message_type = .client_remote, .payload = client_remote_payload } },
     });
     _ = client_fd.take();
     _ = process_fd.take();
@@ -166,7 +165,7 @@ pub fn registerDebugFrameWithTerminalRemoteFromDaemon(options: TerminalRemoteDeb
         },
     }
 
-    var process_fd = core_fds.OwnedFd.init(terminal_worker.connectSingleLiveTerminalWorker(allocator) catch |err| switch (err) {
+    var process_fd = core_fds.OwnedFd.init(terminal_worker.connectSingleLiveTerminalWorkerFromDaemon(allocator, daemon_dispatcher) catch |err| switch (err) {
         error.SessionNotFound, error.AmbiguousSession => {
             try client_error.queueSessionNotFound();
             return;
@@ -175,16 +174,115 @@ pub fn registerDebugFrameWithTerminalRemoteFromDaemon(options: TerminalRemoteDeb
     });
     defer process_fd.deinit();
 
-    const initial_write = try protocol.FrameWriteState.init(allocator, frame.message_type, frame.payload);
-    try frame_forwarder.registerFrameRelayWithInitialWrites(.{
+    try registerOneShotTerminalDebugControl(.{
         .allocator = allocator,
-        .dispatcher = daemon_dispatcher,
-        .endpoints = .{ .left = client_fd.get(), .right = process_fd.get() },
-        .initial_writes = .{ .left_to_right = initial_write },
+        .daemon_dispatcher = daemon_dispatcher,
+        .client_fd = client_fd.get(),
+        .worker_fd = process_fd.get(),
+        .frame = frame,
     });
     _ = client_fd.take();
     _ = process_fd.take();
 }
+
+const OneShotTerminalDebugControlRegistration = struct {
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+    client_fd: c.fd_t,
+    worker_fd: c.fd_t,
+    frame: protocol.OwnedFrame,
+};
+
+fn registerOneShotTerminalDebugControl(options: OneShotTerminalDebugControlRegistration) !void {
+    try core_fds.setNonBlocking(options.client_fd);
+    try core_fds.setNonBlocking(options.worker_fd);
+
+    const control = try options.allocator.create(OneShotTerminalDebugControl);
+    errdefer options.allocator.destroy(control);
+    control.* = .{
+        .allocator = options.allocator,
+        .client_fd = options.client_fd,
+        .worker_fd = options.worker_fd,
+    };
+    errdefer control.deinit();
+
+    control.worker_source = try options.daemon_dispatcher.frameSource(options.worker_fd);
+    control.worker_sink = try options.daemon_dispatcher.frameSink(.{ .allocator = options.allocator, .fd = options.worker_fd });
+    control.client_sink = try options.daemon_dispatcher.frameSink(.{ .allocator = options.allocator, .fd = options.client_fd });
+    try control.worker_sink.writeFrame(options.frame.message_type, options.frame.payload);
+
+    control.task = dispatcher.dispatchTask(
+        OneShotTerminalDebugControl,
+        options.allocator,
+        control,
+        OneShotTerminalDebugControl.run,
+    );
+    control.task.setSourceReadiness(.any);
+    try control.task.requireSource(control.worker_source);
+    try control.task.requireSink(control.worker_sink);
+    try control.task.requireSink(control.client_sink);
+    try control.task.schedule(options.daemon_dispatcher);
+}
+
+const OneShotTerminalDebugControl = struct {
+    allocator: std.mem.Allocator,
+    client_fd: c.fd_t,
+    worker_fd: c.fd_t,
+    worker_source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    worker_sink: dispatcher.Sink = dispatcher.Sink.uninitialized(),
+    client_sink: dispatcher.Sink = dispatcher.Sink.uninitialized(),
+    task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
+    response_queued: bool = false,
+
+    fn deinit(self: *OneShotTerminalDebugControl) void {
+        self.task.deinit();
+        self.worker_source.deinit();
+        self.worker_sink.deinit();
+        self.client_sink.deinit();
+        if (self.client_fd >= 0) {
+            _ = c.close(self.client_fd);
+            self.client_fd = -1;
+        }
+        if (self.worker_fd >= 0) {
+            _ = c.close(self.worker_fd);
+            self.worker_fd = -1;
+        }
+        const allocator = self.allocator;
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    fn run(
+        self: *OneShotTerminalDebugControl,
+        _: *dispatcher.Dispatcher,
+        _: *dispatcher.DispatchTask,
+    ) !dispatch_io.DispatchTaskStatus {
+        if (self.worker_sink.takeWriteError() != null or self.client_sink.takeWriteError() != null) {
+            self.deinit();
+            return .done;
+        }
+
+        if (!self.response_queued and !self.worker_sink.hasPendingWrite()) {
+            var frame = switch (try self.worker_source.readFrame()) {
+                .blocked => return .pending,
+                .eof => {
+                    self.deinit();
+                    return .done;
+                },
+                .frame => |frame_value| frame_value,
+            };
+            defer frame.deinit(self.allocator);
+            try self.client_sink.writeOwnedFrame(&frame);
+            self.response_queued = true;
+        }
+
+        if (self.response_queued and !self.client_sink.hasPendingWrite()) {
+            self.deinit();
+            return .done;
+        }
+        return .pending;
+    }
+};
 
 pub const TerminalMuxStream = struct {
     stream_id: u64,
@@ -379,13 +477,13 @@ fn handleTerminalMuxPayloadOpen(
     } });
     try sendTerminalMuxOpenOk(ctx.mux_writer, stream_id);
     ctx.sessions.items[stream_index].endpoint.fd = process_fd.take();
-    ctx.sessions.items[stream_index].endpoint.initWriter(ctx.allocator);
+    if (ctx.daemon_dispatcher) |d| {
+        try ctx.sessions.items[stream_index].endpoint.initIo(d, ctx.allocator);
+    }
     var remote_open = try protocol.decodePayload(pb.TerminalEmulatorItem.Open, ctx.allocator, remote_payload);
     defer remote_open.deinit(ctx.allocator);
     try queueTerminalWorkerPayload(ctx.allocator, &ctx.sessions.items[stream_index], .{ .open = remote_open });
     if (ctx.daemon_dispatcher) |d| {
-        ctx.sessions.items[stream_index].endpoint.initReader(ctx.allocator);
-        try ctx.sessions.items[stream_index].endpoint.initDispatchSource(d);
         // Try the first nonblocking flush now. The dispatcher remains
         // responsible for backpressure if the worker socket cannot accept all
         // queued bytes immediately.
@@ -574,8 +672,8 @@ pub fn forwardTerminalRemoteFrameToMux(options: ForwardTerminalRemoteFrameToMuxO
 
 pub fn findTerminalMuxStreamIndexBySource(sessions: *const std.ArrayList(TerminalMuxStream), source: dispatcher.Source) ?usize {
     for (sessions.items, 0..) |stream, index| {
-        if (!stream.endpoint.dispatch_source.isInitialized()) continue;
-        if (stream.endpoint.dispatch_source.eql(source)) return index;
+        if (!stream.endpoint.source.isInitialized()) continue;
+        if (stream.endpoint.source.eql(source)) return index;
     }
     return null;
 }
@@ -607,12 +705,7 @@ fn removeTerminalMuxStream(
 }
 
 fn sendTerminalMuxOpenOk(mux_writer: *dispatch_io.FrameSink, stream_id: u64) !void {
-    try sendTerminalMuxFrame(mux_writer, .{
-        .stream_id = stream_id,
-        .message = .{ .open_ok = .{
-            .recv_next_offset = 0,
-        } },
-    });
+    try sendTerminalMuxFrame(mux_writer, protocol.muxStreamOpenOkFrame(stream_id, 0));
 }
 
 fn sendTerminalMuxPayload(
@@ -620,20 +713,15 @@ fn sendTerminalMuxPayload(
     stream: *const TerminalMuxStream,
     item: pb.TerminalEmulatorItem,
 ) !void {
-    try sendTerminalMuxFrame(mux_writer, .{
-        .stream_id = stream.stream_id,
-        .message = .{ .payload = .{
-            .offset = stream.outbound_next_offset,
-            .item = .{ .terminal_emulator = item },
-        } },
-    });
+    try sendTerminalMuxFrame(mux_writer, protocol.terminalMuxPayloadFrame(
+        stream.stream_id,
+        stream.outbound_next_offset,
+        item,
+    ));
 }
 
 fn sendTerminalMuxEof(mux_writer: *dispatch_io.FrameSink, stream_id: u64, final_offset: u64) !void {
-    try sendTerminalMuxFrame(mux_writer, .{
-        .stream_id = stream_id,
-        .message = .{ .eof = .{ .final_offset = final_offset } },
-    });
+    try sendTerminalMuxFrame(mux_writer, protocol.muxStreamEofFrame(stream_id, final_offset));
 }
 
 const TerminalMuxResetOptions = struct {

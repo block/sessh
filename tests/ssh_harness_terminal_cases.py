@@ -867,8 +867,8 @@ def test_ssh_forced_tty_remote_command_allocates_pty_with_stdin_null(tmp):
     if "proxy_ssh=1" not in log_text or "plain_ssh=1" in log_text:
         raise AssertionError(log_text)
     trace_text = fake_trace.read_text()
-    runtime_invocation = re.search(r"event=parsed .*config_query=0 .*request_tty=1", trace_text)
-    if runtime_invocation is None:
+    traced_invocation = re.search(r"event=parsed .*config_query=0 .*request_tty=1", trace_text)
+    if traced_invocation is None:
         raise AssertionError(trace_text)
 
 
@@ -1012,11 +1012,11 @@ def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
     write_fake_ssh(fake_bin / "ssh")
     (fake_bin / "sessh").write_text(
         "#!/bin/sh\n"
-        "printf 'direct_broker=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
-        "printf 'direct_broker_argc=%s\\n' \"$#\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "printf 'direct_bridge=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "printf 'direct_bridge_argc=%s\\n' \"$#\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
         "i=1\n"
         "for arg in \"$@\"; do\n"
-        "  printf 'direct_broker_arg%s=%s\\n' \"$i\" \"$arg\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "  printf 'direct_bridge_arg%s=%s\\n' \"$i\" \"$arg\" >>\"$SESSH_FAKE_SSH_LOG\"\n"
         "  i=$((i + 1))\n"
         "done\n"
         f"exec {shlex.quote(str(BIN))} \"$@\"\n"
@@ -1038,9 +1038,9 @@ def test_ssh_bootstrap_false_config_uses_remote_path_sessh(tmp):
     if marker not in result.stdout:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "direct_broker=1" not in log_text:
+    if "direct_bridge=1" not in log_text:
         raise AssertionError(log_text)
-    if "direct_broker_argc=1" not in log_text or "direct_broker_arg1=:broker:" not in log_text:
+    if "direct_bridge_argc=1" not in log_text or "direct_bridge_arg1=:bridge:" not in log_text:
         raise AssertionError(log_text)
     if "bootstrapper=1" in log_text:
         raise AssertionError(log_text)
@@ -1057,7 +1057,7 @@ def test_ssh_version_mismatch_fallback_message_is_precise(tmp):
     write_sessh_config(env, "bootstrap=false\n")
     (fake_bin / "sessh").write_text(
         "#!/bin/sh\n"
-        "printf 'direct_broker=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
+        "printf 'direct_bridge=1\\n' >>\"$SESSH_FAKE_SSH_LOG\"\n"
         "python3 - <<'PY'\n"
         "import struct, sys\n"
         "\n"
@@ -1102,5 +1102,5 @@ def test_ssh_version_mismatch_fallback_message_is_precise(tmp):
     if "no matching sessh binary" in combined_output or "unsupported" in combined_output:
         raise AssertionError(result)
     log_text = fake_log.read_text()
-    if "direct_broker=1" not in log_text or "plain_ssh=1" not in log_text:
+    if "direct_bridge=1" not in log_text or "plain_ssh=1" not in log_text:
         raise AssertionError(log_text)

@@ -175,7 +175,7 @@ append_exec_arg() {
   esac
   if [ "$exec_arg_count" -eq 0 ]; then
     case "$decoded" in
-      sesshd|sessh-broker|sessh-proxy|sessh-terminal-remote|sessh-proxy-remote)
+      sesshd|sessh-bridge|sessh-proxy|sessh-terminal-remote|sessh-proxy-remote)
         exec_role=$decoded
         exec_arg_count=$((exec_arg_count + 1))
         return

@@ -110,11 +110,10 @@ pub fn handleProxyMuxOpen(
     if (findProxyMuxStreamIndex(streams, stream_id)) |index| {
         streams.items[index].open = open;
         if (streams.items[index].endpoint.active()) {
-            try queueProxyProcessFrame(&streams.items[index], .{
-                .stream_id = proxy_mux_stream_id,
-                .message = .{ .open = open },
-            });
-            if (ctx.daemon_dispatcher != null) streams.items[index].endpoint.updateDispatchSource();
+            try queueProxyProcessFrame(
+                &streams.items[index],
+                protocol.muxStreamOpenMessageFrame(proxy_mux_stream_id, open),
+            );
         }
         return;
     }
@@ -146,10 +145,6 @@ fn handleProxyMuxPayload(
         .open => |request| try handleProxyMuxPayloadOpen(ctx, stream_id, request),
         .data => {
             try forwardProxyMuxFrameToProxyRemote(ctx.streams, mux_frame);
-            if (ctx.daemon_dispatcher != null) {
-                const index = findProxyMuxStreamIndex(ctx.streams, stream_id) orelse return error.StreamUnexpectedFrame;
-                ctx.streams.items[index].endpoint.updateDispatchSource();
-            }
         },
     }
 }
@@ -181,12 +176,14 @@ fn handleProxyMuxPayloadOpen(
         try core_fds.setNonBlocking(process_fd.get());
     }
 
-    ctx.streams.items[index].endpoint.initWriter(ctx.allocator);
-    try queueProxyProcessFrame(&ctx.streams.items[index], .{
-        .stream_id = proxy_mux_stream_id,
-        .message = .{ .open = ctx.streams.items[index].open },
-    });
     ctx.streams.items[index].endpoint.fd = process_fd.take();
+    if (ctx.daemon_dispatcher) |d| {
+        try ctx.streams.items[index].endpoint.initIo(d, ctx.allocator);
+    }
+    try queueProxyProcessFrame(
+        &ctx.streams.items[index],
+        protocol.muxStreamOpenMessageFrame(proxy_mux_stream_id, ctx.streams.items[index].open),
+    );
     const canonical = try guid_ref.canonicalProxyGuid(ctx.allocator, request.proxy_guid);
     defer ctx.allocator.free(canonical);
     try ctx.streams.items[index].proxy_guid.set(canonical);
@@ -195,8 +192,6 @@ fn handleProxyMuxPayloadOpen(
         .process = daemon_cleanup.makeRemoteProcessIdentity(ctx.identity, canonical),
     } });
     if (ctx.daemon_dispatcher) |d| {
-        ctx.streams.items[index].endpoint.initReader(ctx.allocator);
-        try ctx.streams.items[index].endpoint.initDispatchSource(d);
         _ = try drainProxyProcessWrites(&ctx.streams.items[index], d);
     }
 }
@@ -242,7 +237,7 @@ pub fn handleProxyRemoteControlFrame(
     defer item.deinit(allocator);
     switch (item.payload orelse return false) {
         .ping => {
-            try stream.endpoint.writer.writeDaemonTunnelPayload(.{ .pong = .{} });
+            try stream.endpoint.writeDaemonTunnelPayload(.{ .pong = .{} });
             return true;
         },
         .pong => return true,
@@ -259,8 +254,8 @@ pub fn findProxyMuxStreamIndex(streams: *const std.ArrayList(ProxyMuxStream), st
 
 pub fn findProxyMuxStreamIndexBySource(streams: *const std.ArrayList(ProxyMuxStream), source: dispatcher.Source) ?usize {
     for (streams.items, 0..) |stream, index| {
-        if (!stream.endpoint.dispatch_source.isInitialized()) continue;
-        if (stream.endpoint.dispatch_source.eql(source)) return index;
+        if (!stream.endpoint.source.isInitialized()) continue;
+        if (stream.endpoint.source.eql(source)) return index;
     }
     return null;
 }

@@ -49,23 +49,19 @@ pub fn registerAcceptedClient(options: RegisterAcceptedClientOptions) !void {
         .active_local_clients = options.active_local_clients,
         .fd = options.client_fd,
     };
-    context.initReader();
-    context.initWriter();
-    errdefer context.reader.deinit();
-    errdefer context.writer.deinit();
+    try context.initIo(options.daemon_dispatcher);
+    errdefer context.releaseDispatchHandles();
 
     options.active_local_clients.* += 1;
     errdefer options.active_local_clients.* -= 1;
 
-    context.source = try options.daemon_dispatcher.fdSource(options.client_fd, .{ .readable = true });
-    errdefer context.releaseDispatchHandles();
-    context.task = try dispatcher.fdDispatchTask(
+    context.task = dispatcher.dispatchTask(
         ClientContext,
         allocator,
         context,
-        context.source,
         readDaemonClient,
     );
+    try context.configureTask();
     try context.task.schedule(options.daemon_dispatcher);
 }
 
@@ -90,26 +86,21 @@ const ClientContext = struct {
     identity: daemon_identity.DaemonIdentity,
     active_local_clients: *usize,
     fd: c.fd_t,
-    reader: protocol.FrameReader = undefined,
-    writer: dispatch_io.FrameSink = undefined,
     source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    sink: dispatcher.Sink = dispatcher.Sink.uninitialized(),
     task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
     stage: ClientStage = .waiting_peer_hello,
     owns_active_count: bool = true,
     close_after_write: bool = false,
 
-    fn initReader(self: *ClientContext) void {
-        self.reader = protocol.FrameReader.init(self.allocator);
-    }
-
-    fn initWriter(self: *ClientContext) void {
-        self.writer = dispatch_io.FrameSink.init(.{ .allocator = self.allocator, .fd = -1 });
+    fn initIo(self: *ClientContext, daemon_dispatcher: *dispatcher.Dispatcher) !void {
+        self.source = try daemon_dispatcher.frameSource(self.fd);
+        errdefer self.source.deinit();
+        self.sink = try daemon_dispatcher.frameSink(.{ .allocator = self.allocator, .fd = self.fd });
     }
 
     fn deinit(self: *ClientContext) void {
         self.releaseDispatchHandles();
-        self.writer.deinit();
-        self.reader.deinit();
         if (self.fd >= 0) {
             _ = c.close(self.fd);
             self.fd = -1;
@@ -124,6 +115,19 @@ const ClientContext = struct {
     fn releaseDispatchHandles(self: *ClientContext) void {
         self.task.deinit();
         self.source.deinit();
+        self.sink.deinit();
+    }
+
+    fn writer(self: *ClientContext) *dispatch_io.FrameSink {
+        return self.sink.frame();
+    }
+
+    fn configureTask(self: *ClientContext) !void {
+        if (!self.task.isInitialized()) return;
+        self.task.clearSources();
+        self.task.clearSinks();
+        if (!self.close_after_write) try self.task.requireSource(self.source);
+        try self.task.requireSink(self.sink);
     }
 };
 
@@ -131,9 +135,8 @@ fn readDaemonClient(
     context: *ClientContext,
     daemon_dispatcher: *dispatcher.Dispatcher,
     _: *dispatcher.DispatchTask,
-    event: dispatcher.FdEvent,
 ) !dispatch_io.DispatchTaskStatus {
-    return readDaemonClientInner(context, daemon_dispatcher, event) catch |err| {
+    return readDaemonClientInner(context, daemon_dispatcher) catch |err| {
         daemon_log.infof(context.allocator, "client handler failed error={t}", .{err});
         closeDaemonClient(context, daemon_dispatcher);
         return .done;
@@ -147,30 +150,21 @@ fn readDaemonClient(
 fn readDaemonClientInner(
     context: *ClientContext,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    fd_event: dispatcher.FdEvent,
 ) !dispatch_io.DispatchTaskStatus {
-    if (fd_event.error_event or fd_event.invalid) {
+    if (context.close_after_write) {
         closeDaemonClient(context, daemon_dispatcher);
         return .done;
     }
-    if (fd_event.writable and try drainDaemonClientWrites(context, daemon_dispatcher)) return .done;
-    if (context.close_after_write) return .pending;
-    if (!fd_event.readable and !fd_event.hangup) return .pending;
 
     while (true) {
-        switch (try context.reader.readReady(context.fd)) {
+        switch (try context.source.readFrame()) {
             .blocked => return .pending,
-            .progress => continue,
             .eof => {
                 if (context.stage == .daemon_log) {
                     daemon_log.infof(context.allocator, "daemon log subscriber disconnected", .{});
                 } else {
                     daemon_log.infof(context.allocator, "client disconnected from daemon", .{});
                 }
-                closeDaemonClient(context, daemon_dispatcher);
-                return .done;
-            },
-            .truncated_frame => {
                 closeDaemonClient(context, daemon_dispatcher);
                 return .done;
             },
@@ -182,16 +176,16 @@ fn readDaemonClientInner(
                 switch (action) {
                     .consumed => {
                         frame.deinit(context.allocator);
-                        if (context.writer.hasPendingWrite()) {
-                            try updateDaemonClientEvents(context, daemon_dispatcher);
+                        if (context.sink.hasPendingWrite()) {
+                            try context.configureTask();
                             return .pending;
                         }
                     },
                     .close => {
                         frame.deinit(context.allocator);
-                        if (context.writer.hasPendingWrite()) {
+                        if (context.sink.hasPendingWrite()) {
                             context.close_after_write = true;
-                            try updateDaemonClientEvents(context, daemon_dispatcher);
+                            try context.configureTask();
                             return .pending;
                         }
                         closeDaemonClient(context, daemon_dispatcher);
@@ -373,6 +367,18 @@ fn transferInitialRequestToDispatcherOwner(
             => {
                 const client_fd = context.fd;
                 context.releaseDispatchHandles();
+                switch (try transport_ssh.registerPooledTerminalDebugFromDaemon(.{
+                    .allocator = context.allocator,
+                    .daemon_dispatcher = daemon_dispatcher,
+                    .frame = frame.*,
+                    .client_fd = client_fd,
+                })) {
+                    .transferred => {
+                        context.fd = -1;
+                        return .transferred;
+                    },
+                    .not_found => {},
+                }
                 try session_daemon_handler.registerDebugFrameWithTerminalRemoteFromDaemon(.{
                     .allocator = context.allocator,
                     .daemon_dispatcher = daemon_dispatcher,
@@ -576,7 +582,7 @@ fn handleDaemonTunnelControlFrame(
             try daemon_cleanup.handleRemoteProcessCleanupRequestQueued(.{
                 .allocator = context.allocator,
                 .daemon_dispatcher = daemon_dispatcher,
-                .mux_writer = &context.writer,
+                .mux_writer = context.writer(),
                 .identity = context.identity,
                 .request = request,
             });
@@ -589,7 +595,7 @@ fn handleDaemonTunnelControlFrame(
 fn handleTransportControlFrameQueued(context: *ClientContext, message_type: protocol.MessageType, payload: []const u8) !bool {
     switch (try protocol.decodeTransportControlFrame(context.allocator, message_type, payload) orelse return false) {
         .ping => {
-            try context.writer.writeDaemonTunnelPayload(.{ .pong = .{} });
+            try context.writer().writeDaemonTunnelPayload(.{ .pong = .{} });
             return true;
         },
         .pong => return true,
@@ -603,13 +609,13 @@ fn queueHelloRequest(context: *ClientContext) !void {
         .version = core_config.version,
     });
     defer context.allocator.free(payload);
-    try context.writer.writeFrame(.hello_request, payload);
+    try context.sink.writeFrame(.hello_request, payload);
 }
 
 fn queueHelloOk(context: *ClientContext) !void {
     const payload = try protocol.encodePayload(context.allocator, hpb.HelloOk{});
     defer context.allocator.free(payload);
-    try context.writer.writeFrame(.hello_ok, payload);
+    try context.sink.writeFrame(.hello_ok, payload);
 }
 
 fn queueHelloError(context: *ClientContext, info: protocol.ErrorInfo) !void {
@@ -619,14 +625,14 @@ fn queueHelloError(context: *ClientContext, info: protocol.ErrorInfo) !void {
         .hint = info.hint,
     });
     defer context.allocator.free(payload);
-    try context.writer.writeFrame(.hello_error, payload);
+    try context.sink.writeFrame(.hello_error, payload);
     context.close_after_write = true;
 }
 
 fn queueError(context: *ClientContext, info: protocol.ErrorInfo) !void {
     const payload = try protocol.encodeErrorPayload(context.allocator, info);
     defer context.allocator.free(payload);
-    try context.writer.writeFrame(.error_message, payload);
+    try context.sink.writeFrame(.error_message, payload);
     context.close_after_write = true;
 }
 
@@ -635,43 +641,4 @@ fn queueProtocolError(context: *ClientContext, message: []const u8) !void {
         .code = "PROTOCOL_ERROR",
         .message = message,
     });
-}
-
-fn drainDaemonClientWrites(
-    context: *ClientContext,
-    daemon_dispatcher: *dispatcher.Dispatcher,
-) !bool {
-    // Flush queued response frames before closing or resuming reads. This keeps
-    // daemon errors/log replies ordered while still respecting socket
-    // backpressure from slow foreground clients.
-    if (!context.writer.hasPendingWrite()) {
-        try updateDaemonClientEvents(context, daemon_dispatcher);
-        return false;
-    }
-    switch (try context.writer.writeReadyTo(context.fd)) {
-        .blocked, .progress => {
-            try updateDaemonClientEvents(context, daemon_dispatcher);
-            return false;
-        },
-        .drained => {
-            if (context.close_after_write) {
-                closeDaemonClient(context, daemon_dispatcher);
-                return true;
-            }
-            try updateDaemonClientEvents(context, daemon_dispatcher);
-            return false;
-        },
-    }
-}
-
-fn updateDaemonClientEvents(
-    context: *ClientContext,
-    daemon_dispatcher: *dispatcher.Dispatcher,
-) !void {
-    if (!context.source.isInitialized()) return;
-    context.source.setFdEvents(.{
-        .readable = !context.close_after_write,
-        .writable = context.writer.hasPendingWrite(),
-    });
-    if (context.task.isInitialized()) try context.task.schedule(daemon_dispatcher);
 }

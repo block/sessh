@@ -1,6 +1,8 @@
-// Persistent cleanup records for remote worker processes. The fast path asks
-// the paired daemon to hang up work immediately; these records are the fallback
-// that survives a local client, daemon, or laptop crash.
+// Daemon-owned cleanup service for remote worker processes. The fast path asks
+// the paired daemon to hang up work immediately; durable records are the
+// fallback that survives a local client, daemon, or laptop crash. This module
+// owns the record format, stale-record sweep, remote cleanup request/response,
+// and same-daemon dispatch to terminal/proxy worker cleanup hooks.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -372,6 +374,10 @@ fn cleanupGuidOnCurrentDaemon(
     daemon_dispatcher: *dispatcher.Dispatcher,
     guid: []const u8,
 ) !CleanupResult {
+    // Cleanup requests identify logical work by guid. The daemon cleanup
+    // service is the only code that maps those ids to terminal/proxy worker
+    // hang-up implementations, so durable fallback and immediate disconnect
+    // cleanup use the same behavior.
     if (std.mem.startsWith(u8, guid, "s-")) {
         terminal_worker.requestTerminalWorkerCleanup(allocator, daemon_dispatcher, guid) catch |err| switch (err) {
             error.SessionNotFound, error.InvalidSessionId => return .missing,

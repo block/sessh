@@ -206,9 +206,9 @@ def send_hello(conn, major_delta=0, minor_delta=0, version_override=None, expect
     return message_type, payload
 
 
-def broker_hello(env, **kwargs):
+def bridge_hello(env, **kwargs):
     proc = subprocess.Popen(
-        [str(BIN), ":broker:"],
+        [str(BIN), ":bridge:"],
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,

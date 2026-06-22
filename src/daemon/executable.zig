@@ -9,7 +9,7 @@ const socket_namespace = @import("socket_namespace.zig");
 const socket_transport = @import("../transport/socket.zig");
 
 pub const daemon_name = socket_namespace.daemon_executable_name;
-pub const broker_name = socket_namespace.broker_executable_name;
+pub const bridge_name = socket_namespace.bridge_executable_name;
 pub const proxy_name = socket_namespace.proxy_executable_name;
 pub const terminal_remote_name = socket_namespace.terminal_remote_executable_name;
 pub const proxy_remote_name = socket_namespace.proxy_remote_executable_name;
@@ -17,14 +17,14 @@ pub const proxy_remote_name = socket_namespace.proxy_remote_executable_name;
 pub const NamespaceExecutables = struct {
     allocator: std.mem.Allocator,
     daemon: []u8,
-    broker: []u8,
+    bridge: []u8,
     proxy: []u8,
     terminal_remote: []u8,
     proxy_remote: []u8,
 
     pub fn deinit(self: *NamespaceExecutables) void {
         self.allocator.free(self.daemon);
-        self.allocator.free(self.broker);
+        self.allocator.free(self.bridge);
         self.allocator.free(self.proxy);
         self.allocator.free(self.terminal_remote);
         self.allocator.free(self.proxy_remote);
@@ -75,7 +75,7 @@ pub fn installNamespaceExecutablesWhileHoldingLock(
     errdefer executables.deinit();
 
     try replaceSymlink(allocator, target, executables.daemon);
-    try replaceSymlink(allocator, target, executables.broker);
+    try replaceSymlink(allocator, target, executables.bridge);
     try replaceSymlink(allocator, target, executables.proxy);
     try replaceSymlink(allocator, target, executables.terminal_remote);
     try replaceSymlink(allocator, target, executables.proxy_remote);
@@ -90,8 +90,8 @@ pub fn namespaceExecutablePaths(
 ) !NamespaceExecutables {
     const daemon_path = try socket_namespace.executablePath(allocator, dir_name, daemon_name);
     errdefer allocator.free(daemon_path);
-    const broker_path = try socket_namespace.executablePath(allocator, dir_name, broker_name);
-    errdefer allocator.free(broker_path);
+    const bridge_path = try socket_namespace.executablePath(allocator, dir_name, bridge_name);
+    errdefer allocator.free(bridge_path);
     const proxy_path = try socket_namespace.executablePath(allocator, dir_name, proxy_name);
     errdefer allocator.free(proxy_path);
     const terminal_remote_path = try socket_namespace.executablePath(allocator, dir_name, terminal_remote_name);
@@ -102,7 +102,7 @@ pub fn namespaceExecutablePaths(
     return .{
         .allocator = allocator,
         .daemon = daemon_path,
-        .broker = broker_path,
+        .bridge = bridge_path,
         .proxy = proxy_path,
         .terminal_remote = terminal_remote_path,
         .proxy_remote = proxy_remote_path,
@@ -140,7 +140,7 @@ pub fn reexec(
     args: []const []const u8,
 ) !void {
     // Re-exec through the role-named symlink so process listings show sesshd,
-    // sessh-broker, etc. Build a null-terminated argv because execvpe is the
+    // sessh-bridge, etc. Build a null-terminated argv because execvpe is the
     // final boundary before leaving Zig-owned memory behind.
     var owned_args = try allocator.alloc([:0]u8, args.len + 1);
     var initialized: usize = 0;
@@ -213,9 +213,9 @@ test "namespace executables are written beside socket namespace" {
     const daemon = try socket_namespace.executablePath(allocator, dir_name, daemon_name);
     defer allocator.free(daemon);
     try std.testing.expect(std.mem.endsWith(u8, daemon, "/1.dev.exec-test/sesshd"));
-    const broker = try socket_namespace.executablePath(allocator, dir_name, broker_name);
-    defer allocator.free(broker);
-    try std.testing.expect(std.mem.endsWith(u8, broker, "/1.dev.exec-test/sessh-broker"));
+    const bridge = try socket_namespace.executablePath(allocator, dir_name, bridge_name);
+    defer allocator.free(bridge);
+    try std.testing.expect(std.mem.endsWith(u8, bridge, "/1.dev.exec-test/sessh-bridge"));
     const proxy = try socket_namespace.executablePath(allocator, dir_name, proxy_name);
     defer allocator.free(proxy);
     try std.testing.expect(std.mem.endsWith(u8, proxy, "/1.dev.exec-test/sessh-proxy"));
@@ -260,7 +260,7 @@ fn readLinkAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn deleteNamespaceExecutables(executables: NamespaceExecutables) void {
     std.fs.deleteFileAbsolute(executables.daemon) catch {};
-    std.fs.deleteFileAbsolute(executables.broker) catch {};
+    std.fs.deleteFileAbsolute(executables.bridge) catch {};
     std.fs.deleteFileAbsolute(executables.proxy) catch {};
     std.fs.deleteFileAbsolute(executables.terminal_remote) catch {};
     std.fs.deleteFileAbsolute(executables.proxy_remote) catch {};

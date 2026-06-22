@@ -77,16 +77,16 @@ def test_cache_hit_execs_without_platform_or_tool_probe(tmp):
     artifact_hash = sha256(artifact)
     write_executable(artifact_path(env, artifact_hash), artifact)
 
-    result = run_bootstrapper(f"EXEC test-set {artifact_hash} -- sessh-broker\n", env)
+    result = run_bootstrapper(f"EXEC test-set {artifact_hash} -- sessh-bridge\n", env)
 
     assert_ok(result)
-    if result.stdout != "OK\nCACHED argv0=sessh-broker argc=0\n":
+    if result.stdout != "OK\nCACHED argv0=sessh-bridge argc=0\n":
         raise AssertionError(result.stdout)
-    if not artifact_role_path(env, artifact_hash, "sessh-broker").is_symlink():
-        raise AssertionError("bootstrapper did not create sessh-broker role symlink")
+    if not artifact_role_path(env, artifact_hash, "sessh-bridge").is_symlink():
+        raise AssertionError("bootstrapper did not create sessh-bridge role symlink")
 
 
-def test_cache_hit_execs_explicit_broker_role(tmp):
+def test_cache_hit_execs_explicit_bridge_role(tmp):
     env = isolated_env(tmp)
     fake_bin = tmp / "fake-bin"
     fake_bin.mkdir()
@@ -96,12 +96,12 @@ def test_cache_hit_execs_explicit_broker_role(tmp):
     write_executable(artifact_path(env, artifact_hash), artifact)
 
     result = run_bootstrapper(
-        f"EXEC test-set {artifact_hash} -- sessh-broker\n",
+        f"EXEC test-set {artifact_hash} -- sessh-bridge\n",
         env,
     )
 
     assert_ok(result)
-    expected = "OK\nCACHED argv0=sessh-broker argc=0\n"
+    expected = "OK\nCACHED argv0=sessh-bridge argc=0\n"
     if result.stdout != expected:
         raise AssertionError(result.stdout)
 
@@ -148,7 +148,7 @@ def test_upload_installs_and_execs(tmp):
     encoded = base64.b64encode(artifact).decode()
 
     result = run_bootstrapper(
-        f"EXEC test-set {artifact_hash} -- sessh-broker\n"
+        f"EXEC test-set {artifact_hash} -- sessh-bridge\n"
         f"UPLOAD sessh-test-linux-x86_64 {artifact_hash} {encoded}\n",
         env,
     )
@@ -161,7 +161,7 @@ def test_upload_installs_and_execs(tmp):
         raise AssertionError(result.stdout)
     if lines[1] != "OK":
         raise AssertionError(result.stdout)
-    if lines[2] != "UPLOADED argv0=sessh-broker argc=0":
+    if lines[2] != "UPLOADED argv0=sessh-bridge argc=0":
         raise AssertionError(result.stdout)
 
     installed = artifact_path(env, artifact_hash)
@@ -169,7 +169,7 @@ def test_upload_installs_and_execs(tmp):
         raise AssertionError("uploaded artifact was not installed")
     if not os.access(installed, os.X_OK):
         raise AssertionError("uploaded artifact is not executable")
-    if not artifact_role_path(env, artifact_hash, "sessh-broker").is_symlink():
+    if not artifact_role_path(env, artifact_hash, "sessh-bridge").is_symlink():
         raise AssertionError("uploaded artifact role symlink was not created")
 
 
@@ -204,7 +204,7 @@ def test_cache_hit_trusts_cached_executable(tmp):
     expected_hash = sha256(expected)
     write_executable(artifact_path(env, expected_hash), wrong)
 
-    result = run_bootstrapper(f"EXEC test-set {expected_hash} -- sessh-broker\n", env)
+    result = run_bootstrapper(f"EXEC test-set {expected_hash} -- sessh-bridge\n", env)
 
     assert_ok(result)
     if result.stdout != "OK\nWRONG\n":
@@ -218,7 +218,7 @@ def test_cache_miss_reports_platform_before_tool_probe(tmp):
     env["PATH"] = str(fake_bin)
 
     result = run_bootstrapper(
-        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-broker\n",
+        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-bridge\n",
         env,
         extra_env={
             "SESSH_FAKE_UNAME_S": "Linux",
@@ -246,7 +246,7 @@ def test_platform_strings_are_canonicalized(tmp):
     )
     for os_name, arch, expected in cases:
         result = run_bootstrapper(
-            "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-broker\n",
+            "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-bridge\n",
             env,
             extra_env={
                 "SESSH_FAKE_UNAME_S": os_name,
@@ -265,7 +265,7 @@ def test_unsupported_platform_is_structured_error(tmp):
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
 
     result = run_bootstrapper(
-        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-broker\n",
+        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-bridge\n",
         env,
         extra_env={
             "SESSH_FAKE_UNAME_S": "Plan9",
@@ -290,7 +290,7 @@ def run_test(name, fn):
 def main():
     tests = (
         ("cache hit execs without platform or tool probe", test_cache_hit_execs_without_platform_or_tool_probe),
-        ("cache hit execs explicit broker role", test_cache_hit_execs_explicit_broker_role),
+        ("cache hit execs explicit bridge role", test_cache_hit_execs_explicit_bridge_role),
         ("cache hit decodes encoded exec args", test_cache_hit_decodes_encoded_exec_args),
         ("upload installs and execs", test_upload_installs_and_execs),
         ("invalid artifact set is rejected", test_invalid_artifact_set_is_rejected),

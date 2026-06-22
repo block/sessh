@@ -96,13 +96,13 @@ test "buildExecBytes writes role entrypoint and encodes reserved args" {
     const bytes = try buildExecBytes(.{
         .allocator = std.testing.allocator,
         .artifacts = &artifacts,
-        .entrypoint = .broker,
+        .entrypoint = .bridge,
         .entrypoint_args = &.{ "3.dev.test", "b64:literal" },
     });
     defer std.testing.allocator.free(bytes);
 
     try std.testing.expectEqualStrings(
-        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-broker 3.dev.test b64:YjY0OmxpdGVyYWw=\n",
+        "EXEC test-set 0000000000000000000000000000000000000000000000000000000000000000 -- sessh-bridge 3.dev.test b64:YjY0OmxpdGVyYWw=\n",
         bytes,
     );
 }

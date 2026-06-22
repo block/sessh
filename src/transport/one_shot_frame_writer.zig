@@ -18,31 +18,33 @@ pub fn registerFrameAndClose(options: RegisterOptions) !void {
     // Some setup paths need to send exactly one framed response and then give up
     // the fd. Register that write with the daemon dispatcher instead of blocking
     // the caller until the peer becomes writable.
-    var writer = try protocol.FrameWriteState.init(options.allocator, options.message_type, options.payload);
-    errdefer writer.deinit();
-
     try core_fds.setNonBlocking(options.fd);
     const context = try options.allocator.create(OneShotFrameWriter);
     errdefer options.allocator.destroy(context);
+    var sink = try options.daemon_dispatcher.frameSink(.{
+        .allocator = options.allocator,
+        .fd = options.fd,
+    });
+    errdefer sink.deinit();
+    try sink.writeFrame(options.message_type, options.payload);
     context.* = .{
         .allocator = options.allocator,
         .fd = options.fd,
-        .writer = writer,
-        .source = try options.daemon_dispatcher.fdSource(options.fd, .{ .writable = true }),
+        .sink = sink,
         .task = undefined,
     };
-    writer = undefined;
+    sink = dispatcher.Sink.uninitialized();
 
-    errdefer context.writer.deinit();
-    errdefer context.source.deinit();
-    context.task = try dispatcher.fdDispatchTask(
+    errdefer context.sink.deinit();
+    context.task = dispatcher.dispatchTask(
         OneShotFrameWriter,
         options.allocator,
         context,
-        context.source,
-        OneShotFrameWriter.onWritable,
+        OneShotFrameWriter.flush,
     );
     errdefer context.task.deinit();
+    context.task.setSourceReadiness(.any);
+    try context.task.requireSink(context.sink);
     try context.task.schedule(options.daemon_dispatcher);
 }
 
@@ -52,14 +54,12 @@ pub fn registerFrameAndClose(options: RegisterOptions) !void {
 const OneShotFrameWriter = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    writer: protocol.FrameWriteState,
-    source: dispatcher.Source,
+    sink: dispatcher.Sink,
     task: dispatcher.DispatchTask,
 
     fn close(self: *OneShotFrameWriter) void {
         self.task.deinit();
-        self.source.deinit();
-        self.writer.deinit();
+        self.sink.deinit();
         if (self.fd >= 0) {
             _ = c.close(self.fd);
             self.fd = -1;
@@ -69,32 +69,25 @@ const OneShotFrameWriter = struct {
         allocator.destroy(self);
     }
 
-    fn onWritable(
+    fn flush(
         self: *OneShotFrameWriter,
         d: *dispatcher.Dispatcher,
         task: *dispatcher.DispatchTask,
-        fd_event: dispatcher.FdEvent,
     ) !dispatch_io.DispatchTaskStatus {
         _ = d;
         _ = task;
         // Keep ownership of the fd until the encoded frame is completely
-        // flushed. Any peer close/error abandons the response and releases the
-        // fd because there is no later state machine to recover it.
-        if (fd_event.error_event or fd_event.invalid or fd_event.hangup) {
+        // flushed. Sink write errors are surfaced by the dispatcher; this
+        // callback only observes successful drain and then closes the setup fd.
+        if (self.sink.takeWriteError()) |_| {
             self.close();
             return .done;
         }
-        if (!fd_event.writable) return .pending;
-        switch (self.writer.writeReady(self.fd) catch {
-            self.close();
-            return .done;
-        }) {
-            .blocked, .progress => return .pending,
-            .done => {
-                self.close();
-                return .done;
-            },
+        if (self.sink.hasPendingWrite()) {
+            return .pending;
         }
+        self.close();
+        return .done;
     }
 };
 

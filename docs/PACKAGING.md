@@ -8,7 +8,7 @@ libexec/sessh/<os>-<arch>/sessh
 ```
 
 Role-shaped executable names are daemon-namespace details, not packaged artifacts. When
-`sessh` starts a daemon namespace it writes `sesshd`, `sessh-broker`,
+`sessh` starts a daemon namespace it writes `sesshd`, `sessh-bridge`,
 `sessh-proxy`, `sessh-terminal-remote`, and `sessh-proxy-remote` symlinks beside
 `sesshd.sock`, all pointing back to the active `sessh` binary. That keeps
 packaged archives simple while still making `ps` output readable.

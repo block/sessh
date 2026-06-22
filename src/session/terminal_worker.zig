@@ -12,7 +12,6 @@ const core_fds = @import("../core/fds.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const input_translation = @import("input_translation.zig");
 const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
-const pty_process = @import("../tty/pty_process.zig");
 const protocol = @import("../protocol/mod.zig");
 const daemon_log = @import("../daemon/log.zig");
 const guid_ref = @import("../core/guid.zig");
@@ -29,8 +28,7 @@ const terminal_worker_render = @import("terminal_worker_render.zig");
 const terminal_worker_protocol = @import("terminal_worker_protocol.zig");
 const terminal_worker_lifecycle = @import("terminal_worker_lifecycle.zig");
 
-const preferred_live_output_batch_bytes = 1024;
-const max_live_output_reads_per_batch = 64;
+const pty_output_source_bytes = 4096;
 const synchronized_output_max_hold_ms: i64 = 1000;
 const pty_eof_exit_status_grace_ms: i64 = 250;
 const terminal_worker_poll_timing = terminal_worker_lifecycle.PollTiming{
@@ -186,7 +184,7 @@ const DispatcherTerminalWorker = struct {
         try core_fds.setNonBlocking(daemon_fd.get());
         try core_fds.setNonBlocking(worker_fd.get());
 
-        self.terminal_worker.pending_client.start(worker_fd.take());
+        try self.terminal_worker.pending_client.start(daemon_dispatcher, worker_fd.take());
         try self.updateWatches(daemon_dispatcher);
         return daemon_fd.take();
     }
@@ -204,46 +202,23 @@ const DispatcherTerminalWorker = struct {
         const clock = terminalWorkerPollClock(&self.terminal_worker);
         const session = &self.terminal_worker.session;
         if (session.alive and session.process.hasOpenPty()) {
-            try self.ensureWatch(.{
+            try self.ensurePtyOutputWatch(.{
                 .daemon_dispatcher = daemon_dispatcher,
                 .watch = &self.session_watch,
                 .fd = session.process.pty_fd,
-                .events = .{
-                    .readable = true,
-                    .writable = session.hasPendingPtyInput(),
-                },
             });
         } else {
             self.session_watch.cancel(daemon_dispatcher);
         }
 
-        const pending_client = &self.terminal_worker.pending_client;
-        if (!pending_client.active) self.pending_watch.cancel(daemon_dispatcher);
+        self.pending_watch.cancel(daemon_dispatcher);
 
         const visible_client = &self.terminal_worker.visible_client;
         if (visible_client.active) {
             const debug_unresponsive = visible_client.debug_unresponsive_until_ms > clock.monotonic_ms;
-            try self.ensureWatch(.{
-                .daemon_dispatcher = daemon_dispatcher,
-                .watch = &self.visible_watch,
-                .fd = visible_client.fd,
-                .events = .{
-                    .readable = !visible_client.close_after_flush and !debug_unresponsive,
-                    .writable = !debug_unresponsive and visible_client.pendingBytes() > 0,
-                },
-                .token = visible_client.generation,
-            });
+            if (debug_unresponsive) self.visible_watch.cancel(daemon_dispatcher);
         } else {
             self.visible_watch.cancel(daemon_dispatcher);
-        }
-
-        if (pending_client.active) {
-            try self.ensureWatch(.{
-                .daemon_dispatcher = daemon_dispatcher,
-                .watch = &self.pending_watch,
-                .fd = pending_client.fd,
-                .events = pending_client.watchEvents(),
-            });
         }
 
         try self.refreshFdTask(daemon_dispatcher);
@@ -279,6 +254,30 @@ const DispatcherTerminalWorker = struct {
         }
     }
 
+    const EnsurePtyOutputWatchOptions = struct {
+        daemon_dispatcher: *dispatcher.Dispatcher,
+        watch: *WorkerFdWatch,
+        fd: c.fd_t,
+    };
+
+    fn ensurePtyOutputWatch(self: *DispatcherTerminalWorker, options: EnsurePtyOutputWatchOptions) !void {
+        _ = self;
+        const daemon_dispatcher = options.daemon_dispatcher;
+        const watch = options.watch;
+        const fd = options.fd;
+        if (watch.active() and watch.fd != fd) {
+            watch.cancel(daemon_dispatcher);
+        }
+        if (!watch.active()) {
+            watch.source = try daemon_dispatcher.byteSourceWithOptions(.{
+                .fd = fd,
+                .capacity = pty_output_source_bytes,
+                .read_options = .{ .eio_is_eof = true },
+            });
+            watch.fd = fd;
+        }
+    }
+
     fn refreshFdTask(self: *DispatcherTerminalWorker, daemon_dispatcher: *dispatcher.Dispatcher) !void {
         if (!self.fd_task.isInitialized()) {
             self.fd_task = dispatcher.dispatchTask(
@@ -290,11 +289,23 @@ const DispatcherTerminalWorker = struct {
             self.fd_task.setSourceReadiness(.any);
         }
         self.fd_task.clearSources();
+        self.fd_task.clearSinks();
+        const session = &self.terminal_worker.session;
         if (self.session_watch.active()) try self.fd_task.requireSource(self.session_watch.source);
-        if (self.visible_watch.active()) try self.fd_task.requireSource(self.visible_watch.source);
-        if (self.pending_watch.active()) try self.fd_task.requireSource(self.pending_watch.source);
+        if (session.alive and session.pty_sink.isInitialized()) try self.fd_task.requireSink(session.pty_sink);
         if (self.listen_watch.active()) try self.fd_task.requireSource(self.listen_watch.source);
-        if (self.fd_task.sources.items.len == 0) {
+        const clock = terminalWorkerPollClock(&self.terminal_worker);
+        const visible_client = &self.terminal_worker.visible_client;
+        if (visible_client.active and visible_client.debug_unresponsive_until_ms <= clock.monotonic_ms) {
+            if (!visible_client.close_after_flush) try self.fd_task.requireSource(visible_client.source);
+            try self.fd_task.requireSink(visible_client.sink);
+        }
+        const pending_client = &self.terminal_worker.pending_client;
+        if (pending_client.active) {
+            if (!pending_client.close_after_flush) try self.fd_task.requireSource(pending_client.source);
+            try self.fd_task.requireSink(pending_client.sink);
+        }
+        if (self.fd_task.sources.items.len == 0 and self.fd_task.sinks.items.len == 0) {
             self.fd_task.cancel();
         } else {
             try self.fd_task.schedule(daemon_dispatcher);
@@ -538,6 +549,20 @@ pub fn connectSingleLiveTerminalWorker(allocator: std.mem.Allocator) !c.fd_t {
     return connectTerminalWorkerHandle(allocator, found_guid orelse return error.SessionNotFound);
 }
 
+pub fn connectSingleLiveTerminalWorkerFromDaemon(
+    allocator: std.mem.Allocator,
+    daemon_dispatcher: *dispatcher.Dispatcher,
+) !c.fd_t {
+    var found_guid: ?[]const u8 = null;
+    for (terminal_worker_handles.items) |control| {
+        if (found_guid != null) {
+            return error.AmbiguousSession;
+        }
+        found_guid = control.guid;
+    }
+    return connectTerminalWorker(allocator, daemon_dispatcher, found_guid orelse return error.SessionNotFound);
+}
+
 test "single live terminal worker ambiguity does not allocate a guid copy" {
     defer if (terminal_worker_handles.items.len == 0) {
         terminal_worker_handles.deinit(app_allocator.allocator());
@@ -662,17 +687,13 @@ fn handleDispatcherTerminalWorkerFd(
         return .done;
     }
 
-    if (worker.session_watch.takeEvent()) |event| {
-        handleSessionPtyEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(event));
+    if (worker.session_watch.source.hasReadyUnit()) {
+        drainSessionOutput(&worker.terminal_worker, worker.session_watch.source);
     }
-    if (worker.visible_watch.takeEvent()) |event| {
-        handleVisibleClientEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(event));
-    }
-    if (worker.pending_watch.takeEvent()) |event| {
-        handlePendingWorkerClientEvents(&worker.terminal_worker, pollReventsFromDispatcherEvent(event));
-    }
+    handleVisibleClientReady(&worker.terminal_worker);
+    handlePendingWorkerClientReady(&worker.terminal_worker);
     if (worker.listen_watch.takeEvent()) |event| {
-        if (event.readable) handleWorkerHandoffEvent(&worker.terminal_worker, event.fd);
+        if (event.readable) handleWorkerHandoffEvent(&worker.terminal_worker, daemon_dispatcher, event.fd);
     }
 
     try finishDispatcherTerminalWorkerEvent(worker, daemon_dispatcher);
@@ -705,16 +726,6 @@ fn finishDispatcherTerminalWorkerEvent(
         return;
     }
     try worker.updateWatches(daemon_dispatcher);
-}
-
-fn pollReventsFromDispatcherEvent(event: dispatcher.FdEvent) i16 {
-    var revents: i16 = 0;
-    if (event.readable) revents |= posix.POLL.IN;
-    if (event.writable) revents |= posix.POLL.OUT;
-    if (event.hangup) revents |= posix.POLL.HUP;
-    if (event.error_event) revents |= posix.POLL.ERR;
-    if (event.invalid) revents |= posix.POLL.NVAL;
-    return revents;
 }
 
 fn runTerminalWorkerMaintenance(terminal_worker: *TerminalWorker) void {
@@ -782,22 +793,16 @@ fn flushExpiredSynchronizedOutputSessions(terminal_worker: *TerminalWorker, now_
     }
 }
 
-fn handleVisibleClientEvents(terminal_worker: *TerminalWorker, revents: i16) void {
-    if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-        disconnectVisibleClient(terminal_worker);
-        return;
-    }
-    if ((revents & posix.POLL.OUT) != 0) {
-        flushVisibleClientOutput(terminal_worker);
-    }
+fn handleVisibleClientReady(terminal_worker: *TerminalWorker) void {
+    flushVisibleClientOutput(terminal_worker);
     if (!terminal_worker.visible_client.active) return;
     if (terminal_worker.visible_client.close_after_flush) return;
-    if ((revents & posix.POLL.IN) != 0) {
+    if (terminal_worker.visible_client.source.hasReadyUnit()) {
         drainVisibleClientInput(terminal_worker);
     }
 }
 
-fn handleWorkerHandoffEvent(terminal_worker: *TerminalWorker, listen_fd: c.fd_t) void {
+fn handleWorkerHandoffEvent(terminal_worker: *TerminalWorker, daemon_dispatcher: *dispatcher.Dispatcher, listen_fd: c.fd_t) void {
     const client_fd = c.accept(listen_fd, null, null);
     if (client_fd < 0) return;
     socket_transport.setCloseOnExec(client_fd) catch {
@@ -812,33 +817,26 @@ fn handleWorkerHandoffEvent(terminal_worker: *TerminalWorker, listen_fd: c.fd_t)
         _ = c.close(client_fd);
         return;
     }
-    terminal_worker.pending_client.start(client_fd);
+    terminal_worker.pending_client.start(daemon_dispatcher, client_fd) catch {
+        _ = c.close(client_fd);
+        return;
+    };
     drainPendingWorkerClient(terminal_worker);
 }
 
-fn handlePendingWorkerClientEvents(terminal_worker: *TerminalWorker, revents: i16) void {
+fn handlePendingWorkerClientReady(terminal_worker: *TerminalWorker) void {
     if (!terminal_worker.pending_client.active) return;
-    if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-        terminal_worker.pending_client.close();
-        return;
-    }
-    if ((revents & posix.POLL.OUT) != 0) {
-        flushPendingWorkerClientOutput(terminal_worker);
-    }
+    flushPendingWorkerClientOutput(terminal_worker);
     if (!terminal_worker.pending_client.active) return;
     if (terminal_worker.pending_client.close_after_flush) return;
-    if ((revents & posix.POLL.IN) != 0) drainPendingWorkerClient(terminal_worker);
+    if (terminal_worker.pending_client.source.hasReadyUnit()) drainPendingWorkerClient(terminal_worker);
 }
 
 fn flushPendingWorkerClientOutput(terminal_worker: *TerminalWorker) void {
     const pending_client = &terminal_worker.pending_client;
     if (!pending_client.active) return;
-    switch (pending_client.drainWrites() catch {
+    if (!pending_client.hasPendingWrite() and pending_client.close_after_flush) {
         pending_client.close();
-        return;
-    }) {
-        .blocked, .progress => {},
-        .drained => if (pending_client.close_after_flush) pending_client.close(),
     }
 }
 
@@ -1053,14 +1051,8 @@ fn flushVisibleClientOutput(terminal_worker: *TerminalWorker) void {
         visible_client.debug_unresponsive_until_ms = 0;
     }
 
-    const status = visible_client.writer.writeReadyTo(visible_client.fd) catch {
+    if (!visible_client.hasPendingWrite() and visible_client.close_after_flush) {
         disconnectVisibleClient(terminal_worker);
-        return;
-    };
-    if (status == .drained) {
-        if (visible_client.close_after_flush) {
-            disconnectVisibleClient(terminal_worker);
-        }
     }
 }
 
@@ -1170,16 +1162,25 @@ fn createSession(
         var close_process = process;
         close_process.closePty();
     }
+    var pty_sink = try dispatcher.get().byteSink(.{
+        .allocator = app_allocator.allocator(),
+        .fd = process.pty_fd,
+        .max_pending_bytes = terminal_worker_state.max_pty_input_queue_bytes,
+        .low_watermark = terminal_worker_state.max_pty_input_queue_bytes / 4,
+    });
+    errdefer pty_sink.deinit();
 
     const session = &terminal_worker.session;
     session.* = Session{
         .process = process,
+        .pty_sink = pty_sink,
         .terminal_model = terminal_model,
         .size = spec.size,
         .scrollback_row_count = spec.scrollback_row_count,
         .reap_ms = spec.reap_ms,
         .alive = true,
     };
+    pty_sink = dispatcher.Sink.uninitialized();
     try session.setId(spec.session_guid);
     terminal_worker.started_session = true;
     return session;
@@ -1208,22 +1209,27 @@ fn connectVisibleClient(options: ConnectVisibleClientOptions) !void {
     if (terminal_worker.visible_client_generation == 0) terminal_worker.visible_client_generation = 1;
 
     const visible_client = &terminal_worker.visible_client;
+    const daemon_dispatcher = dispatcher.get();
+    var source = try daemon_dispatcher.frameSource(client_fd);
+    errdefer source.deinit();
+    var sink = try daemon_dispatcher.frameSink(.{ .allocator = app_allocator.allocator(), .fd = client_fd });
+    errdefer sink.deinit();
     visible_client.* = .{
         .fd = client_fd,
         .generation = terminal_worker.visible_client_generation,
         .size = resize.size,
         .connected_at_unix_ms = nowUnixMs(),
         .active = true,
-        .source = dispatch_io.FrameSource.init(app_allocator.allocator(), client_fd),
-        .source_initialized = true,
-        .writer = dispatch_io.FrameSink.init(.{ .allocator = app_allocator.allocator(), .fd = -1 }),
-        .writer_initialized = true,
+        .source = source,
+        .sink = sink,
         .capture_tty_transcript = capture_tty_transcript,
     };
+    source = dispatcher.Source.uninitialized();
+    sink = dispatcher.Sink.uninitialized();
     visible_client.presentation.setViewportOffset(resize.viewport_offset);
     errdefer {
-        if (visible_client.source_initialized) visible_client.source.deinit();
-        if (visible_client.writer_initialized) visible_client.writer.deinit();
+        visible_client.source.deinit();
+        visible_client.sink.deinit();
         visible_client.* = VisibleClient{};
     }
     try terminal_worker_render.sendSessionReady(visible_client, session);
@@ -1259,46 +1265,34 @@ fn shouldDeferSynchronizedOutput(terminal_worker: *TerminalWorker, now_ms: i64) 
     return now_ms - session.synchronized_output_since_ms < synchronized_output_max_hold_ms;
 }
 
-fn handleSessionPtyEvents(terminal_worker: *TerminalWorker, revents: i16) void {
-    if ((revents & posix.POLL.OUT) != 0) {
-        if (!terminal_worker.session.flushPtyInput()) {
-            endSessionFromPtyClose(terminal_worker);
-            return;
-        }
-    }
-    if ((revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-        drainSessionOutput(terminal_worker);
-    }
-}
-
-// Drain PTY output in bounded batches, feed it through the VT model, and then
+// Consume dispatcher-buffered PTY output, feed it through the VT model, and then
 // broadcast a patch unless synchronized-output mode asks us to hold updates
-// briefly for an atomic redraw.
-fn drainSessionOutput(terminal_worker: *TerminalWorker) void {
+// briefly for an atomic redraw. PTY EOF also arrives through this source; Linux
+// reports that as EIO, and the dispatcher source maps that PTY-specific case to
+// EOF before this function runs.
+fn drainSessionOutput(terminal_worker: *TerminalWorker, source: dispatcher.Source) void {
     const session = &terminal_worker.session;
     if (!session.alive) return;
 
-    var context = SessionPtyDrainContext{
-        .terminal_worker = terminal_worker,
-    };
-    const result = pty_process.drainMasterNonBlocking(.{
-        .fd = session.process.pty_fd,
-        .context = &context,
-        .on_bytes = feedSessionPtyBytes,
-        .limits = .{
-            .max_reads = max_live_output_reads_per_batch,
-            .max_bytes = preferred_live_output_batch_bytes,
-        },
-    }) catch {
-        endSessionFromPtyClose(terminal_worker);
-        return;
-    };
-    if (!session.alive) return;
-    if (result.eof) {
-        endSessionFromPtyEof(terminal_worker);
-        return;
+    var saw_bytes = false;
+    while (source.readBytes()) |read| {
+        switch (read) {
+            .bytes => |bytes| {
+                if (bytes.len == 0) continue;
+                feedSessionPtyBytes(terminal_worker, bytes) catch {
+                    endSessionFromPtyClose(terminal_worker);
+                    return;
+                };
+                saw_bytes = true;
+                if (!session.alive) return;
+            },
+            .eof => {
+                endSessionFromPtyEof(terminal_worker);
+                return;
+            },
+        }
     }
-    if (result.read_count == 0) return;
+    if (!saw_bytes) return;
 
     const now_ms = terminalWorkerMonotonicMs(terminal_worker);
     if (shouldDeferSynchronizedOutput(terminal_worker, now_ms)) return;
@@ -1311,12 +1305,7 @@ fn drainSessionOutput(terminal_worker: *TerminalWorker) void {
     }
 }
 
-const SessionPtyDrainContext = struct {
-    terminal_worker: *TerminalWorker,
-};
-
-fn feedSessionPtyBytes(context: *SessionPtyDrainContext, bytes: []const u8) !void {
-    const terminal_worker = context.terminal_worker;
+fn feedSessionPtyBytes(terminal_worker: *TerminalWorker, bytes: []const u8) !void {
     if (!terminal_worker.session.alive) return error.SessionEndedDuringPtyDrain;
 
     try feedSessionOutputBytes(terminal_worker, bytes);
@@ -1487,7 +1476,7 @@ fn requestSessionPtyHangup(terminal_worker: *TerminalWorker) void {
 
     disconnectVisibleClient(terminal_worker);
     if (session.process.hasOpenPty()) {
-        session.process.closePtyForHangup();
+        session.closePtyForHangup();
         session.synchronized_output_since_ms = 0;
     }
     _ = reapPtyHangupSessionIfExited(terminal_worker);
@@ -1762,9 +1751,9 @@ fn disconnectVisibleClient(terminal_worker: *TerminalWorker) void {
     const visible_client = &terminal_worker.visible_client;
     if (!visible_client.active) return;
 
+    visible_client.source.deinit();
+    visible_client.sink.deinit();
     _ = c.close(visible_client.fd);
-    if (visible_client.source_initialized) visible_client.source.deinit();
-    if (visible_client.writer_initialized) visible_client.writer.deinit();
     visible_client.* = VisibleClient{};
     refreshVisibleClientConnectionState(terminal_worker);
 }
@@ -1793,7 +1782,7 @@ fn endSession(terminal_worker: *TerminalWorker, reason: u8, exit_info: ExitInfo)
     session.synchronized_output_since_ms = 0;
 
     sendSessionEndedToVisibleClient(terminal_worker, reason, exit_info);
-    session.process.closePty();
+    session.closePty();
     if (session.terminal_model) |model| {
         model.destroy();
         session.terminal_model = null;
@@ -1847,7 +1836,7 @@ fn endSessionFromPtyEof(terminal_worker: *TerminalWorker) void {
     if (!session.alive) return;
     session.clearPendingPlainOutput();
     session.synchronized_output_since_ms = 0;
-    session.process.closePty();
+    session.closePty();
     session.pty_eof_wait_started_ms = terminalWorkerMonotonicMs(terminal_worker);
 }
 

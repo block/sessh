@@ -42,7 +42,7 @@ pub fn main() !void {
 
 fn runMain(blocking: core_blocking.Blocking) !void {
     // The installed binary is shared by every role. Normal packaging creates
-    // role-named symlinks (`sesshd`, `sessh-broker`, etc.), while the colon
+    // role-named symlinks (`sesshd`, `sessh-bridge`, etc.), while the colon
     // commands remain explicit internal entry points for bootstrap paths that
     // only know how to invoke `sessh` itself.
     const allocator = app_allocator.allocator();
@@ -58,8 +58,8 @@ fn runMain(blocking: core_blocking.Blocking) !void {
     if (std.mem.eql(u8, exe_name, "sesshd")) {
         return daemon.run(blocking, allocator, args[0], args[1..]);
     }
-    if (std.mem.eql(u8, exe_name, "sessh-broker")) {
-        return daemon.forwardBrokerToDaemon(blocking, allocator, args[0], args[1..]);
+    if (std.mem.eql(u8, exe_name, "sessh-bridge")) {
+        return daemon.forwardBridgeToDaemon(blocking, allocator, args[0], args[1..]);
     }
     if (std.mem.eql(u8, exe_name, "sessh-proxy")) {
         return transport_ssh.runProxyStream(blocking, allocator, args[0], args[1..]);
@@ -77,8 +77,8 @@ fn runMain(blocking: core_blocking.Blocking) !void {
         return daemon.reexecDaemonOrRun(blocking, allocator, args[0], args[2..]);
     }
 
-    if (std.mem.eql(u8, args[1], ":broker:")) {
-        return daemon.reexecBrokerOrForward(blocking, allocator, args[0], args[2..]);
+    if (std.mem.eql(u8, args[1], ":bridge:")) {
+        return daemon.reexecBridgeOrForward(blocking, allocator, args[0], args[2..]);
     }
 
     if (std.mem.eql(u8, args[1], ":terminal-remote:")) {
@@ -236,6 +236,7 @@ test {
     _ = @import("daemon/client_router.zig");
     _ = @import("daemon/client.zig");
     _ = @import("daemon/cleanup.zig");
+    _ = @import("daemon/cleanup_queue.zig");
     _ = @import("daemon/cleanup_scheduler.zig");
     _ = @import("daemon/executable.zig");
     _ = @import("daemon/log.zig");

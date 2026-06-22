@@ -39,6 +39,35 @@ TOKEN_CREATION = (
     ("blocking.fromTest(", "Blocking test token creation"),
 )
 
+FOREGROUND_FRAME_IO = 'foreground_frame_io = @import('
+
+FOREGROUND_FRAME_IO_ALLOWED = {
+    "src/daemon/handshake.zig",
+    "src/session/visible_client.zig",
+    "src/stream/proxy_diagnostics_channel.zig",
+    "src/transport/foreground_frame_io.zig",
+    "src/transport/proxy_entry.zig",
+    "src/transport/ssh.zig",
+}
+
+DIRECT_DISPATCH_IO_CONSTRUCTORS = (
+    ("ByteSource.init(", "direct ByteSource construction"),
+    ("ByteSource.initWithOptions(", "direct ByteSource construction"),
+    ("FrameSource.init(", "direct FrameSource construction"),
+    ("ByteSink.init(", "direct ByteSink construction"),
+    ("FrameSink.init(", "direct FrameSink construction"),
+    ("dispatch_io.ByteSource.init(", "direct ByteSource construction"),
+    ("dispatch_io.ByteSource.initWithOptions(", "direct ByteSource construction"),
+    ("dispatch_io.FrameSource.init(", "direct FrameSource construction"),
+    ("dispatch_io.ByteSink.init(", "direct ByteSink construction"),
+    ("dispatch_io.FrameSink.init(", "direct FrameSink construction"),
+)
+
+DIRECT_DISPATCH_IO_ALLOWED = {
+    "src/core/dispatch_io.zig",
+    "src/core/dispatcher.zig",
+}
+
 
 def strip_line_comment(line: str) -> str:
     # This checker is a policy guard, not a Zig parser. Removing plain line
@@ -108,6 +137,22 @@ def check_file(path: Path) -> list[str]:
                 errors.append(f"{rel}:{index + 1}: {label} is only allowed in src/main.zig")
             if needle == "blocking.fromTest(":
                 errors.append(f"{rel}:{index + 1}: {label} is only allowed inside Zig test blocks")
+
+        if FOREGROUND_FRAME_IO in code and rel not in FOREGROUND_FRAME_IO_ALLOWED:
+            errors.append(
+                f"{rel}:{index + 1}: foreground_frame_io is only for documented "
+                "setup/handshake boundaries; long-lived protocol paths must use "
+                "dispatcher FrameSource/FrameSink"
+            )
+
+        if rel not in DIRECT_DISPATCH_IO_ALLOWED:
+            for needle, label in DIRECT_DISPATCH_IO_CONSTRUCTORS:
+                if needle in code:
+                    errors.append(
+                        f"{rel}:{index + 1}: {label} must go through "
+                        "dispatcher.byteSource/byteSink/frameSource/frameSink "
+                        "so each fd has one process-owned reader and writer"
+                    )
 
     return errors
 

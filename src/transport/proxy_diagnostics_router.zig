@@ -62,19 +62,19 @@ pub fn registerOpenFromDaemon(options: RegisterOpenFromDaemonOptions) !void {
         .allocator = allocator,
         .fd = fd,
         .guid = guid,
-        .reader = protocol.FrameReader.init(allocator),
-        .writer = dispatch_io.FrameSink.init(.{ .allocator = allocator, .fd = -1 }),
     };
-    errdefer context.reader.deinit();
-    errdefer context.writer.deinit();
-    context.source = try options.daemon_dispatcher.fdSource(fd, .{ .readable = true });
-    context.task = try dispatcher.fdDispatchTask(
+    context.source = try options.daemon_dispatcher.frameSource(fd);
+    errdefer context.source.deinit();
+    context.sink = try options.daemon_dispatcher.frameSink(.{ .allocator = allocator, .fd = fd });
+    errdefer context.sink.deinit();
+    context.task = dispatcher.dispatchTask(
         VisibleConnection,
         allocator,
         context,
-        context.source,
         readVisibleConnection,
     );
+    try context.task.requireSource(context.source);
+    try context.task.requireSink(context.sink);
     try context.task.schedule(options.daemon_dispatcher);
 }
 
@@ -82,22 +82,20 @@ const VisibleConnection = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t = -1,
     guid: []u8,
-    reader: protocol.FrameReader,
-    writer: dispatch_io.FrameSink,
     source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    sink: dispatcher.Sink = dispatcher.Sink.uninitialized(),
     task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
 
     fn deinit(self: *VisibleConnection, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
         _ = daemon_dispatcher;
         self.task.deinit();
         self.source.deinit();
+        self.sink.deinit();
         if (self.fd >= 0) {
             unregisterVisible(self.fd);
             _ = c.close(self.fd);
             self.fd = -1;
         }
-        self.reader.deinit();
-        self.writer.deinit();
         self.allocator.free(self.guid);
         const allocator = self.allocator;
         self.* = undefined;
@@ -109,9 +107,8 @@ fn readVisibleConnection(
     connection: *VisibleConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
     _: *dispatcher.DispatchTask,
-    fd_event: dispatcher.FdEvent,
 ) !dispatch_io.DispatchTaskStatus {
-    readVisibleConnectionInner(connection, daemon_dispatcher, fd_event) catch {
+    readVisibleConnectionInner(connection, daemon_dispatcher) catch {
         connection.deinit(daemon_dispatcher);
         return .done;
     };
@@ -121,28 +118,14 @@ fn readVisibleConnection(
 fn readVisibleConnectionInner(
     connection: *VisibleConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    fd_event: dispatcher.FdEvent,
 ) !void {
     // Diagnostics clients are optional side channels for visible proxy UI. They
     // receive connection events from the daemon but must never be allowed to
     // block the daemon's pooled SSH transport or proxy streams.
-    if (fd_event.error_event or fd_event.invalid) {
-        connection.deinit(daemon_dispatcher);
-        return;
-    }
-    if (fd_event.writable and connection.writer.hasPendingWrite()) {
-        _ = try connection.writer.writeReadyTo(connection.fd);
-        try updateVisibleConnectionSource(daemon_dispatcher, connection);
-    }
-    if (!fd_event.readable) {
-        if (fd_event.hangup) connection.deinit(daemon_dispatcher);
-        return;
-    }
     while (true) {
-        switch (try connection.reader.readReady(connection.fd)) {
+        switch (try connection.source.readFrame()) {
             .blocked => return,
-            .progress => continue,
-            .eof, .truncated_frame => {
+            .eof => {
                 connection.deinit(daemon_dispatcher);
                 return;
             },
@@ -154,15 +137,6 @@ fn readVisibleConnectionInner(
             },
         }
     }
-}
-
-fn updateVisibleConnectionSource(daemon_dispatcher: *dispatcher.Dispatcher, connection: *VisibleConnection) !void {
-    if (!connection.source.isInitialized()) return;
-    connection.source.setFdEvents(.{
-        .readable = true,
-        .writable = connection.writer.hasPendingWrite(),
-    });
-    if (connection.task.isInitialized()) try connection.task.schedule(daemon_dispatcher);
 }
 
 fn registerVisible(allocator: std.mem.Allocator, guid: []const u8, connection: *VisibleConnection) !void {
@@ -265,11 +239,10 @@ pub fn forwardFromStream(options: ForwardFromStreamOptions) !void {
     const guid = options.guid;
     if (!try streamFrameIsAllowed(allocator, frame)) return error.UnexpectedProxyDiagnosticsFrame;
     const visible = visibleConnection(guid) orelse return;
-    visible.writer.writeFrame(frame.message_type, frame.payload) catch |err| {
+    visible.sink.writeFrame(frame.message_type, frame.payload) catch |err| {
         unregisterVisible(visible.fd);
         return err;
     };
-    try updateVisibleConnectionSource(options.daemon_dispatcher, visible);
 }
 
 fn streamFrameIsAllowed(allocator: std.mem.Allocator, frame: protocol.OwnedFrame) !bool {
@@ -339,7 +312,7 @@ test "routes diagnostics and retry by proxy guid" {
         .allocator = allocator,
         .fd = visible[0],
         .guid = visible_guid,
-        .reader = protocol.FrameReader.init(allocator),
+        .frame_source = dispatch_io.FrameSource.init(allocator, visible[0]),
         .writer = dispatch_io.FrameSink.init(.{ .allocator = allocator, .fd = -1 }),
     };
     defer visible_context.deinit(null);

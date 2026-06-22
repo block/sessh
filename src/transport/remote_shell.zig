@@ -6,13 +6,13 @@ const bootstrapper_script = @embedFile("../bootstrapper.sh");
 pub const bootstrap_exec_encoded_arg_prefix = "b64:";
 
 pub const Entrypoint = enum {
-    broker,
+    bridge,
 
     pub fn arg(self: Entrypoint) []const u8 {
         return switch (self) {
             // Role process for the daemon-to-daemon tunnel bridge. The name is
-            // about brokering tunnel bytes across ssh stdio, not owning sessions.
-            .broker => "sessh-broker",
+            // about bridging tunnel bytes across ssh stdio, not owning sessions.
+            .bridge => "sessh-bridge",
         };
     }
 };
@@ -25,10 +25,10 @@ pub fn bootstrapCommand(allocator: std.mem.Allocator) ![]u8 {
     return shCommand(allocator, bootstrapper_script);
 }
 
-pub fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []const u8) ![]u8 {
+pub fn directBridgeCommand(allocator: std.mem.Allocator, bridge_args: []const []const u8) ![]u8 {
     // `--no-bootstrap` can only assume a `sessh` executable is already on the
-    // remote PATH. The bootstrapped path uses the `sessh-broker` role name;
-    // this fallback enters broker mode through `sessh` itself and immediately
+    // remote PATH. The bootstrapped path uses the `sessh-bridge` role name;
+    // this fallback enters bridge mode through `sessh` itself and immediately
     // re-execs the role symlink once the remote namespace is known.
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(allocator);
@@ -36,8 +36,8 @@ pub fn directBrokerCommand(allocator: std.mem.Allocator, broker_args: []const []
     defer allocator.free(client_version);
     try script.appendSlice(allocator, "SESSH_CLIENT_VERSION=");
     try script.appendSlice(allocator, client_version);
-    try script.appendSlice(allocator, " exec sessh :broker:");
-    for (broker_args) |arg| {
+    try script.appendSlice(allocator, " exec sessh :bridge:");
+    for (bridge_args) |arg| {
         const quoted = try shellQuote(allocator, arg);
         defer allocator.free(quoted);
         try script.append(allocator, ' ');

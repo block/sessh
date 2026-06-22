@@ -28,16 +28,18 @@ pub const VisibleClient = struct {
     close_after_flush: bool = false,
     debug_unresponsive_until_ms: i64 = 0,
     presentation: visible_client_presentation.PresentationState = .{},
-    writer: dispatch_io.FrameSink = undefined,
-    writer_initialized: bool = false,
+    sink: dispatcher.Sink = dispatcher.Sink.uninitialized(),
     input_pending: input_translation.PendingInput = .{},
-    source: dispatch_io.FrameSource = undefined,
-    source_initialized: bool = false,
+    source: dispatcher.Source = dispatcher.Source.uninitialized(),
     capture_tty_transcript: bool = false,
 
     pub fn pendingBytes(self: *const VisibleClient) usize {
-        if (!self.writer_initialized) return 0;
-        return self.writer.pendingBytes();
+        if (!self.sink.isInitialized()) return 0;
+        return self.sink.frame().pendingBytes();
+    }
+
+    pub fn hasPendingWrite(self: *const VisibleClient) bool {
+        return self.sink.isInitialized() and self.sink.hasPendingWrite();
     }
 
     pub fn inputModeState(self: *const VisibleClient) input_translation.ModeState {
@@ -74,8 +76,8 @@ pub const VisibleClient = struct {
     }
 
     pub fn writeFrame(self: *VisibleClient, message_type: protocol.MessageType, payload: []const u8) !void {
-        if (!self.writer_initialized) return error.VisibleClientWriterMissing;
-        self.writer.writeFrameBounded(.{
+        if (!self.sink.isInitialized()) return error.VisibleClientWriterMissing;
+        self.sink.frame().writeFrameBounded(.{
             .message_type = message_type,
             .payload = payload,
             .max_pending_bytes = max_output_pending_bytes,
@@ -86,17 +88,17 @@ pub const VisibleClient = struct {
     }
 
     pub fn readReady(self: *VisibleClient) !dispatch_io.SourceReadStatus {
-        if (!self.source_initialized) return error.VisibleClientReaderMissing;
-        return self.source.readReady();
+        if (!self.source.isInitialized()) return error.VisibleClientReaderMissing;
+        return self.source.frame().readReady();
     }
 
     pub fn popFrame(self: *VisibleClient) ?protocol.OwnedFrame {
-        if (!self.source_initialized) return null;
-        return self.source.popFrame();
+        if (!self.source.isInitialized()) return null;
+        return self.source.frame().popFrame();
     }
 
     pub fn readFrame(self: *VisibleClient) !dispatch_io.FrameSource.Read {
-        if (!self.source_initialized) return error.VisibleClientReaderMissing;
+        if (!self.source.isInitialized()) return error.VisibleClientReaderMissing;
         return self.source.readFrame();
     }
 };
@@ -104,48 +106,43 @@ pub const VisibleClient = struct {
 pub const PendingWorkerClient = struct {
     fd: c.fd_t = -1,
     active: bool = false,
-    source: dispatch_io.FrameSource = undefined,
-    source_initialized: bool = false,
-    writer: dispatch_io.FrameSink = undefined,
-    writer_initialized: bool = false,
+    source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    sink: dispatcher.Sink = dispatcher.Sink.uninitialized(),
     close_after_flush: bool = false,
 
-    pub fn start(self: *PendingWorkerClient, fd: c.fd_t) void {
+    pub fn start(self: *PendingWorkerClient, daemon_dispatcher: *dispatcher.Dispatcher, fd: c.fd_t) !void {
         self.close();
+        var source = try daemon_dispatcher.frameSource(fd);
+        errdefer source.deinit();
+        var sink = try daemon_dispatcher.frameSink(.{ .allocator = app_allocator.allocator(), .fd = fd });
+        errdefer sink.deinit();
         self.* = .{
             .fd = fd,
             .active = true,
-            .source = dispatch_io.FrameSource.init(app_allocator.allocator(), fd),
-            .source_initialized = true,
-            .writer = dispatch_io.FrameSink.init(.{ .allocator = app_allocator.allocator(), .fd = -1 }),
-            .writer_initialized = true,
+            .source = source,
+            .sink = sink,
         };
     }
 
     pub fn close(self: *PendingWorkerClient) void {
+        self.source.deinit();
+        self.sink.deinit();
         if (self.fd >= 0) {
             _ = c.close(self.fd);
         }
-        if (self.source_initialized) self.source.deinit();
-        if (self.writer_initialized) self.writer.deinit();
         self.* = .{};
     }
 
     pub fn takeFd(self: *PendingWorkerClient) c.fd_t {
         const fd = self.fd;
         self.fd = -1;
+        self.source.deinit();
+        self.sink.deinit();
         return fd;
     }
 
     pub fn hasPendingWrite(self: *const PendingWorkerClient) bool {
-        return self.writer_initialized and self.writer.hasPendingWrite();
-    }
-
-    pub fn watchEvents(self: *const PendingWorkerClient) dispatcher.FdEvents {
-        return .{
-            .readable = !self.close_after_flush,
-            .writable = self.hasPendingWrite(),
-        };
+        return self.sink.isInitialized() and self.sink.hasPendingWrite();
     }
 
     pub fn queueError(self: *PendingWorkerClient, info: protocol.ErrorInfo) !void {
@@ -175,33 +172,28 @@ pub const PendingWorkerClient = struct {
     }
 
     pub fn writeDaemonTunnelPayload(self: *PendingWorkerClient, payload: protocol.DaemonTunnelPayload) !void {
-        if (!self.writer_initialized) return error.PendingWorkerClientWriterMissing;
-        try self.writer.writeDaemonTunnelPayload(payload);
-    }
-
-    pub fn drainWrites(self: *PendingWorkerClient) !dispatch_io.SinkWriteStatus {
-        if (!self.writer_initialized or self.fd < 0) return .drained;
-        return self.writer.writeReadyTo(self.fd);
+        if (!self.sink.isInitialized()) return error.PendingWorkerClientWriterMissing;
+        try self.sink.frame().writeDaemonTunnelPayload(payload);
     }
 
     pub fn readReady(self: *PendingWorkerClient) !dispatch_io.SourceReadStatus {
-        if (!self.source_initialized) return error.PendingWorkerClientReaderMissing;
-        return self.source.readReady();
+        if (!self.source.isInitialized()) return error.PendingWorkerClientReaderMissing;
+        return self.source.frame().readReady();
     }
 
     pub fn popFrame(self: *PendingWorkerClient) ?protocol.OwnedFrame {
-        if (!self.source_initialized) return null;
-        return self.source.popFrame();
+        if (!self.source.isInitialized()) return null;
+        return self.source.frame().popFrame();
     }
 
     pub fn readFrame(self: *PendingWorkerClient) !dispatch_io.FrameSource.Read {
-        if (!self.source_initialized) return error.PendingWorkerClientReaderMissing;
+        if (!self.source.isInitialized()) return error.PendingWorkerClientReaderMissing;
         return self.source.readFrame();
     }
 
     fn writeFrame(self: *PendingWorkerClient, message_type: protocol.MessageType, payload: []const u8) !void {
-        if (!self.writer_initialized) return error.PendingWorkerClientWriterMissing;
-        try self.writer.writeFrame(message_type, payload);
+        if (!self.sink.isInitialized()) return error.PendingWorkerClientWriterMissing;
+        try self.sink.writeFrame(message_type, payload);
     }
 };
 
@@ -235,15 +227,17 @@ test "pending worker client drains queued error before close" {
     defer {
         _ = c.close(pipe[0]);
     }
+    var d = try dispatcher.Dispatcher.init(std.testing.allocator);
+    defer d.deinit();
 
     var pending = PendingWorkerClient{};
-    pending.start(pipe[1]);
+    try pending.start(&d, pipe[1]);
     defer pending.close();
 
     try pending.queueProtocolError("bad request");
     pending.close_after_flush = true;
     try std.testing.expect(pending.hasPendingWrite());
-    try std.testing.expectEqual(dispatch_io.SinkWriteStatus.drained, try pending.drainWrites());
+    try std.testing.expectEqual(dispatch_io.SinkWriteStatus.drained, try pending.sink.frame().writeReady());
     try std.testing.expect(!pending.hasPendingWrite());
 
     var frame = try protocol_test_helpers.readFrameForTest(std.testing.allocator, pipe[0]);

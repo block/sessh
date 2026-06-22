@@ -6,9 +6,9 @@ const c = std.c;
 const posix = std.posix;
 
 const core_blocking = @import("../core/blocking.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const core_fds = @import("../core/fds.zig");
-const io = @import("../core/io.zig");
 
 const buffer_len = 8192;
 
@@ -25,65 +25,71 @@ pub fn forwardRawDuplex(blocking: core_blocking.Blocking, left: SplitEndpointFds
     try core_fds.setNonBlocking(left.write);
     try core_fds.setNonBlocking(right_fd);
 
-    var left_to_right = RawDirection{
-        .read_fd = left.read,
-        .write_fd = right_fd,
-    };
-    var right_to_left = RawDirection{
-        .read_fd = right_fd,
-        .write_fd = left.write,
-    };
-
     // this process is only a byte bridge. It uses the
     // process Dispatcher initialized by main.
     const raw_dispatcher = dispatcher.get();
-    var bridge = RawBridge{
-        .left_to_right = &left_to_right,
-        .right_to_left = &right_to_left,
-    };
+    var bridge = try RawBridge.init(raw_dispatcher, .{
+        .left_to_right = .{ .read_fd = left.read, .write_fd = right_fd },
+        .right_to_left = .{ .read_fd = right_fd, .write_fd = left.write },
+    });
     defer bridge.deinit();
     try bridge.start(raw_dispatcher);
     try blocking.runLoop();
 }
 
 const RawBridge = struct {
-    left_to_right: *RawDirection,
-    right_to_left: *RawDirection,
-    sources: [3]dispatcher.Source = .{
-        dispatcher.Source.uninitialized(),
-        dispatcher.Source.uninitialized(),
-        dispatcher.Source.uninitialized(),
-    },
+    left_to_right: RawDirection,
+    right_to_left: RawDirection,
     task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
 
+    const DirectionFds = struct {
+        read_fd: c.fd_t,
+        write_fd: c.fd_t,
+    };
+
+    const Init = struct {
+        left_to_right: DirectionFds,
+        right_to_left: DirectionFds,
+    };
+
+    fn init(raw_dispatcher: *dispatcher.Dispatcher, options: Init) !RawBridge {
+        var left_to_right = try RawDirection.init(raw_dispatcher, options.left_to_right);
+        errdefer left_to_right.deinit();
+        var right_to_left = try RawDirection.init(raw_dispatcher, options.right_to_left);
+        errdefer right_to_left.deinit();
+        return .{
+            .left_to_right = left_to_right,
+            .right_to_left = right_to_left,
+        };
+    }
+
     fn start(self: *RawBridge, raw_dispatcher: *dispatcher.Dispatcher) !void {
-        // Three fds model the two directions: left input, left output, and the
-        // bidirectional right fd. The right Source carries both readable and
-        // writable interests, preserving the invariant that each fd has one
-        // dispatcher Source.
-        self.sources[0] = try raw_dispatcher.fdSource(self.left_to_right.read_fd, .{});
-        self.sources[1] = try raw_dispatcher.fdSource(self.right_to_left.write_fd, .{});
-        self.sources[2] = try raw_dispatcher.fdSource(self.right_to_left.read_fd, .{});
         self.task = dispatcher.dispatchTask(RawBridge, raw_dispatcher.allocator, self, runRawBridgeTask);
         self.task.setSourceReadiness(.any);
-        for (self.sources) |source| try self.task.requireSource(source);
         try self.updateSources(raw_dispatcher);
-        try self.task.schedule(raw_dispatcher);
     }
 
     fn deinit(self: *RawBridge) void {
         self.task.deinit();
-        for (&self.sources) |*source| source.deinit();
+        self.left_to_right.deinit();
+        self.right_to_left.deinit();
     }
 
     fn updateSources(self: *RawBridge, raw_dispatcher: *dispatcher.Dispatcher) !void {
-        self.sources[0].setFdEvents(.{ .readable = self.left_to_right.wantsRead() });
-        self.sources[1].setFdEvents(.{ .writable = self.right_to_left.wantsWrite() });
-        self.sources[2].setFdEvents(.{
-            .readable = self.right_to_left.wantsRead(),
-            .writable = self.left_to_right.wantsWrite(),
-        });
-        if (self.left_to_right.done() and self.right_to_left.done()) raw_dispatcher.stop();
+        self.task.clearSources();
+        self.task.clearSinks();
+        try self.left_to_right.configureTask(&self.task);
+        try self.right_to_left.configureTask(&self.task);
+        if (self.left_to_right.done() and self.right_to_left.done()) {
+            raw_dispatcher.stop();
+            self.task.cancel();
+            return;
+        }
+        if (self.task.sources.items.len == 0 and self.task.sinks.items.len == 0) {
+            self.task.cancel();
+        } else {
+            try self.task.schedule(raw_dispatcher);
+        }
     }
 };
 
@@ -93,79 +99,66 @@ fn runRawBridgeTask(
     task: *dispatcher.DispatchTask,
 ) !@import("../core/dispatch_io.zig").DispatchTaskStatus {
     _ = task;
-    if (bridge.sources[0].takeFdEvent()) |fd_event| {
-        if (fd_event.readable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-            bridge.left_to_right.readReady();
-        }
-    }
-    if (bridge.sources[1].takeFdEvent()) |fd_event| {
-        if (fd_event.writable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-            bridge.right_to_left.writeReady();
-        }
-    }
-    if (bridge.sources[2].takeFdEvent()) |fd_event| {
-        if (fd_event.writable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-            bridge.left_to_right.writeReady();
-        }
-        if (fd_event.readable or fd_event.hangup or fd_event.error_event or fd_event.invalid) {
-            bridge.right_to_left.readReady();
-        }
-    }
+    try bridge.left_to_right.readReady();
+    bridge.left_to_right.noteSinkProgress();
+    try bridge.right_to_left.readReady();
+    bridge.right_to_left.noteSinkProgress();
     try bridge.updateSources(raw_dispatcher);
     return .pending;
 }
 
 const RawDirection = struct {
-    read_fd: c.fd_t,
     write_fd: c.fd_t,
-    buf: [buffer_len]u8 = undefined,
-    start: usize = 0,
-    len: usize = 0,
+    source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    sink: dispatcher.Sink = dispatcher.Sink.uninitialized(),
     read_closed: bool = false,
     write_closed: bool = false,
 
+    fn init(raw_dispatcher: *dispatcher.Dispatcher, fds: RawBridge.DirectionFds) !RawDirection {
+        var source = try raw_dispatcher.byteSource(fds.read_fd, buffer_len);
+        errdefer source.deinit();
+        var sink = try raw_dispatcher.byteSink(.{
+            .allocator = raw_dispatcher.allocator,
+            .fd = fds.write_fd,
+            .max_pending_bytes = buffer_len,
+        });
+        errdefer sink.deinit();
+        return .{
+            .write_fd = fds.write_fd,
+            .source = source,
+            .sink = sink,
+        };
+    }
+
+    fn deinit(self: *RawDirection) void {
+        self.source.deinit();
+        self.sink.deinit();
+    }
+
     fn done(self: *const RawDirection) bool {
-        return self.read_closed and self.len == 0 and self.write_closed;
+        return self.read_closed and !self.sink.hasPendingWrite() and self.write_closed;
     }
 
     fn wantsRead(self: *const RawDirection) bool {
-        return !self.read_closed and self.len == 0;
+        return !self.read_closed and !self.sink.hasPendingWrite();
     }
 
-    fn wantsWrite(self: *const RawDirection) bool {
-        return !self.write_closed and self.len > 0;
+    fn configureTask(self: *RawDirection, task: *dispatcher.DispatchTask) !void {
+        if (self.wantsRead()) try task.requireSource(self.source);
+        if (self.sink.hasPendingWrite()) try task.requireSink(self.sink);
     }
 
-    fn readReady(self: *RawDirection) void {
-        if (self.read_closed or self.len != 0) return;
-        const n = c.read(self.read_fd, &self.buf, self.buf.len);
-        if (n < 0) return switch (posix.errno(n)) {
-            .AGAIN, .INTR => {},
-            else => self.closeReadAndMaybeWrite(),
-        };
-        if (n == 0) return self.closeReadAndMaybeWrite();
-        self.start = 0;
-        self.len = @intCast(n);
-        io.noteRead(self.read_fd, self.buf[0..self.len]);
-    }
-
-    fn writeReady(self: *RawDirection) void {
-        if (self.write_closed or self.len == 0) return;
-        const bytes = self.buf[self.start .. self.start + self.len];
-        const n = c.write(self.write_fd, bytes.ptr, bytes.len);
-        if (n < 0) return switch (posix.errno(n)) {
-            .AGAIN, .INTR => {},
-            else => self.closeWrite(),
-        };
-        if (n == 0) return;
-        const written: usize = @intCast(n);
-        io.noteWrite(self.write_fd, bytes[0..written]);
-        self.start += written;
-        self.len -= written;
-        if (self.len == 0) {
-            self.start = 0;
-            self.closeWriteIfReadClosed();
+    fn readReady(self: *RawDirection) !void {
+        if (!self.wantsRead()) return;
+        const read = self.source.readBytes() orelse return;
+        switch (read) {
+            .bytes => |bytes| try self.sink.writeBytes(bytes),
+            .eof => self.closeReadAndMaybeWrite(),
         }
+    }
+
+    fn noteSinkProgress(self: *RawDirection) void {
+        if (!self.sink.hasPendingWrite()) self.closeWriteIfReadClosed();
     }
 
     fn closeReadAndMaybeWrite(self: *RawDirection) void {
@@ -174,12 +167,8 @@ const RawDirection = struct {
     }
 
     fn closeWriteIfReadClosed(self: *RawDirection) void {
-        if (!self.read_closed or self.len != 0) return;
+        if (!self.read_closed or self.sink.hasPendingWrite()) return;
         _ = c.shutdown(self.write_fd, c.SHUT.WR);
-        self.write_closed = true;
-    }
-
-    fn closeWrite(self: *RawDirection) void {
         self.write_closed = true;
     }
 };
@@ -222,6 +211,9 @@ test "raw duplex propagates right-side eof to the left peer" {
 }
 
 test "raw direction keeps pending bytes when destination is backpressured" {
+    try dispatcher.initGlobal(std.testing.allocator);
+    defer dispatcher.deinitGlobal();
+
     const pipe = try posix.pipe();
     defer posix.close(pipe[0]);
     defer posix.close(pipe[1]);
@@ -238,12 +230,9 @@ test "raw direction keeps pending bytes when destination is backpressured" {
         }
     }
 
-    var direction = RawDirection{
-        .read_fd = -1,
-        .write_fd = pipe[1],
-    };
-    @memcpy(direction.buf[0.."pending".len], "pending");
-    direction.len = "pending".len;
-    direction.writeReady();
-    try std.testing.expectEqualStrings("pending", direction.buf[direction.start .. direction.start + direction.len]);
+    var direction = try RawDirection.init(dispatcher.get(), .{ .read_fd = pipe[0], .write_fd = pipe[1] });
+    defer direction.deinit();
+    try direction.sink.writeBytes("pending");
+    try std.testing.expectEqual(dispatch_io.SinkWriteStatus.blocked, try direction.sink.byte().writeReady());
+    try std.testing.expect(direction.sink.hasPendingWrite());
 }

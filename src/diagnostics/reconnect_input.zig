@@ -6,7 +6,9 @@ const c = std.c;
 const posix = std.posix;
 
 const core_blocking = @import("../core/blocking.zig");
-const io_helpers = @import("../core/io.zig");
+const core_fds = @import("../core/fds.zig");
+const dispatch_io = @import("../core/dispatch_io.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const reconnect_control = @import("../reconnect/control.zig");
 const terminal = @import("../tty/terminal.zig");
 
@@ -39,59 +41,9 @@ pub const State = struct {
         blocking: core_blocking.Blocking,
         options: PollOptions,
     ) !Decision {
-        // Reconnect UI is intentionally local to the visible client process. It
-        // watches terminal input plus an optional diagnostics notifier, filters
-        // sessh controls, and leaves ordinary user input untouched until a
-        // disconnected/unresponsive state asks us to intercept it.
-        var pollfds = [_]posix.pollfd{
-            .{
-                .fd = options.terminal_fds.input,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = options.diagnostic_notify_read_fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-        };
-        const poll_count: usize = if (options.diagnostic_notify_read_fd >= 0) 2 else 1;
-        const ready = try blocking.poll(
-            pollfds[0..poll_count],
-            self.effectivePollTimeout(options.timeout_ms, options.overlay_presentation, options.now_ms),
-        );
-        if (ready == 0) return .wait_elapsed;
-        if ((pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .client_hangup;
-        if (poll_count > 1 and (pollfds[1].revents & posix.POLL.IN) != 0) {
-            drainDiagnosticNotifier(options.diagnostic_notify_read_fd);
-        }
-        if ((pollfds[0].revents & posix.POLL.IN) == 0) return .wait_elapsed;
-
-        var input: [256]u8 = undefined;
-        var filtered: [512]u8 = undefined;
-        const n = c.read(options.terminal_fds.input, &input, input.len);
-        if (n <= 0) return .client_hangup;
-        io_helpers.noteRead(options.terminal_fds.input, input[0..@intCast(n)]);
-
-        const bytes = input[0..@intCast(n)];
-        switch (reconnect_control.scanInput(bytes)) {
-            .reconnect_now => {
-                self.reconnect_acknowledged = true;
-                return .reconnect_now;
-            },
-            .none => {},
-        }
-        const result = self.escape_filter.filter(bytes, &filtered);
-        if (result.end) |end| switch (end) {
-            .disconnect => return .client_hangup,
-            .help => {},
-            .repaint => {},
-        };
-        if (bytes.len > 0) {
-            self.input_during_disconnect = true;
-            try self.alertDisconnectedInput(blocking, options.terminal_fds.output, options.now_ms);
-        }
-        return .wait_elapsed;
+        var wait = try PollWait.init(self, blocking, options);
+        defer wait.deinit();
+        return wait.run();
     }
 
     pub fn refreshDisconnectedInputFlash(self: *State, blocking: core_blocking.Blocking, output_fd: c.fd_t, now_ms: u64) !void {
@@ -127,6 +79,152 @@ pub const State = struct {
     }
 };
 
+const PollWait = struct {
+    state: *State,
+    blocking: core_blocking.Blocking,
+    options: PollOptions,
+    input_source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    diagnostic_source: dispatcher.Source = dispatcher.Source.uninitialized(),
+    input_flags_guard: ?core_fds.StatusFlagsGuard = null,
+    diagnostic_flags_guard: ?core_fds.StatusFlagsGuard = null,
+    io_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
+    timer_task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
+    decision: ?Decision = null,
+
+    fn init(state: *State, blocking: core_blocking.Blocking, options: PollOptions) !PollWait {
+        var input_flags_guard = try core_fds.StatusFlagsGuard.setNonBlocking(options.terminal_fds.input);
+        errdefer input_flags_guard.restore();
+        var diagnostic_flags_guard = if (options.diagnostic_notify_read_fd >= 0)
+            try core_fds.StatusFlagsGuard.setNonBlocking(options.diagnostic_notify_read_fd)
+        else
+            null;
+        errdefer if (diagnostic_flags_guard) |*guard| guard.restore();
+        const d = dispatcher.get();
+        return .{
+            .state = state,
+            .blocking = blocking,
+            .options = options,
+            .input_source = try d.byteSource(options.terminal_fds.input, 256),
+            .diagnostic_source = if (options.diagnostic_notify_read_fd >= 0)
+                try d.byteSource(options.diagnostic_notify_read_fd, 128)
+            else
+                dispatcher.Source.uninitialized(),
+            .input_flags_guard = input_flags_guard,
+            .diagnostic_flags_guard = diagnostic_flags_guard,
+        };
+    }
+
+    fn deinit(self: *PollWait) void {
+        self.io_task.deinit();
+        self.timer_task.deinit();
+        self.diagnostic_source.deinit();
+        self.input_source.deinit();
+        if (self.diagnostic_flags_guard) |*guard| guard.restore();
+        if (self.input_flags_guard) |*guard| guard.restore();
+    }
+
+    fn run(self: *PollWait) !Decision {
+        const d = dispatcher.get();
+        const timeout_ms = self.state.effectivePollTimeout(
+            self.options.timeout_ms,
+            self.options.overlay_presentation,
+            self.options.now_ms,
+        );
+        if (timeout_ms == 0) return self.pollImmediate();
+
+        self.io_task = dispatcher.dispatchTask(PollWait, d.allocator, self, runIo);
+        self.io_task.setSourceReadiness(.any);
+        try self.io_task.requireSource(self.input_source);
+        if (self.diagnostic_source.isInitialized()) try self.io_task.requireSource(self.diagnostic_source);
+        try self.io_task.schedule(d);
+
+        if (timeout_ms >= 0) {
+            self.timer_task = dispatcher.timerDispatchTask(PollWait, d.allocator, self, runTimer);
+            self.timer_task.setTimerAfter(d, @intCast(timeout_ms));
+            try self.timer_task.schedule(d);
+        }
+
+        while (self.decision == null) {
+            if (try d.runOnce() == 0 and d.activeTaskCount() == 0) return .wait_elapsed;
+        }
+        return self.decision.?;
+    }
+
+    fn pollImmediate(self: *PollWait) !Decision {
+        if (self.diagnostic_source.isInitialized()) {
+            switch (try self.diagnostic_source.byte().readReady()) {
+                .ready, .eof => drainDiagnosticNotifierSource(self.diagnostic_source),
+                .blocked, .progress => {},
+            }
+        }
+        switch (try self.input_source.byte().readReady()) {
+            .ready, .eof => return self.readInput(),
+            .blocked, .progress => return .wait_elapsed,
+        }
+    }
+
+    fn runIo(
+        self: *PollWait,
+        d: *dispatcher.Dispatcher,
+        task: *dispatcher.DispatchTask,
+    ) !dispatch_io.DispatchTaskStatus {
+        _ = d;
+        _ = task;
+        if (self.diagnostic_source.isInitialized() and self.diagnostic_source.hasReadyUnit()) {
+            drainDiagnosticNotifierSource(self.diagnostic_source);
+        }
+        if (self.input_source.hasReadyUnit()) {
+            self.decision = try self.readInput();
+        } else {
+            self.decision = .wait_elapsed;
+        }
+        return .done;
+    }
+
+    fn runTimer(
+        self: *PollWait,
+        d: *dispatcher.Dispatcher,
+        task: *dispatcher.DispatchTask,
+        event: dispatcher.TimerEvent,
+    ) !dispatch_io.DispatchTaskStatus {
+        _ = d;
+        _ = task;
+        _ = event;
+        if (self.input_source.hasReadyUnit()) return .done;
+        if (self.diagnostic_source.isInitialized() and self.diagnostic_source.hasReadyUnit()) return .done;
+        self.decision = .wait_elapsed;
+        return .done;
+    }
+
+    fn readInput(self: *PollWait) !Decision {
+        var filtered: [512]u8 = undefined;
+        const read = self.input_source.readBytes() orelse return .wait_elapsed;
+        const bytes = switch (read) {
+            .bytes => |bytes| bytes,
+            .eof => return .client_hangup,
+        };
+
+        switch (reconnect_control.scanInput(bytes)) {
+            .reconnect_now => {
+                self.state.reconnect_acknowledged = true;
+                return .reconnect_now;
+            },
+            .none => {},
+        }
+        const result = self.state.escape_filter.filter(bytes, &filtered);
+        if (result.end) |end| switch (end) {
+            .disconnect => return .client_hangup,
+            .help => {},
+            .repaint => {},
+        };
+        if (bytes.len > 0) {
+            self.state.input_during_disconnect = true;
+            try self.state.alertDisconnectedInput(self.blocking, self.options.terminal_fds.output, self.options.now_ms);
+        }
+        return .wait_elapsed;
+    }
+};
+
 pub const PollOptions = struct {
     terminal_fds: terminal.TerminalFds,
     diagnostic_notify_read_fd: c.fd_t,
@@ -135,17 +233,17 @@ pub const PollOptions = struct {
     now_ms: u64,
 };
 
-fn drainDiagnosticNotifier(fd: c.fd_t) void {
-    if (fd < 0) return;
-    var buf: [128]u8 = undefined;
+fn drainDiagnosticNotifierSource(source: dispatcher.Source) void {
     while (true) {
-        const n = c.read(fd, &buf, buf.len);
-        if (n > 0) continue;
-        if (n == 0) return;
-        switch (posix.errno(n)) {
-            .AGAIN => return,
-            .INTR => continue,
-            else => return,
+        if (!source.hasReadyUnit()) {
+            switch (source.byte().readReady() catch return) {
+                .blocked, .progress => return,
+                .ready, .eof => {},
+            }
+        }
+        switch (source.readBytes() orelse return) {
+            .bytes => {},
+            .eof => return,
         }
     }
 }
@@ -160,6 +258,8 @@ test "reconnect input returns reconnect_now for ctrl-r" {
     defer posix.close(output[1]);
 
     try core_blocking.fromTest().writeAll(input[1], &.{reconnect_control.ctrl_r});
+    try dispatcher.initGlobal(std.testing.allocator);
+    defer dispatcher.deinitGlobal();
 
     var state = State{};
     try std.testing.expectEqual(
@@ -188,6 +288,8 @@ test "reconnect input records ordinary input during disconnect" {
     defer posix.close(output[1]);
 
     try core_blocking.fromTest().writeAll(input[1], "x");
+    try dispatcher.initGlobal(std.testing.allocator);
+    defer dispatcher.deinitGlobal();
 
     var state = State{};
     try std.testing.expectEqual(

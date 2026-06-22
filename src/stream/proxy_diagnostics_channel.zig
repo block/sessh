@@ -8,6 +8,7 @@ const posix = std.posix;
 const app_allocator = @import("../core/app_allocator.zig");
 const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const protocol = @import("../protocol/mod.zig");
 const foreground_frame_io = @import("../transport/foreground_frame_io.zig");
 const pb = protocol.pb;
@@ -38,23 +39,39 @@ pub const ReadStatus = union(enum) {
 };
 
 pub const Reader = struct {
-    frame_reader: protocol.FrameReader,
+    allocator: std.mem.Allocator,
+    frame_source: dispatcher.Source = dispatcher.Source.uninitialized(),
 
     pub fn init(allocator: std.mem.Allocator) Reader {
-        return .{ .frame_reader = protocol.FrameReader.init(allocator) };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Reader) void {
-        self.frame_reader.deinit();
+        self.frame_source.deinit();
         self.* = undefined;
     }
 
+    fn ensureFrameSource(self: *Reader, fd: c.fd_t) !void {
+        if (self.frame_source.isInitialized()) {
+            if (self.frame_source.frame().fd != fd) @panic("proxy diagnostics Reader reused for a different fd");
+            return;
+        }
+        self.frame_source = try dispatcher.get().frameSource(fd);
+    }
+
+    pub fn source(self: *Reader, fd: c.fd_t) !dispatcher.Source {
+        try self.ensureFrameSource(fd);
+        return self.frame_source;
+    }
+
     pub fn readReady(self: *Reader, allocator: std.mem.Allocator, fd: c.fd_t) !ReadStatus {
-        switch (try self.frame_reader.readReady(fd)) {
+        try self.ensureFrameSource(fd);
+        switch (self.frame_source.readFrame() catch |err| switch (err) {
+            error.TruncatedFrame => return .truncated_frame,
+            else => return err,
+        }) {
             .blocked => return .blocked,
-            .progress => return .progress,
             .eof => return .eof,
-            .truncated_frame => return .truncated_frame,
             .frame => |frame_value| {
                 var frame = frame_value;
                 defer frame.deinit(allocator);
@@ -127,6 +144,8 @@ test "proxy diagnostics uses client daemon frames" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
     try core_fds.setNonBlocking(fds[1]);
+    try dispatcher.initGlobal(std.testing.allocator);
+    defer dispatcher.deinitGlobal();
 
     const blocking = core_blocking.fromTest();
 

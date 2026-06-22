@@ -47,6 +47,7 @@ pub const SshTtyRequest = ssh_opts.SshTtyRequest;
 pub const classifySshOptions = ssh_opts.classifySshOptions;
 pub const activePooledSshTransportCount = pooled_ssh.activePooledSshTransportCount;
 pub const registerPooledSshTransportFromDaemon = pooled_ssh.registerPooledSshTransportFromDaemon;
+pub const registerPooledTerminalDebugFromDaemon = pooled_ssh.registerPooledTerminalDebugFromDaemon;
 pub const registerProxyFdPassOpenFromDaemon = pooled_ssh.registerProxyFdPassOpenFromDaemon;
 pub const enqueueCleanupRequestToRemote = pooled_ssh.enqueueCleanupRequestToRemote;
 
@@ -158,7 +159,7 @@ pub const RunRemoteNewSessionOptions = struct {
 /// Start the ssh transport by running the bootstrapper as the remote command.
 ///
 /// The bootstrapper installs or finds the remote sessh binary, then execs the
-/// `sessh-broker` role we send in the EXEC line.
+/// `sessh-bridge` role we send in the EXEC line.
 /// Installed packages keep one executable per supported platform under
 /// `libexec/sessh/<os>-<arch>/sessh`. If that layout is unavailable, upload the
 /// current binary for same-platform development tests.
@@ -538,6 +539,11 @@ fn reconnectRemoteSessionClient(ctx: RemoteClientContext) !void {
             replacement.readFd(),
             ctx.session,
         ) catch |err| switch (err) {
+            error.RemoteDaemonDied => {
+                finishReconnectUi(&reconnect_ui, &reconnect_ui_active);
+                try finishRemoteDaemonDiedSshSession(ctx.blocking, &replacement, ctx.session);
+                return process_exit.request(255);
+            },
             error.SessionEnded => {
                 replacement_active = false;
                 ctx.transport.* = replacement;

@@ -14,6 +14,7 @@ const session_daemon_handler = @import("../session/daemon_handler.zig");
 const proxy_worker = @import("../stream/proxy_worker.zig");
 const dispatch_io = @import("../core/dispatch_io.zig");
 const mux_tunnel = @import("../transport/mux_tunnel.zig");
+const worker_endpoint = @import("worker_endpoint.zig");
 
 const pb = protocol.pb;
 
@@ -59,6 +60,38 @@ const PendingMuxStream = struct {
     envelope_open: ?pb.DaemonTunnelItem.MuxStreamFrame.Open = null,
 };
 
+const RemoteStreamRef = union(enum) {
+    terminal: usize,
+    proxy: usize,
+};
+
+const ReadyRemoteSource = struct {
+    stream: RemoteStreamRef,
+    source: dispatcher.Source,
+};
+
+const RemoteStreamView = struct {
+    ref: RemoteStreamRef,
+    stream_id: u64,
+    endpoint: *worker_endpoint.Endpoint,
+    cleanup_recorded: *bool,
+
+    fn requireIo(self: RemoteStreamView, task: *dispatcher.DispatchTask) !void {
+        if (self.endpoint.source.isInitialized()) try task.requireSource(self.endpoint.source);
+        if (self.endpoint.sink.isInitialized()) try task.requireSink(self.endpoint.sink);
+    }
+
+    fn readySource(self: RemoteStreamView) ?dispatcher.Source {
+        if (!self.endpoint.source.isInitialized()) return null;
+        if (!self.endpoint.source.hasReadyUnit()) return null;
+        return self.endpoint.source;
+    }
+
+    fn noteCleanupRecorded(self: RemoteStreamView) void {
+        self.cleanup_recorded.* = true;
+    }
+};
+
 // Streams opened by one mux connection. `MuxStreamFrame` is the mux envelope:
 // it carries stream id, offsets, and close/reset state. `Payload.item` is the
 // typed payload inside that envelope. A stream starts in `pending` when the
@@ -68,6 +101,7 @@ const MuxRemoteStreams = struct {
     pending: std.ArrayList(PendingMuxStream) = .empty,
     terminal: std.ArrayList(session_daemon_handler.TerminalMuxStream) = .empty,
     proxy: std.ArrayList(proxy_worker.ProxyMuxStream) = .empty,
+    next_ready_cursor: usize = 0,
 
     fn closeAll(self: *MuxRemoteStreams, allocator: std.mem.Allocator, daemon_dispatcher: ?*dispatcher.Dispatcher) void {
         self.pending.deinit(allocator);
@@ -84,44 +118,87 @@ const MuxRemoteStreams = struct {
     // Add every live worker fd to the mux task. The same task also watches the
     // shared mux fd, so bytes from either side of the bridge are processed by
     // one state machine instead of competing event loops.
-    fn requireSources(self: *const MuxRemoteStreams, task: *dispatcher.DispatchTask) !void {
-        for (self.terminal.items) |stream| {
-            if (stream.endpoint.dispatch_source.isInitialized()) try task.requireSource(stream.endpoint.dispatch_source);
-        }
-        for (self.proxy.items) |stream| {
-            if (stream.endpoint.dispatch_source.isInitialized()) try task.requireSource(stream.endpoint.dispatch_source);
+    fn requireSources(self: *MuxRemoteStreams, task: *dispatcher.DispatchTask) !void {
+        var ordinal: usize = 0;
+        while (ordinal < self.streamCount()) : (ordinal += 1) {
+            const view = self.viewAtOrdinal(ordinal);
+            try view.requireIo(task);
         }
     }
 
     // Return the first worker readiness event already captured by Dispatcher.
     // The caller loops on this so multiple ready workers are drained fairly
     // during the same task run without exposing terminal/proxy array details.
-    fn nextReadySource(self: *const MuxRemoteStreams) ?ReadyRemoteSource {
-        for (self.terminal.items) |stream| {
-            if (!stream.endpoint.dispatch_source.isInitialized()) continue;
-            if (stream.endpoint.dispatch_source.takeFdEvent()) |event| {
-                return .{ .terminal = .{ .source = stream.endpoint.dispatch_source, .event = event } };
-            }
+    fn nextReadySource(self: *MuxRemoteStreams) ?ReadyRemoteSource {
+        const total = self.streamCount();
+        if (total == 0) {
+            self.next_ready_cursor = 0;
+            return null;
         }
-        for (self.proxy.items) |stream| {
-            if (!stream.endpoint.dispatch_source.isInitialized()) continue;
-            if (stream.endpoint.dispatch_source.takeFdEvent()) |event| {
-                return .{ .proxy = .{ .source = stream.endpoint.dispatch_source, .event = event } };
-            }
+        if (self.next_ready_cursor >= total) self.next_ready_cursor = 0;
+        var scanned: usize = 0;
+        while (scanned < total) : (scanned += 1) {
+            const ordinal = (self.next_ready_cursor + scanned) % total;
+            const view = self.viewAtOrdinal(ordinal);
+            const source = view.readySource() orelse continue;
+            self.next_ready_cursor = (ordinal + 1) % total;
+            return .{ .stream = view.ref, .source = source };
         }
         return null;
     }
 
-    // A cleanup record is keyed by mux stream id, not by worker type. Mark both
-    // registries because ids are unique within the tunnel and only one side can
-    // match.
-    fn markCleanupRecorded(self: *MuxRemoteStreams, stream_id: u64) void {
+    fn streamCount(self: *const MuxRemoteStreams) usize {
+        return self.terminal.items.len + self.proxy.items.len;
+    }
+
+    fn refAtOrdinal(self: *const MuxRemoteStreams, ordinal: usize) RemoteStreamRef {
+        if (ordinal < self.terminal.items.len) return .{ .terminal = ordinal };
+        return .{ .proxy = ordinal - self.terminal.items.len };
+    }
+
+    fn viewAtOrdinal(self: *MuxRemoteStreams, ordinal: usize) RemoteStreamView {
+        return self.viewByRef(self.refAtOrdinal(ordinal)) orelse @panic("invalid mux stream ordinal");
+    }
+
+    fn viewByRef(self: *MuxRemoteStreams, stream_ref: RemoteStreamRef) ?RemoteStreamView {
+        return switch (stream_ref) {
+            .terminal => |index| blk: {
+                if (index >= self.terminal.items.len) break :blk null;
+                break :blk .{
+                    .ref = stream_ref,
+                    .stream_id = self.terminal.items[index].stream_id,
+                    .endpoint = &self.terminal.items[index].endpoint,
+                    .cleanup_recorded = &self.terminal.items[index].cleanup_recorded,
+                };
+            },
+            .proxy => |index| blk: {
+                if (index >= self.proxy.items.len) break :blk null;
+                break :blk .{
+                    .ref = stream_ref,
+                    .stream_id = self.proxy.items[index].stream_id,
+                    .endpoint = &self.proxy.items[index].endpoint,
+                    .cleanup_recorded = &self.proxy.items[index].cleanup_recorded,
+                };
+            },
+        };
+    }
+
+    fn findByStreamId(self: *const MuxRemoteStreams, stream_id: u64) ?RemoteStreamRef {
         if (session_daemon_handler.findTerminalMuxStreamIndex(&self.terminal, stream_id)) |index| {
-            self.terminal.items[index].cleanup_recorded = true;
+            return .{ .terminal = index };
         }
         if (proxy_worker.findProxyMuxStreamIndex(&self.proxy, stream_id)) |index| {
-            self.proxy.items[index].cleanup_recorded = true;
+            return .{ .proxy = index };
         }
+        return null;
+    }
+
+    // A cleanup record is keyed by mux stream id, not by worker type. Resolve
+    // the stream once and let the owner variant decide which record bit to set.
+    fn markCleanupRecorded(self: *MuxRemoteStreams, stream_id: u64) void {
+        const stream_ref = self.findByStreamId(stream_id) orelse return;
+        const view = self.viewByRef(stream_ref) orelse return;
+        view.noteCleanupRecorded();
     }
 
     fn saveEnvelopeOpen(self: *MuxRemoteStreams, allocator: std.mem.Allocator, stream_id: u64, open: pb.DaemonTunnelItem.MuxStreamFrame.Open) !void {
@@ -157,16 +234,6 @@ const MuxRemoteStreams = struct {
 const StreamOwner = enum {
     terminal,
     proxy,
-};
-
-const ReadyRemoteSourceEvent = struct {
-    source: dispatcher.Source,
-    event: dispatcher.FdEvent,
-};
-
-const ReadyRemoteSource = union(enum) {
-    terminal: ReadyRemoteSourceEvent,
-    proxy: ReadyRemoteSourceEvent,
 };
 
 // PROCESS_GLOBAL_REGISTRY: one daemon-to-daemon mux connection is useful work
@@ -362,14 +429,17 @@ fn handleMuxStreamFrame(
 ) !void {
     const stream_id = mux_frame.stream_id;
 
-    if (terminalStreamExists(connection, stream_id)) {
-        if (payloadOwner(mux_frame) == .proxy) return changedMuxStreamOwner(connection, stream_id, mux_frame);
-        try dispatchTerminalMuxStreamFrame(connection, daemon_dispatcher, mux_frame);
-        return;
-    }
-    if (proxyStreamExists(connection, stream_id)) {
-        if (payloadOwner(mux_frame) == .terminal) return changedMuxStreamOwner(connection, stream_id, mux_frame);
-        try dispatchProxyMuxStreamFrame(connection, daemon_dispatcher, mux_frame);
+    if (connection.remote_streams.findByStreamId(stream_id)) |stream_ref| {
+        switch (stream_ref) {
+            .terminal => {
+                if (payloadOwner(mux_frame) == .proxy) return changedMuxStreamOwner(connection, stream_id, mux_frame);
+                try dispatchTerminalMuxStreamFrame(connection, daemon_dispatcher, mux_frame);
+            },
+            .proxy => {
+                if (payloadOwner(mux_frame) == .terminal) return changedMuxStreamOwner(connection, stream_id, mux_frame);
+                try dispatchProxyMuxStreamFrame(connection, daemon_dispatcher, mux_frame);
+            },
+        }
         return;
     }
 
@@ -409,14 +479,6 @@ fn handleMuxStreamFrame(
             return error.UnexpectedDaemonMuxFrame;
         },
     }
-}
-
-fn terminalStreamExists(connection: *MuxConnection, stream_id: u64) bool {
-    return session_daemon_handler.findTerminalMuxStreamIndex(&connection.remote_streams.terminal, stream_id) != null;
-}
-
-fn proxyStreamExists(connection: *MuxConnection, stream_id: u64) bool {
-    return proxy_worker.findProxyMuxStreamIndex(&connection.remote_streams.proxy, stream_id) != null;
 }
 
 fn changedMuxStreamOwner(connection: *MuxConnection, stream_id: u64, mux_frame: pb.DaemonTunnelItem.MuxStreamFrame) !void {
@@ -531,7 +593,7 @@ test "pending mux stream stores envelope open until first typed payload chooses 
     try std.testing.expectEqual(@as(usize, 0), streams.pending.items.len);
 }
 
-test "remote process recorded marks only matching terminal stream cleanup recorded" {
+test "remote process recorded marks resolved stream owner cleanup recorded" {
     const allocator = std.testing.allocator;
     var connection = MuxConnection{
         .allocator = allocator,
@@ -545,9 +607,10 @@ test "remote process recorded marks only matching terminal stream cleanup record
 
     try connection.remote_streams.terminal.append(allocator, .{ .stream_id = 1 });
     try connection.remote_streams.terminal.append(allocator, .{ .stream_id = 2 });
-    try connection.remote_streams.proxy.append(allocator, .{ .stream_id = 1, .open = .{} });
+    try connection.remote_streams.proxy.append(allocator, .{ .stream_id = 3, .open = .{} });
 
     markCleanupRecorded(&connection, 1);
+    markCleanupRecorded(&connection, 3);
 
     try std.testing.expect(connection.remote_streams.terminal.items[0].cleanup_recorded);
     try std.testing.expect(!connection.remote_streams.terminal.items[1].cleanup_recorded);
@@ -574,14 +637,78 @@ test "remote process recorded before stream open is ignored until stream exists"
     try std.testing.expect(!connection.remote_streams.proxy.items[0].cleanup_recorded);
 }
 
+test "mux remote stream readiness is round robin across terminal and proxy streams" {
+    const allocator = std.testing.allocator;
+    var d = try dispatcher.Dispatcher.init(allocator);
+    defer d.deinit();
+
+    var pipes: [3][2]c.fd_t = undefined;
+    for (&pipes) |*pipe| {
+        pipe.* = try std.posix.pipe();
+    }
+    defer for (pipes) |pipe| {
+        _ = c.close(pipe[0]);
+        _ = c.close(pipe[1]);
+    };
+
+    var streams = MuxRemoteStreams{};
+    defer streams.closeAll(allocator, null);
+
+    const first_source = try d.byteSource(pipes[0][0], 8);
+    const second_source = try d.byteSource(pipes[1][0], 8);
+    const third_source = try d.byteSource(pipes[2][0], 8);
+
+    try streams.terminal.append(allocator, .{
+        .stream_id = 1,
+        .endpoint = .{ .source = first_source },
+    });
+    try streams.terminal.append(allocator, .{
+        .stream_id = 2,
+        .endpoint = .{ .source = second_source },
+    });
+    try streams.proxy.append(allocator, .{
+        .stream_id = 3,
+        .endpoint = .{ .source = third_source },
+        .open = .{},
+    });
+
+    for (pipes) |pipe| {
+        try std.testing.expectEqual(@as(usize, 1), try std.posix.write(pipe[1], "x"));
+    }
+    try std.testing.expectEqual(dispatch_io.SourceReadStatus.ready, try first_source.byte().readReady());
+    try std.testing.expectEqual(dispatch_io.SourceReadStatus.ready, try second_source.byte().readReady());
+    try std.testing.expectEqual(dispatch_io.SourceReadStatus.ready, try third_source.byte().readReady());
+
+    const first = streams.nextReadySource() orelse return error.ExpectedReadySource;
+    switch (first.stream) {
+        .terminal => |index| try std.testing.expectEqual(@as(usize, 0), index),
+        .proxy => return error.UnexpectedReadySource,
+    }
+    const second = streams.nextReadySource() orelse return error.ExpectedReadySource;
+    switch (second.stream) {
+        .terminal => |index| try std.testing.expectEqual(@as(usize, 1), index),
+        .proxy => return error.UnexpectedReadySource,
+    }
+    const third = streams.nextReadySource() orelse return error.ExpectedReadySource;
+    switch (third.stream) {
+        .terminal => return error.UnexpectedReadySource,
+        .proxy => |index| try std.testing.expectEqual(@as(usize, 0), index),
+    }
+    const fourth = streams.nextReadySource() orelse return error.ExpectedReadySource;
+    switch (fourth.stream) {
+        .terminal => |index| try std.testing.expectEqual(@as(usize, 0), index),
+        .proxy => return error.UnexpectedReadySource,
+    }
+}
+
 fn readRemoteProcessInner(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
     ready: ReadyRemoteSource,
 ) !ConnectionEventResult {
-    return switch (ready) {
-        .terminal => |terminal| readTerminalRemoteInner(connection, daemon_dispatcher, terminal.source, terminal.event),
-        .proxy => |proxy| readProxyRemoteInner(connection, daemon_dispatcher, proxy.source, proxy.event),
+    return switch (ready.stream) {
+        .terminal => |index| readTerminalRemoteInner(connection, daemon_dispatcher, index, ready.source),
+        .proxy => |index| readProxyRemoteInner(connection, daemon_dispatcher, index, ready.source),
     };
 }
 
@@ -591,36 +718,26 @@ fn readRemoteProcessInner(
 fn readTerminalRemoteInner(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
+    initial_index: usize,
     source: dispatcher.Source,
-    fd_event: dispatcher.FdEvent,
 ) !ConnectionEventResult {
-    const stream_index = session_daemon_handler.findTerminalMuxStreamIndexBySource(&connection.remote_streams.terminal, source) orelse return .alive;
-    if (fd_event.error_event or fd_event.invalid or (!fd_event.readable and fd_event.hangup)) {
-        return closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
-    }
-
-    if (fd_event.writable) {
-        const stream = &connection.remote_streams.terminal.items[stream_index];
-        switch (try session_daemon_handler.drainTerminalWorkerWrites(stream, daemon_dispatcher)) {
-            .blocked, .progress => if (!fd_event.readable) return .alive,
-            .drained => {},
-        }
-    }
-
-    if (!fd_event.readable) return .alive;
-
+    var stream_index = initial_index;
     while (true) {
-        const current_index = session_daemon_handler.findTerminalMuxStreamIndexBySource(&connection.remote_streams.terminal, source) orelse return .alive;
-        var stream = &connection.remote_streams.terminal.items[current_index];
+        if (stream_index >= connection.remote_streams.terminal.items.len or
+            !connection.remote_streams.terminal.items[stream_index].endpoint.source.eql(source))
+        {
+            stream_index = session_daemon_handler.findTerminalMuxStreamIndexBySource(&connection.remote_streams.terminal, source) orelse return .alive;
+        }
+        var stream = &connection.remote_streams.terminal.items[stream_index];
         var frame = switch (stream.endpoint.readFrame() catch |err| switch (err) {
             error.TruncatedFrame => {
-                return closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
+                return closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
             },
             else => return err,
         }) {
             .blocked => return .alive,
             .eof => {
-                return closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
+                return closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
             },
             .frame => |frame| frame,
         };
@@ -633,7 +750,7 @@ fn readTerminalRemoteInner(
         })) {
             continue;
         }
-        return closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
+        return closeTerminalRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
     }
 }
 
@@ -671,36 +788,27 @@ fn closeTerminalRemoteAfterProcessClose(
 fn readProxyRemoteInner(
     connection: *MuxConnection,
     daemon_dispatcher: *dispatcher.Dispatcher,
+    initial_index: usize,
     source: dispatcher.Source,
-    fd_event: dispatcher.FdEvent,
 ) !ConnectionEventResult {
-    const stream_index = proxy_worker.findProxyMuxStreamIndexBySource(&connection.remote_streams.proxy, source) orelse return .alive;
-    if (fd_event.error_event or fd_event.invalid or (!fd_event.readable and fd_event.hangup)) {
-        closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
-        return .alive;
-    }
-    if (fd_event.writable) {
-        const stream = &connection.remote_streams.proxy.items[stream_index];
-        switch (try proxy_worker.drainProxyProcessWrites(stream, daemon_dispatcher)) {
-            .blocked, .progress => if (!fd_event.readable) return .alive,
-            .drained => {},
-        }
-    }
-    if (!fd_event.readable) return .alive;
-
+    var stream_index = initial_index;
     while (true) {
-        const current_index = proxy_worker.findProxyMuxStreamIndexBySource(&connection.remote_streams.proxy, source) orelse return .alive;
-        var stream = &connection.remote_streams.proxy.items[current_index];
+        if (stream_index >= connection.remote_streams.proxy.items.len or
+            !connection.remote_streams.proxy.items[stream_index].endpoint.source.eql(source))
+        {
+            stream_index = proxy_worker.findProxyMuxStreamIndexBySource(&connection.remote_streams.proxy, source) orelse return .alive;
+        }
+        var stream = &connection.remote_streams.proxy.items[stream_index];
         var frame = switch (stream.endpoint.readFrame() catch |err| switch (err) {
             error.TruncatedFrame => {
-                closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
+                closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
                 return .alive;
             },
             else => return err,
         }) {
             .blocked => return .alive,
             .eof => {
-                closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
+                closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
                 return .alive;
             },
             .frame => |frame| frame,
@@ -718,7 +826,7 @@ fn readProxyRemoteInner(
         })) {
             continue;
         }
-        closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, current_index);
+        closeProxyRemoteAfterProcessClose(connection, daemon_dispatcher, stream_index);
         return .alive;
     }
 }

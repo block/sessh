@@ -30,7 +30,7 @@ The diagram below shows the default `isolation-mode=process` layout.
                                                          v
                                                      +--------+
                                                      | sessh  |
-                                                     | broker |
+                                                     | bridge |
                                                      +--------+
                                                          ^
                                                          |
@@ -45,7 +45,7 @@ The diagram below shows the default `isolation-mode=process` layout.
 
 `sessh` will set up a connection to the local `sesshd` (creating it if
 necessary). `sesshd` will communicate over a pooled connection to
-`sessh-broker`, which is only a daemon-tunnel bridge over ssh stdin/stdout. It
+`sessh-bridge`, which is only a daemon-tunnel bridge over ssh stdin/stdout. It
 does not own sessions or workers. The remote `sesshd` receives the tunnel
 frames and sets up the terminal worker, which creates the actual requested
 remote process (typically a shell).
@@ -55,7 +55,7 @@ The local `sesshd` process serves two purposes:
    response.
 2. Pool connections
 
-The broker process is needed because ssh gives us one remote command connected
+The bridge process is needed because ssh gives us one remote command connected
 to stdin/stdout. Keeping that role as a tiny bridge lets the local daemon
 reconnect to the same remote `sesshd` after an ssh disconnect.
 
@@ -81,7 +81,7 @@ The diagram below shows the default `isolation-mode=process` layout.
                                                                         v
                                                                     +--------+
                                                                     | sessh  |
-                                                                    | broker |
+                                                                    | bridge |
                                                                     +--------+
                                                                         ^
                                                                         |
@@ -113,7 +113,7 @@ The diagram below shows the default `isolation-mode=process` layout.
                                                                         v
                                                                     +--------+
                                                                     | sessh  |
-                                                                    | broker |
+                                                                    | bridge |
                                                                     +--------+
                                                                         ^
                                                                         |

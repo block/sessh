@@ -3,6 +3,7 @@ const c = std.c;
 const posix = std.posix;
 
 const dispatch_io = @import("dispatch_io.zig");
+const core_io = @import("io.zig");
 const NonSuspendingTimer = @import("non_suspending_timer.zig").NonSuspendingTimer;
 const protocol = @import("../protocol/mod.zig");
 const slot_holder = @import("slot_holder.zig");
@@ -223,9 +224,13 @@ pub const Source = struct {
         return storage.readReady(revents);
     }
 
-    fn hasReadyUnit(self: Source) bool {
+    pub fn hasReadyUnit(self: Source) bool {
         const storage = sourceStorage(self) orelse return false;
         return storage.hasReadyUnit();
+    }
+
+    pub fn descriptor(self: Source) ?c.fd_t {
+        return self.fd();
     }
 };
 
@@ -255,6 +260,13 @@ const SinkStorage = union(enum) {
         };
     }
 
+    fn markWriteError(self: *SinkStorage, err: anyerror) void {
+        switch (self.*) {
+            .byte => |sink| sink.markWriteError(err),
+            .frame => |sink| sink.markWriteError(err),
+        }
+    }
+
     fn hasPendingWrite(self: *const SinkStorage) bool {
         return switch (self.*) {
             .byte => |sink| sink.hasPendingWrite(),
@@ -266,6 +278,27 @@ const SinkStorage = union(enum) {
         return switch (self.*) {
             .byte => |sink| sink.belowWatermark(),
             .frame => |sink| sink.belowWatermark(),
+        };
+    }
+
+    fn hasReadyUnit(self: *const SinkStorage) bool {
+        return switch (self.*) {
+            .byte => |sink| sink.hasReadyUnit(),
+            .frame => |sink| sink.hasReadyUnit(),
+        };
+    }
+
+    fn takeReadyUnit(self: *SinkStorage) bool {
+        return switch (self.*) {
+            .byte => |sink| sink.takeReadyUnit(),
+            .frame => |sink| sink.takeReadyUnit(),
+        };
+    }
+
+    fn takeWriteError(self: *SinkStorage) ?anyerror {
+        return switch (self.*) {
+            .byte => |sink| sink.takeWriteError(),
+            .frame => |sink| sink.takeWriteError(),
         };
     }
 
@@ -366,6 +399,25 @@ pub const Sink = struct {
         return storage.belowWatermark();
     }
 
+    pub fn hasReadyUnit(self: Sink) bool {
+        const storage = sinkStorage(self) orelse return false;
+        return storage.hasReadyUnit();
+    }
+
+    pub fn takeReadyUnit(self: Sink) bool {
+        const storage = sinkStorage(self) orelse return false;
+        return storage.takeReadyUnit();
+    }
+
+    pub fn takeWriteError(self: Sink) ?anyerror {
+        const storage = sinkStorage(self) orelse return null;
+        return storage.takeWriteError();
+    }
+
+    pub fn descriptor(self: Sink) ?c.fd_t {
+        return self.fd();
+    }
+
     fn fd(self: Sink) ?c.fd_t {
         const storage = sinkStorage(self) orelse return null;
         return storage.sinkFd();
@@ -374,6 +426,11 @@ pub const Sink = struct {
     fn writeReady(self: Sink) !dispatch_io.SinkWriteStatus {
         const storage = sinkStorage(self) orelse return .drained;
         return storage.writeReady();
+    }
+
+    fn markWriteError(self: Sink, err: anyerror) void {
+        const storage = sinkStorage(self) orelse return;
+        storage.markWriteError(err);
     }
 };
 
@@ -656,6 +713,20 @@ pub const Dispatcher = struct {
     }
 
     pub fn byteSource(self: *Dispatcher, fd: c.fd_t, capacity: usize) !Source {
+        return self.byteSourceWithOptions(.{
+            .fd = fd,
+            .capacity = capacity,
+        });
+    }
+
+    pub const ByteSourceOptions = struct {
+        fd: c.fd_t,
+        capacity: usize,
+        read_options: core_io.ReadSomeOptions = .{},
+    };
+
+    pub fn byteSourceWithOptions(self: *Dispatcher, options: ByteSourceOptions) !Source {
+        const fd = options.fd;
         if (self.sourceHandleForFd(fd)) |source| {
             const storage = sourceStorage(source).?;
             if (storage.sourceKind() != .byte) @panic("fd already registered as non-byte Source");
@@ -663,7 +734,12 @@ pub const Dispatcher = struct {
         }
         const source = try self.allocator.create(dispatch_io.ByteSource);
         errdefer self.allocator.destroy(source);
-        source.* = try dispatch_io.ByteSource.init(self.allocator, fd, capacity);
+        source.* = try dispatch_io.ByteSource.initWithOptions(.{
+            .allocator = self.allocator,
+            .fd = fd,
+            .capacity = options.capacity,
+            .read_options = options.read_options,
+        });
         errdefer source.deinit();
 
         const handle = try self.source_slots.add(.{ .byte = source });
@@ -861,7 +937,10 @@ pub const Dispatcher = struct {
                 },
                 .sink => |sink| {
                     if ((pollfd.revents & (posix.POLL.OUT | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-                        _ = try sink.writeReady();
+                        _ = sink.writeReady() catch |err| {
+                            sink.markWriteError(err);
+                            continue;
+                        };
                     }
                 },
             }
@@ -880,6 +959,7 @@ pub const Dispatcher = struct {
                 0
             else
                 (index + 1) % self.dispatch_tasks.items.len;
+            for (task.sinks.items) |sink| _ = sink.takeReadyUnit();
             const status = try task.runFn(task.ctx, self, task);
             if (status == .done) {
                 self.removeTaskPointer(task, true);
@@ -931,13 +1011,22 @@ fn taskReadyAt(task: *const DispatchTask, now_ms: u64) bool {
             for (task.sources.items) |source| {
                 if (!source.hasReadyUnit()) return false;
             }
+            if (task.sources.items.len == 0 and task.sinks.items.len != 0) {
+                for (task.sinks.items) |sink| {
+                    if (sink.hasReadyUnit()) return true;
+                }
+                return false;
+            }
             return true;
         },
         .any => {
-            if (task.sources.items.len == 0) return true;
             for (task.sources.items) |source| {
                 if (source.hasReadyUnit()) return true;
             }
+            for (task.sinks.items) |sink| {
+                if (sink.hasReadyUnit()) return true;
+            }
+            if (task.sources.items.len == 0 and task.sinks.items.len == 0) return true;
             return false;
         },
     }
@@ -1070,6 +1159,87 @@ test "dispatcher dispatches fd source readability" {
     try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], "x"));
     _ = try d.loopForBlocking();
     try std.testing.expectEqual(@as(u8, 'x'), context.read_byte);
+}
+
+test "dispatcher wakes any-ready task after sink drains" {
+    const Context = struct {
+        sink: Sink,
+        runs: usize = 0,
+
+        fn run(self: *@This(), d: *Dispatcher, task: *DispatchTask) !dispatch_io.DispatchTaskStatus {
+            _ = task;
+            self.runs += 1;
+            if (!self.sink.hasPendingWrite()) {
+                d.stop();
+                return .done;
+            }
+            return .pending;
+        }
+    };
+
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var d = try Dispatcher.init(std.testing.allocator);
+    defer d.deinit();
+    var sink = try d.byteSink(.{ .allocator = std.testing.allocator, .fd = fds[1] });
+    defer sink.deinit();
+    try sink.writeBytes("x");
+
+    var context = Context{ .sink = sink };
+    var task = dispatchTask(Context, std.testing.allocator, &context, Context.run);
+    defer task.deinit();
+    task.setSourceReadiness(.any);
+    try task.requireSink(sink);
+    try task.schedule(&d);
+
+    _ = try d.loopForBlocking();
+    try std.testing.expectEqual(@as(usize, 1), context.runs);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(fds[0], &buf));
+    try std.testing.expectEqual(@as(u8, 'x'), buf[0]);
+}
+
+test "sink-only all-ready task waits for sink readiness" {
+    const Context = struct {
+        sink: Sink,
+        runs: usize = 0,
+
+        fn run(self: *@This(), d: *Dispatcher, task: *DispatchTask) !dispatch_io.DispatchTaskStatus {
+            _ = task;
+            self.runs += 1;
+            if (!self.sink.hasPendingWrite()) d.stop();
+            return .done;
+        }
+    };
+
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var d = try Dispatcher.init(std.testing.allocator);
+    defer d.deinit();
+    var sink = try d.byteSink(.{ .allocator = std.testing.allocator, .fd = fds[1] });
+    defer sink.deinit();
+
+    var context = Context{ .sink = sink };
+    var task = dispatchTask(Context, std.testing.allocator, &context, Context.run);
+    defer task.deinit();
+    try task.requireSink(sink);
+    try task.schedule(&d);
+
+    try std.testing.expectEqual(@as(usize, 0), try d.runOnce());
+    try std.testing.expectEqual(@as(usize, 0), context.runs);
+
+    try sink.writeBytes("y");
+    _ = try d.loopForBlocking();
+    try std.testing.expectEqual(@as(usize, 1), context.runs);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(fds[0], &buf));
+    try std.testing.expectEqual(@as(u8, 'y'), buf[0]);
 }
 
 test "dispatcher rotates ready task order" {

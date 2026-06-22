@@ -29,8 +29,8 @@ def main(argv=None):
             test_ssh_clean_completion_deletes_cleanup_records,
         ),
         (
-            "ssh transport uploads artifact and reaches broker",
-            test_ssh_transport_uploads_artifact_and_reaches_broker,
+            "ssh transport uploads artifact and reaches bridge",
+            test_ssh_transport_uploads_artifact_and_reaches_bridge,
         ),
         (
             "ssh daemon log records client hangup cleanup",

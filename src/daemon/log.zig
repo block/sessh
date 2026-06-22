@@ -10,7 +10,8 @@ const dispatcher = @import("../core/dispatcher.zig");
 const protocol = @import("../protocol/mod.zig");
 
 const pb = protocol.pb;
-const max_pending_frames_per_subscriber: usize = 128;
+const max_pending_log_bytes_per_subscriber: usize = 256 * 1024;
+const low_watermark_log_bytes_per_subscriber: usize = 64 * 1024;
 
 // PROCESS_GLOBAL_REGISTRY: daemon-log subscribers are local clients subscribed to
 // this daemon process. After the initial log request, this module owns the fd.
@@ -25,17 +26,12 @@ pub fn activeSubscriberCount() usize {
 const Subscriber = struct {
     fd: c.fd_t,
     daemon_dispatcher: *dispatcher.Dispatcher,
-    write_source: dispatcher.Source,
+    sink: dispatcher.Sink,
     write_task: dispatcher.DispatchTask,
-    pending_frames: std.ArrayList(protocol.FrameWriteState) = .empty,
 
     fn deinit(self: *Subscriber) void {
         self.write_task.deinit();
-        self.write_source.deinit();
-        for (self.pending_frames.items) |*frame| {
-            frame.deinit();
-        }
-        self.pending_frames.deinit(self.daemon_dispatcher.allocator);
+        self.sink.deinit();
         if (self.fd >= 0) {
             _ = c.close(self.fd);
             self.fd = -1;
@@ -54,18 +50,24 @@ pub fn subscribe(
     subscriber.* = .{
         .fd = fd,
         .daemon_dispatcher = daemon_dispatcher,
-        .write_source = try daemon_dispatcher.fdSource(fd, .{ .writable = true }),
+        .sink = try daemon_dispatcher.frameSink(.{
+            .allocator = allocator,
+            .fd = fd,
+            .max_pending_bytes = max_pending_log_bytes_per_subscriber,
+            .low_watermark = low_watermark_log_bytes_per_subscriber,
+        }),
         .write_task = undefined,
     };
-    errdefer subscriber.write_source.deinit();
-    subscriber.write_task = try dispatcher.fdDispatchTask(
+    errdefer subscriber.sink.deinit();
+    subscriber.write_task = dispatcher.dispatchTask(
         Subscriber,
         allocator,
         subscriber,
-        subscriber.write_source,
         writeSubscriber,
     );
     errdefer subscriber.write_task.deinit();
+    subscriber.write_task.setSourceReadiness(.any);
+    try subscriber.write_task.requireSink(subscriber.sink);
     errdefer {
         subscriber.fd = -1;
         subscriber.deinit();
@@ -106,34 +108,20 @@ fn writeSubscriber(
     subscriber: *Subscriber,
     daemon_dispatcher: *dispatcher.Dispatcher,
     task: *dispatcher.DispatchTask,
-    fd_event: dispatcher.FdEvent,
 ) !dispatch_io.DispatchTaskStatus {
     _ = daemon_dispatcher;
     _ = task;
-    // Log subscribers are best-effort observers. Drain their bounded frame queue
-    // only when their socket is writable, and drop the subscriber on socket
-    // errors so daemon logging never becomes required work.
-    if (fd_event.error_event or fd_event.invalid) {
+    // Log subscribers are best-effort observers. The dispatcher-owned FrameSink
+    // serializes frames and reports write failure as a ready condition; on
+    // failure we drop only this subscriber, never the daemon.
+    if (subscriber.sink.takeWriteError()) |_| {
         destroySubscriber(subscriber.daemon_dispatcher.allocator, subscriber);
         return .done;
     }
-    if (!fd_event.writable) return .pending;
-
-    while (subscriber.pending_frames.items.len != 0) {
-        const write = &subscriber.pending_frames.items[0];
-        switch (try write.writeReady(subscriber.fd)) {
-            .blocked, .progress => return .pending,
-            .done => {
-                write.deinit();
-                _ = subscriber.pending_frames.orderedRemove(0);
-            },
-        }
-    }
-    return .done;
+    return if (subscriber.sink.hasPendingWrite()) .pending else .done;
 }
 
 fn ensureWriteWatch(subscriber: *Subscriber) !void {
-    subscriber.write_source.setFdEvents(.{ .writable = true });
     try subscriber.write_task.schedule(subscriber.daemon_dispatcher);
 }
 
@@ -145,16 +133,14 @@ const QueueSubscriberFrameOptions = struct {
 };
 
 fn queueSubscriberFrame(options: QueueSubscriberFrameOptions) !void {
-    const allocator = options.allocator;
     const subscriber = options.subscriber;
     // Daemon logs are observational. A slow log subscriber must not stall the
-    // daemon or accumulate an unbounded queue, so each subscriber gets a small
-    // bounded queue. Normal startup bursts are preserved; pathological readers
-    // lose later log entries until they drain.
-    if (subscriber.pending_frames.items.len >= max_pending_frames_per_subscriber) return;
-    var frame = try protocol.FrameWriteState.init(allocator, options.message_type, options.payload);
-    errdefer frame.deinit();
-    try subscriber.pending_frames.append(allocator, frame);
+    // daemon or accumulate an unbounded queue. Normal startup bursts are
+    // preserved; pathological readers lose later log entries until they drain.
+    subscriber.sink.writeFrame(options.message_type, options.payload) catch |err| switch (err) {
+        error.FrameSinkFull => return,
+        else => return err,
+    };
     try ensureWriteWatch(subscriber);
 }
 

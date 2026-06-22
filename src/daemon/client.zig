@@ -131,10 +131,10 @@ pub fn printDaemonLog(blocking: core_blocking.Blocking, allocator: std.mem.Alloc
     try subscriber.run();
 }
 
-fn daemonLogRequestWriter(allocator: std.mem.Allocator) !protocol.FrameWriteState {
+fn writeDaemonLogRequest(sink: dispatcher.Sink, allocator: std.mem.Allocator) !void {
     const payload = try protocol.encodeClientDaemonPayload(allocator, .{ .log_request = .{} });
     defer allocator.free(payload);
-    return protocol.FrameWriteState.init(allocator, .client_daemon, payload);
+    try sink.writeFrame(.client_daemon, payload);
 }
 
 const DaemonLogSubscriber = struct {
@@ -143,47 +143,49 @@ const DaemonLogSubscriber = struct {
     dispatcher: *dispatcher.Dispatcher,
     daemon_fd: c.fd_t,
     output_fd: c.fd_t,
-    reader: protocol.FrameReader,
-    request_writer: ?protocol.FrameWriteState,
     source: dispatcher.Source,
+    sink: dispatcher.Sink,
     task: dispatcher.DispatchTask = dispatcher.DispatchTask.uninitialized(),
     err: ?anyerror = null,
 
     fn init(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, daemon_fd: c.fd_t, output_fd: c.fd_t) !DaemonLogSubscriber {
-        var request_writer = try daemonLogRequestWriter(allocator);
-        errdefer request_writer.deinit();
+        const d = dispatcher.get();
+        var source = try d.frameSource(daemon_fd);
+        errdefer source.deinit();
+        var sink = try d.frameSink(.{ .allocator = allocator, .fd = daemon_fd });
+        errdefer sink.deinit();
+        try writeDaemonLogRequest(sink, allocator);
         return .{
             .blocking = blocking,
             .allocator = allocator,
             // `sessh --daemon-log` is a foreground
             // subscriber. It registers daemon-socket readiness on the process
             // Dispatcher; it is not the long-lived sesshd process.
-            .dispatcher = dispatcher.get(),
+            .dispatcher = d,
             .daemon_fd = daemon_fd,
             .output_fd = output_fd,
-            .reader = protocol.FrameReader.init(allocator),
-            .request_writer = request_writer,
-            .source = try dispatcher.get().fdSource(daemon_fd, .{ .writable = true }),
+            .source = source,
+            .sink = sink,
         };
     }
 
     fn deinit(self: *DaemonLogSubscriber) void {
         self.task.deinit();
         self.source.deinit();
-        if (self.request_writer) |*writer| writer.deinit();
-        self.reader.deinit();
+        self.sink.deinit();
         self.* = undefined;
     }
 
     fn run(self: *DaemonLogSubscriber) !void {
         if (!self.task.isInitialized()) {
-            self.task = try dispatcher.fdDispatchTask(
+            self.task = dispatcher.dispatchTask(
                 DaemonLogSubscriber,
                 self.allocator,
                 self,
-                self.source,
                 handleDaemonLogEvent,
             );
+            try self.task.requireSource(self.source);
+            try self.task.requireSink(self.sink);
         }
         try self.task.schedule(self.dispatcher);
         _ = try self.blocking.loop();
@@ -209,59 +211,19 @@ const DaemonLogSubscriber = struct {
     }
 };
 
-fn finishDaemonLogRequest(subscriber: *DaemonLogSubscriber, event_dispatcher: *dispatcher.Dispatcher) !void {
-    _ = event_dispatcher;
-    if (subscriber.request_writer) |*writer| {
-        writer.deinit();
-        subscriber.request_writer = null;
-    }
-    subscriber.source.setFdEvents(.{ .readable = true });
-}
-
-fn writeDaemonLogRequest(
-    subscriber: *DaemonLogSubscriber,
-    event_dispatcher: *dispatcher.Dispatcher,
-    fd_event: dispatcher.FdEvent,
-) !bool {
-    const writer = if (subscriber.request_writer) |*writer| writer else return false;
-    if (!fd_event.writable) return true;
-    switch (try writer.writeReady(subscriber.daemon_fd)) {
-        .blocked, .progress => return true,
-        .done => {
-            try finishDaemonLogRequest(subscriber, event_dispatcher);
-            return false;
-        },
-    }
-}
-
 fn handleDaemonLogEvent(
     subscriber: *DaemonLogSubscriber,
     event_dispatcher: *dispatcher.Dispatcher,
     task: *dispatcher.DispatchTask,
-    fd_event: dispatcher.FdEvent,
 ) !dispatch_io.DispatchTaskStatus {
     _ = task;
+    _ = event_dispatcher;
     // `sessh --daemon-log` first writes a subscription request, then switches
     // the same socket to a read-only stream of log frames. Keeping both phases
     // in one watch avoids a helper thread just to tail daemon output.
-    if (fd_event.error_event or fd_event.invalid) {
-        subscriber.stop(error.DaemonTransportClosed);
-        return .done;
-    }
-    if (subscriber.request_writer != null and try writeDaemonLogRequest(subscriber, event_dispatcher, fd_event)) {
-        if (fd_event.hangup) subscriber.stop(null);
-        return .pending;
-    }
-    if (!fd_event.readable) {
-        if (fd_event.hangup) subscriber.stop(null);
-        return if (fd_event.hangup) .done else .pending;
-    }
     while (true) {
-        switch (try subscriber.reader.readReady(subscriber.daemon_fd)) {
-            .blocked, .progress => {
-                if (fd_event.hangup) subscriber.stop(null);
-                return if (fd_event.hangup) .done else .pending;
-            },
+        switch (try subscriber.source.readFrame()) {
+            .blocked => return .pending,
             .frame => |frame| {
                 var owned_frame = frame;
                 defer owned_frame.deinit(subscriber.allocator);
@@ -272,10 +234,6 @@ fn handleDaemonLogEvent(
             },
             .eof => {
                 subscriber.stop(null);
-                return .done;
-            },
-            .truncated_frame => {
-                subscriber.stop(error.TruncatedFrame);
                 return .done;
             },
         }

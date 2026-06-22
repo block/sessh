@@ -7,9 +7,28 @@ const c = std.c;
 const core_blocking = @import("blocking.zig");
 const fd_passing = @import("fd_passing.zig");
 const io = @import("io.zig");
+const protocol_frame = @import("../protocol/frame.zig");
 const protocol = @import("../protocol/mod.zig");
 
 const pb = protocol.pb;
+
+/// Default byte-sink buffering for long-lived dispatcher-owned fds.
+///
+/// Specific paths can use a tighter or looser bound, but an omitted limit must
+/// never mean "unbounded". Once a sink is above its low watermark, tasks that
+/// depend on it stop reading more input, which pushes backpressure through the
+/// dispatcher instead of letting memory grow without limit.
+pub const default_byte_sink_max_pending_bytes: usize = 1024 * 1024;
+pub const default_byte_sink_low_watermark: usize = 256 * 1024;
+
+/// Default frame-sink buffering for long-lived dispatcher-owned fds.
+///
+/// Frames are larger than raw byte bridge chunks because a single repaint or
+/// forwarded payload can legitimately be sizeable. The important property is
+/// still that every frame sink has a finite queue unless a caller deliberately
+/// opts into a different bound.
+pub const default_frame_sink_max_pending_bytes: usize = 64 * 1024 * 1024;
+pub const default_frame_sink_low_watermark: usize = 16 * 1024 * 1024;
 
 pub const SourceReadStatus = enum {
     blocked,
@@ -40,6 +59,7 @@ pub const ByteSource = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     buffer: []u8,
+    read_options: io.ReadSomeOptions = .{},
     filled: usize = 0,
     eof: bool = false,
 
@@ -49,10 +69,19 @@ pub const ByteSource = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, fd: c.fd_t, capacity: usize) !ByteSource {
-        return .{
+        return initWithOptions(.{
             .allocator = allocator,
             .fd = fd,
-            .buffer = try allocator.alloc(u8, capacity),
+            .capacity = capacity,
+        });
+    }
+
+    pub fn initWithOptions(options: ByteSourceOptions) !ByteSource {
+        return .{
+            .allocator = options.allocator,
+            .fd = options.fd,
+            .buffer = try options.allocator.alloc(u8, options.capacity),
+            .read_options = options.read_options,
         };
     }
 
@@ -86,7 +115,7 @@ pub const ByteSource = struct {
     /// dispatcher gets a chance to run other ready tasks first.
     pub fn readReady(self: *ByteSource) !SourceReadStatus {
         if (self.filled != 0 or self.eof) return .ready;
-        switch (try io.readSomeNonBlocking(self.fd, self.buffer[self.filled..])) {
+        switch (try io.readSomeNonBlockingWithOptions(self.fd, self.buffer[self.filled..], self.read_options)) {
             .would_block => return .blocked,
             .eof => {
                 std.debug.assert(self.filled == 0);
@@ -104,6 +133,13 @@ pub const ByteSource = struct {
     }
 };
 
+pub const ByteSourceOptions = struct {
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    capacity: usize,
+    read_options: io.ReadSomeOptions = .{},
+};
+
 /// Non-blocking writer for raw bytes to one fd.
 ///
 /// `writeBytes()` accepts ownership of a copy of the bytes into bounded
@@ -116,6 +152,8 @@ pub const ByteSink = struct {
     written: usize = 0,
     max_pending_bytes: usize,
     low_watermark: usize,
+    drained_ready: bool = false,
+    write_error: ?anyerror = null,
 
     pub fn init(options: ByteSinkOptions) ByteSink {
         return .{
@@ -144,9 +182,11 @@ pub const ByteSink = struct {
     }
 
     pub fn writeBytes(self: *ByteSink, bytes: []const u8) !void {
+        if (self.write_error != null) return error.ByteSinkFailed;
         if (bytes.len > self.max_pending_bytes or self.pendingBytes() > self.max_pending_bytes - bytes.len) {
             return error.ByteSinkFull;
         }
+        self.drained_ready = false;
         if (self.written == self.bytes.items.len) {
             self.bytes.clearRetainingCapacity();
             self.written = 0;
@@ -155,6 +195,7 @@ pub const ByteSink = struct {
     }
 
     pub fn writeReady(self: *ByteSink) !SinkWriteStatus {
+        const had_pending = self.hasPendingWrite();
         var made_progress = false;
         while (self.written < self.bytes.items.len) {
             const remaining = self.bytes.items[self.written..];
@@ -170,15 +211,36 @@ pub const ByteSink = struct {
         }
         self.bytes.clearRetainingCapacity();
         self.written = 0;
+        if (had_pending) self.drained_ready = true;
         return .drained;
+    }
+
+    pub fn hasReadyUnit(self: *const ByteSink) bool {
+        return self.drained_ready or self.write_error != null;
+    }
+
+    pub fn takeReadyUnit(self: *ByteSink) bool {
+        if (!self.drained_ready) return false;
+        self.drained_ready = false;
+        return true;
+    }
+
+    pub fn markWriteError(self: *ByteSink, err: anyerror) void {
+        self.write_error = err;
+    }
+
+    pub fn takeWriteError(self: *ByteSink) ?anyerror {
+        const err = self.write_error orelse return null;
+        self.write_error = null;
+        return err;
     }
 };
 
 pub const ByteSinkOptions = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    max_pending_bytes: usize = std.math.maxInt(usize),
-    low_watermark: usize = 0,
+    max_pending_bytes: usize = default_byte_sink_max_pending_bytes,
+    low_watermark: usize = default_byte_sink_low_watermark,
 };
 
 /// Non-blocking reader for sessh frames from one fd.
@@ -190,7 +252,7 @@ pub const ByteSinkOptions = struct {
 pub const FrameSource = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    reader: protocol.FrameReader,
+    reader: protocol_frame.FrameReader,
     frames: std.ArrayList(protocol.OwnedFrame) = .empty,
     eof: bool = false,
 
@@ -204,7 +266,7 @@ pub const FrameSource = struct {
         return .{
             .allocator = allocator,
             .fd = fd,
-            .reader = protocol.FrameReader.init(allocator),
+            .reader = protocol_frame.FrameReader.init(allocator),
         };
     }
 
@@ -274,6 +336,8 @@ pub const FrameSink = struct {
     entries: std.ArrayList(FrameSinkEntry) = .empty,
     max_pending_bytes: usize,
     low_watermark: usize,
+    drained_ready: bool = false,
+    write_error: ?anyerror = null,
 
     pub fn init(options: FrameSinkOptions) FrameSink {
         return .{
@@ -380,6 +444,7 @@ pub const FrameSink = struct {
     }
 
     pub fn writeReady(self: *FrameSink) !SinkWriteStatus {
+        const had_pending = self.hasPendingWrite();
         var made_progress = false;
         while (self.entries.items.len != 0) {
             const entry = &self.entries.items[0];
@@ -393,24 +458,47 @@ pub const FrameSink = struct {
                 },
             }
         }
+        if (had_pending) self.drained_ready = true;
         return .drained;
     }
 
     fn appendEntry(self: *FrameSink, entry: FrameSinkEntry, override_limit: ?usize) !void {
+        if (self.write_error != null) return error.FrameSinkFailed;
         const limit = override_limit orelse self.max_pending_bytes;
         const entry_len = entry.pendingBytes();
         if (entry_len > limit or self.pendingBytes() > limit - entry_len) {
             return error.FrameSinkFull;
         }
+        self.drained_ready = false;
         try self.entries.append(self.allocator, entry);
+    }
+
+    pub fn hasReadyUnit(self: *const FrameSink) bool {
+        return self.drained_ready or self.write_error != null;
+    }
+
+    pub fn takeReadyUnit(self: *FrameSink) bool {
+        if (!self.drained_ready) return false;
+        self.drained_ready = false;
+        return true;
+    }
+
+    pub fn markWriteError(self: *FrameSink, err: anyerror) void {
+        self.write_error = err;
+    }
+
+    pub fn takeWriteError(self: *FrameSink) ?anyerror {
+        const err = self.write_error orelse return null;
+        self.write_error = null;
+        return err;
     }
 };
 
 pub const FrameSinkOptions = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
-    max_pending_bytes: usize = std.math.maxInt(usize),
-    low_watermark: usize = 0,
+    max_pending_bytes: usize = default_frame_sink_max_pending_bytes,
+    low_watermark: usize = default_frame_sink_low_watermark,
 };
 
 pub const BoundedFrameWrite = struct {
@@ -588,6 +676,13 @@ test "byte source is ready after any bytes are read" {
     }
 }
 
+test "sink defaults are finite" {
+    try std.testing.expect(default_byte_sink_max_pending_bytes < std.math.maxInt(usize));
+    try std.testing.expect(default_frame_sink_max_pending_bytes < std.math.maxInt(usize));
+    try std.testing.expect(default_byte_sink_low_watermark < default_byte_sink_max_pending_bytes);
+    try std.testing.expect(default_frame_sink_low_watermark < default_frame_sink_max_pending_bytes);
+}
+
 test "frame source and sink preserve frame order" {
     const posix = std.posix;
     const pipe = try posix.pipe();
@@ -631,6 +726,26 @@ test "frame source and sink preserve frame order" {
         .log_entry => |entry| try std.testing.expectEqualStrings("ordered", entry.message),
         else => return error.UnexpectedClientDaemonPayload,
     }
+}
+
+test "frame sink rejects writes above its pending limit" {
+    const posix = std.posix;
+    const pipe = try posix.pipe();
+    defer {
+        _ = c.close(pipe[0]);
+        _ = c.close(pipe[1]);
+    }
+
+    var sink = FrameSink.init(.{
+        .allocator = std.testing.allocator,
+        .fd = pipe[1],
+        .max_pending_bytes = 0,
+    });
+    defer sink.deinit();
+
+    const payload = try protocol.encodeClientDaemonPayload(std.testing.allocator, .{ .log_request = .{} });
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectError(error.FrameSinkFull, sink.writeFrame(.client_daemon, payload));
 }
 
 test "frame sink can send an SCM_RIGHTS frame" {

@@ -41,10 +41,10 @@ def run_minor_version_compatibility_test(base_env):
             finally:
                 older_major.close()
 
-            broker_hello(env, minor_delta=1)
-            broker_hello(env, version_override="0.0.0-compatible-test")
-            broker_hello(env, major_delta=1)
-            broker_hello(env, major_delta=-1, expect_ok=False)
+            bridge_hello(env, minor_delta=1)
+            bridge_hello(env, version_override="0.0.0-compatible-test")
+            bridge_hello(env, major_delta=1)
+            bridge_hello(env, major_delta=-1, expect_ok=False)
         finally:
             if "proc" in locals() and proc.poll() is None:
                 proc.terminate()

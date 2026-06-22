@@ -11,7 +11,7 @@ const core_fds = @import("../core/fds.zig");
 const user_error = @import("../core/user_error.zig");
 const client_config = @import("../session/client_config.zig");
 const daemon_accept = @import("accept.zig");
-const daemon_broker_bridge = @import("broker_bridge.zig");
+const daemon_bridge = @import("bridge.zig");
 const daemon_client = @import("client.zig");
 const daemon_cleanup_scheduler = @import("cleanup_scheduler.zig");
 const daemon_executable = @import("executable.zig");
@@ -43,12 +43,12 @@ pub fn ensureStarted(blocking: core_blocking.Blocking, allocator: std.mem.Alloca
     return daemon_client.ensureStarted(blocking, allocator, exe);
 }
 
-pub fn forwardBrokerToDaemon(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
-    return daemon_broker_bridge.forwardBrokerToDaemon(blocking, allocator, exe, args);
+pub fn forwardBridgeToDaemon(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+    return daemon_bridge.forwardBridgeToDaemon(blocking, allocator, exe, args);
 }
 
-pub fn reexecBrokerOrForward(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
-    return daemon_broker_bridge.reexecBrokerOrForward(blocking, allocator, exe, args);
+pub fn reexecBridgeOrForward(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {
+    return daemon_bridge.reexecBridgeOrForward(blocking, allocator, exe, args);
 }
 
 pub fn reexecDaemonOrRun(blocking: core_blocking.Blocking, allocator: std.mem.Allocator, exe: []const u8, args: []const []const u8) !void {

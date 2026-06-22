@@ -24,7 +24,6 @@ const dispatcher_mod = @import("../core/dispatcher.zig");
 const error_payload = @import("error_payload.zig");
 const input_ack = @import("input_ack.zig");
 const local_terminal_mod = @import("local_terminal.zig");
-const NonSuspendingTimer = @import("../core/non_suspending_timer.zig").NonSuspendingTimer;
 const presentation_guard_mod = @import("presentation_guard.zig");
 const protocol = @import("../protocol/mod.zig");
 const protocol_test_helpers = if (builtin.is_test) @import("../protocol/test_helpers.zig") else struct {};
@@ -61,16 +60,6 @@ pub const VisibleClientEnd = enum {
     remote_transport_closed,
     session_ended,
     client_hangup,
-};
-
-/// Result of reading worker frames while trying to recover from an
-/// unresponsive connection. Recovery is only accepted after terminal state is
-/// coherent again; arbitrary bytes are not enough when a repaint is pending.
-pub const TerminalWorkerRecovery = enum {
-    recovered,
-    transport_closed,
-    remote_transport_closed,
-    session_ended,
 };
 
 pub const VisibleClientOptions = struct {
@@ -232,6 +221,35 @@ test "cancelled reconnect frame read returns without input" {
     try std.testing.expectError(error.ReconnectCancelled, readVisibleClientFrameMaybeCancelled(core_blocking.fromTest(), fds[0], &cancelled));
 }
 
+test "cancelled dispatcher reconnect returns before writing reopen" {
+    try dispatcher_mod.initGlobal(app_allocator.allocator());
+    defer dispatcher_mod.deinitGlobal();
+
+    const remote_to_client = try posix.pipe();
+    defer posix.close(remote_to_client[0]);
+    defer posix.close(remote_to_client[1]);
+    const client_to_remote = try posix.pipe();
+    defer posix.close(client_to_remote[0]);
+    defer posix.close(client_to_remote[1]);
+
+    var session = VisibleClientSessionState{};
+    defer session.deinit();
+    var cancelled = true;
+    try std.testing.expectError(error.ReconnectCancelled, reconnectSessionOnTerminalWorkerCancellable(
+        core_blocking.fromTest(),
+        .{
+            .read = remote_to_client[0],
+            .write = client_to_remote[1],
+        },
+        &session,
+        &cancelled,
+    ));
+
+    try core_fds.setNonBlocking(client_to_remote[0]);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, posix.read(client_to_remote[0], &byte));
+}
+
 test "draw payload preserves app title presence bit" {
     const draw = try drawPayloadFromMessage(.{
         .scrollback_cursor = "opaque-cursor",
@@ -258,75 +276,6 @@ test "draw payload updates terminal worker app title presence state" {
 
     try std.testing.expect(session.app_title_present != null);
     try std.testing.expect(!session.app_title_present.?);
-}
-
-test "recovery polling stores visible-client exit restore bytes from draw" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    var session = VisibleClientSessionState{};
-    defer session.deinit();
-
-    try protocol_test_helpers.sendTerminalEmulatorPayloadFrameBlocking(app_allocator.allocator(), fds[1], .{ .draw = .{
-        .scrollback_cursor = "opaque-cursor",
-        .viewport_offset = 0,
-        .draw_bytes = "",
-        .visible_client_end_restore_bytes = "restore-primary",
-    } });
-
-    try std.testing.expectEqual(TerminalWorkerRecovery.recovered, (try pollTerminalWorkerRecovery(core_blocking.fromTest(), fds[0], &session, 0)).?);
-    try std.testing.expectEqualStrings("restore-primary", session.visible_client_end_restore.items);
-}
-
-test "recovery polling ignores draw while repaint is outstanding" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    var session = VisibleClientSessionState{ .pending_repaint = .{ .repaint_request_seq = 7 } };
-    defer session.deinit();
-
-    try protocol_test_helpers.sendTerminalEmulatorPayloadFrameBlocking(app_allocator.allocator(), fds[1], .{ .draw = .{
-        .scrollback_cursor = "stale-cursor",
-        .viewport_offset = 3,
-        .draw_bytes = "",
-    } });
-
-    try std.testing.expectEqual(@as(?TerminalWorkerRecovery, null), try pollTerminalWorkerRecovery(core_blocking.fromTest(), fds[0], &session, 0));
-    try std.testing.expectEqual(@as(usize, 0), session.scrollback_cursor.len);
-    try std.testing.expectEqual(@as(i32, 0), session.viewport_offset);
-    try std.testing.expect(session.pending_repaint.active());
-}
-
-test "recovery polling waits for resize repaint after input ack" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    var session = VisibleClientSessionState{};
-    defer session.deinit();
-    const repaint_seq = session.pending_repaint.startResizeAt(1_000);
-
-    try protocol_test_helpers.sendTerminalEmulatorPayloadFrameBlocking(app_allocator.allocator(), fds[1], .{ .input_ack = .{
-        .input_seq = 1,
-    } });
-
-    try std.testing.expectEqual(@as(?TerminalWorkerRecovery, null), try pollTerminalWorkerRecovery(core_blocking.fromTest(), fds[0], &session, 0));
-    try std.testing.expect(session.pending_repaint.requiresRepaintForRecovery());
-
-    try protocol_test_helpers.sendTerminalEmulatorPayloadFrameBlocking(app_allocator.allocator(), fds[1], .{ .repaint_response = .{
-        .repaint_request_seq = repaint_seq,
-        .draw = .{
-            .scrollback_cursor = "fresh-cursor",
-            .viewport_offset = 0,
-            .draw_bytes = "",
-        },
-    } });
-
-    try std.testing.expectEqual(TerminalWorkerRecovery.recovered, (try pollTerminalWorkerRecovery(core_blocking.fromTest(), fds[0], &session, 0)).?);
-    try std.testing.expect(!session.pending_repaint.active());
-    try std.testing.expectEqualStrings("fresh-cursor", session.scrollback_cursor.slice());
 }
 
 test "repaint response applies only latest outstanding request" {
@@ -362,6 +311,9 @@ test "repaint response applies only latest outstanding request" {
 }
 
 test "reconnect waits for repaint response before returning" {
+    try dispatcher_mod.initGlobal(app_allocator.allocator());
+    defer dispatcher_mod.deinitGlobal();
+
     const remote_to_client = try posix.pipe();
     defer posix.close(remote_to_client[0]);
     defer posix.close(remote_to_client[1]);
@@ -397,6 +349,9 @@ test "reconnect waits for repaint response before returning" {
 }
 
 test "terminal worker repaint after local ui requests screen-only repaint" {
+    try dispatcher_mod.initGlobal(app_allocator.allocator());
+    defer dispatcher_mod.deinitGlobal();
+
     const remote_to_client = try posix.pipe();
     defer posix.close(remote_to_client[0]);
     defer posix.close(remote_to_client[1]);
@@ -513,20 +468,298 @@ const ReconnectTerminalWorkerRequest = struct {
 };
 
 fn reconnectSessionOnTerminalWorkerInner(request: ReconnectTerminalWorkerRequest) !void {
-    request.session.pending_repaint.repaint_request_seq = try sendSessionOpen(request.blocking, request.worker_fds.write, terminal.currentWindowSize(), request.session);
-    try readSessionReadyInner(request.blocking, request.worker_fds.read, request.cancelled);
-    if (request.wait_for_repaint) {
-        try finishReconnectRepaintInner(request.blocking, request.worker_fds.read, request.session, request.cancelled);
-    }
+    var reconnect = try ReconnectTerminalWorkerLoop.init(request);
+    defer reconnect.deinit();
+    try reconnect.run();
 }
+
+const ReconnectTerminalWorkerLoop = struct {
+    request: ReconnectTerminalWorkerRequest,
+    dispatcher: *dispatcher_mod.Dispatcher,
+    source: dispatcher_mod.Source,
+    sink: dispatcher_mod.Sink,
+    task: dispatcher_mod.DispatchTask = dispatcher_mod.DispatchTask.uninitialized(),
+    cancel_task: dispatcher_mod.DispatchTask = dispatcher_mod.DispatchTask.uninitialized(),
+    read_guard: core_fds.StatusFlagsGuard,
+    write_guard: ?core_fds.StatusFlagsGuard = null,
+    phase: Phase = .waiting_session_ready,
+    result: ?anyerror!void = null,
+
+    const Phase = enum {
+        waiting_session_ready,
+        waiting_repaint,
+        done,
+    };
+
+    fn init(request: ReconnectTerminalWorkerRequest) !ReconnectTerminalWorkerLoop {
+        var read_guard = try core_fds.StatusFlagsGuard.setNonBlocking(request.worker_fds.read);
+        errdefer read_guard.restore();
+        var write_guard = if (request.worker_fds.write == request.worker_fds.read)
+            null
+        else
+            try core_fds.StatusFlagsGuard.setNonBlocking(request.worker_fds.write);
+        errdefer if (write_guard) |*guard| guard.restore();
+
+        const d = dispatcher_mod.get();
+        var source = try d.frameSource(request.worker_fds.read);
+        errdefer source.deinit();
+        var sink = try d.frameSink(.{
+            .allocator = app_allocator.allocator(),
+            .fd = request.worker_fds.write,
+        });
+        errdefer sink.deinit();
+        return .{
+            .request = request,
+            .dispatcher = d,
+            .source = source,
+            .sink = sink,
+            .read_guard = read_guard,
+            .write_guard = write_guard,
+        };
+    }
+
+    fn deinit(self: *ReconnectTerminalWorkerLoop) void {
+        self.cancel_task.deinit();
+        self.task.deinit();
+        self.sink.deinit();
+        self.source.deinit();
+        if (self.write_guard) |*guard| guard.restore();
+        self.read_guard.restore();
+    }
+
+    fn run(self: *ReconnectTerminalWorkerLoop) !void {
+        if (self.cancelled()) return error.ReconnectCancelled;
+        self.request.session.pending_repaint.repaint_request_seq = try queueSessionOpen(
+            self.sink.frame(),
+            terminal.currentWindowSize(),
+            self.request.session,
+        );
+
+        self.task = dispatcher_mod.dispatchTask(ReconnectTerminalWorkerLoop, app_allocator.allocator(), self, runIo);
+        self.task.setSourceReadiness(.any);
+        self.cancel_task = dispatcher_mod.timerDispatchTask(ReconnectTerminalWorkerLoop, app_allocator.allocator(), self, runCancelCheck);
+        try self.configureTasks();
+
+        while (self.result == null) {
+            if (try self.dispatcher.runOnce() == 0 and self.dispatcher.activeTaskCount() == 0) {
+                self.result = error.ReconnectCancelled;
+            }
+        }
+        return self.result.?;
+    }
+
+    fn configureTasks(self: *ReconnectTerminalWorkerLoop) !void {
+        self.task.clearSources();
+        self.task.clearSinks();
+        if (self.phase != .done) try self.task.requireSource(self.source);
+        if (self.sink.hasPendingWrite()) try self.task.requireSink(self.sink);
+        if (self.phase == .done and !self.sink.hasPendingWrite()) {
+            self.task.cancel();
+        } else {
+            try self.task.schedule(self.dispatcher);
+        }
+
+        if (self.request.cancelled != null and self.phase != .done) {
+            self.cancel_task.setTimerAfter(self.dispatcher, 50);
+            try self.cancel_task.schedule(self.dispatcher);
+        } else {
+            self.cancel_task.cancel();
+        }
+    }
+
+    fn runIo(
+        self: *ReconnectTerminalWorkerLoop,
+        d: *dispatcher_mod.Dispatcher,
+        task: *dispatcher_mod.DispatchTask,
+    ) !dispatch_io.DispatchTaskStatus {
+        _ = d;
+        _ = task;
+        self.step() catch |err| {
+            self.result = err;
+            self.phase = .done;
+            self.dispatcher.stop();
+            return .done;
+        };
+        if (self.phase == .done and !self.sink.hasPendingWrite()) {
+            self.result = {};
+            self.dispatcher.stop();
+            return .done;
+        }
+        try self.configureTasks();
+        return .pending;
+    }
+
+    fn runCancelCheck(
+        self: *ReconnectTerminalWorkerLoop,
+        d: *dispatcher_mod.Dispatcher,
+        task: *dispatcher_mod.DispatchTask,
+        event: dispatcher_mod.TimerEvent,
+    ) !dispatch_io.DispatchTaskStatus {
+        _ = d;
+        _ = task;
+        _ = event;
+        if (self.cancelled()) {
+            self.result = error.ReconnectCancelled;
+            self.phase = .done;
+            self.dispatcher.stop();
+            return .done;
+        }
+        try self.configureTasks();
+        return .pending;
+    }
+
+    fn cancelled(self: *const ReconnectTerminalWorkerLoop) bool {
+        const flag = self.request.cancelled orelse return false;
+        return flag.*;
+    }
+
+    fn step(self: *ReconnectTerminalWorkerLoop) !void {
+        if (self.sink.takeWriteError()) |_| return error.RemoteTransportClosed;
+        while (true) {
+            var frame = switch (self.source.readFrame() catch |err| switch (err) {
+                error.TruncatedFrame => return error.RemoteTransportClosed,
+                else => return err,
+            }) {
+                .blocked => return,
+                .eof => return error.RemoteTransportClosed,
+                .frame => |frame_value| frame_value,
+            };
+            defer frame.deinit(app_allocator.allocator());
+            try self.handleFrame(frame);
+            if (self.phase == .done) return;
+        }
+    }
+
+    fn handleFrame(self: *ReconnectTerminalWorkerLoop, frame: protocol.OwnedFrame) !void {
+        switch (frame.message_type) {
+            .client_remote => {
+                var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
+                defer item.deinit(app_allocator.allocator());
+                const item_payload = item.payload orelse return error.UnexpectedFrame;
+                switch (item_payload) {
+                    .session_ready => {
+                        if (self.phase != .waiting_session_ready) return error.UnexpectedFrame;
+                        self.phase = if (self.request.wait_for_repaint) .waiting_repaint else .done;
+                    },
+                    .draw => {},
+                    .repaint_response => |response| {
+                        if (self.phase != .waiting_repaint) return;
+                        _ = try handleRepaintResponseMessage(response, DrawApplyContext.forSession(self.request.blocking, self.request.session, .ignore));
+                        if (!self.request.session.pending_repaint.active()) self.phase = .done;
+                    },
+                    .input_ack => |ack| {
+                        _ = handleInputAckMessage(ack, self.request.session);
+                    },
+                    .tty_transcript_chunk => |chunk| handleTtyTranscriptChunkMessage(chunk),
+                    .session_ended => |ended| {
+                        self.request.session.recordSessionEnded(ended);
+                        return error.SessionEnded;
+                    },
+                    else => return error.UnexpectedFrame,
+                }
+            },
+            .client_daemon => switch (try handleClientDaemonFrame(self.request.blocking, frame.payload)) {
+                .handled => {},
+                .transport_closed => return error.RemoteTransportClosed,
+                .unexpected => return error.UnexpectedFrame,
+            },
+            .error_message => return reconnectTerminalError(self.request.blocking, frame.payload),
+            else => return error.UnexpectedFrame,
+        }
+    }
+};
 
 pub fn finishReconnectRepaint(
     blocking: core_blocking.Blocking,
     read_fd: c.fd_t,
     session: *VisibleClientSessionState,
 ) !void {
-    try finishReconnectRepaintInner(blocking, read_fd, session, null);
+    var wait = try ReconnectRepaintWaitLoop.init(blocking, read_fd, session);
+    defer wait.deinit();
+    try wait.run();
 }
+
+const ReconnectRepaintWaitLoop = struct {
+    blocking: core_blocking.Blocking,
+    read_fd: c.fd_t,
+    session: *VisibleClientSessionState,
+    dispatcher: *dispatcher_mod.Dispatcher,
+    source: dispatcher_mod.Source,
+    task: dispatcher_mod.DispatchTask = dispatcher_mod.DispatchTask.uninitialized(),
+    read_guard: core_fds.StatusFlagsGuard,
+    result: ?anyerror!void = null,
+
+    fn init(blocking: core_blocking.Blocking, read_fd: c.fd_t, session: *VisibleClientSessionState) !ReconnectRepaintWaitLoop {
+        var read_guard = try core_fds.StatusFlagsGuard.setNonBlocking(read_fd);
+        errdefer read_guard.restore();
+        const d = dispatcher_mod.get();
+        var source = try d.frameSource(read_fd);
+        errdefer source.deinit();
+        return .{
+            .blocking = blocking,
+            .read_fd = read_fd,
+            .session = session,
+            .dispatcher = d,
+            .source = source,
+            .read_guard = read_guard,
+        };
+    }
+
+    fn deinit(self: *ReconnectRepaintWaitLoop) void {
+        self.task.deinit();
+        self.source.deinit();
+        self.read_guard.restore();
+    }
+
+    fn run(self: *ReconnectRepaintWaitLoop) !void {
+        if (!self.session.pending_repaint.active()) return;
+        self.task = dispatcher_mod.dispatchTask(ReconnectRepaintWaitLoop, app_allocator.allocator(), self, runTask);
+        try self.task.requireSource(self.source);
+        try self.task.schedule(self.dispatcher);
+        while (self.result == null) {
+            if (try self.dispatcher.runOnce() == 0 and self.dispatcher.activeTaskCount() == 0) {
+                self.result = error.RemoteTransportClosed;
+            }
+        }
+        return self.result.?;
+    }
+
+    fn runTask(
+        self: *ReconnectRepaintWaitLoop,
+        d: *dispatcher_mod.Dispatcher,
+        task: *dispatcher_mod.DispatchTask,
+    ) !dispatch_io.DispatchTaskStatus {
+        _ = d;
+        _ = task;
+        self.step() catch |err| {
+            self.result = err;
+            self.dispatcher.stop();
+            return .done;
+        };
+        if (!self.session.pending_repaint.active()) {
+            self.result = {};
+            self.dispatcher.stop();
+            return .done;
+        }
+        try self.task.schedule(self.dispatcher);
+        return .pending;
+    }
+
+    fn step(self: *ReconnectRepaintWaitLoop) !void {
+        while (self.session.pending_repaint.active()) {
+            var frame = switch (self.source.readFrame() catch |err| switch (err) {
+                error.TruncatedFrame => return error.RemoteTransportClosed,
+                else => return err,
+            }) {
+                .blocked => return,
+                .eof => return error.RemoteTransportClosed,
+                .frame => |frame_value| frame_value,
+            };
+            defer frame.deinit(app_allocator.allocator());
+            try handleReconnectRepaintFrame(self.blocking, self.session, frame);
+        }
+    }
+};
 
 fn repaintVisibleClientSessionState(
     blocking: core_blocking.Blocking,
@@ -541,52 +774,42 @@ fn repaintVisibleClientSessionState(
     try finishReconnectRepaint(blocking, worker_fds.read, session);
 }
 
-// During reconnect, keep reading worker frames until the requested repaint is
-// complete. Draw/input-ack/transcript frames can arrive interleaved with the
-// repaint response, so this loop applies only the pieces that advance recovery.
-fn finishReconnectRepaintInner(
+// During reconnect, repaint waits consume only the pieces that advance recovery.
+// Draw/input-ack/transcript frames can arrive interleaved with the repaint
+// response, and daemon diagnostics still need to be handled while waiting.
+fn handleReconnectRepaintFrame(
     blocking: core_blocking.Blocking,
-    read_fd: c.fd_t,
     session: *VisibleClientSessionState,
-    cancelled: ?*const bool,
+    frame: protocol.OwnedFrame,
 ) !void {
-    while (session.pending_repaint.active()) {
-        var frame = try readVisibleClientFrameMaybeCancelled(blocking, read_fd, cancelled);
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .client_remote => {
-                var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
-                defer item.deinit(app_allocator.allocator());
-                const item_payload = item.payload orelse return error.UnexpectedFrame;
-                switch (item_payload) {
-                    .draw => {},
-                    .repaint_response => |response| {
-                        _ = try handleRepaintResponseMessage(response, DrawApplyContext.forSession(blocking, session, .ignore));
-                    },
-                    .input_ack => |ack| {
-                        _ = handleInputAckMessage(ack, session);
-                    },
-                    .tty_transcript_chunk => |chunk| handleTtyTranscriptChunkMessage(chunk),
-                    .session_ended => |ended| {
-                        session.recordSessionEnded(ended);
-                        return error.SessionEnded;
-                    },
-                    else => return error.UnexpectedFrame,
-                }
-            },
-            .client_daemon => {
-                switch (try handleClientDaemonFrame(blocking, frame.payload)) {
-                    .handled => {},
-                    .transport_closed => return error.RemoteTransportClosed,
-                    .unexpected => return error.UnexpectedFrame,
-                }
-            },
-            .error_message => {
-                try printErrorPayload(blocking, frame.payload);
-                return error.RemoteError;
-            },
-            else => return error.UnexpectedFrame,
-        }
+    switch (frame.message_type) {
+        .client_remote => {
+            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
+            defer item.deinit(app_allocator.allocator());
+            const item_payload = item.payload orelse return error.UnexpectedFrame;
+            switch (item_payload) {
+                .draw => {},
+                .repaint_response => |response| {
+                    _ = try handleRepaintResponseMessage(response, DrawApplyContext.forSession(blocking, session, .ignore));
+                },
+                .input_ack => |ack| {
+                    _ = handleInputAckMessage(ack, session);
+                },
+                .tty_transcript_chunk => |chunk| handleTtyTranscriptChunkMessage(chunk),
+                .session_ended => |ended| {
+                    session.recordSessionEnded(ended);
+                    return error.SessionEnded;
+                },
+                else => return error.UnexpectedFrame,
+            }
+        },
+        .client_daemon => switch (try handleClientDaemonFrame(blocking, frame.payload)) {
+            .handled => {},
+            .transport_closed => return error.RemoteTransportClosed,
+            .unexpected => return error.UnexpectedFrame,
+        },
+        .error_message => return reconnectTerminalError(blocking, frame.payload),
+        else => return error.UnexpectedFrame,
     }
 }
 
@@ -608,58 +831,62 @@ pub fn runVisibleClient(
 }
 
 pub fn drainLocalTransportDiagnostics(blocking: core_blocking.Blocking, read_fd: c.fd_t, timeout_ms: u64) void {
-    var context = LocalTransportDiagnosticsDrain.init(read_fd);
+    var context = LocalTransportDiagnosticsDrain.init(blocking, read_fd) catch return;
     defer context.deinit();
-    context.run(blocking, timeout_ms) catch {};
+    context.run(timeout_ms) catch {};
 }
 
 const LocalTransportDiagnosticsDrain = struct {
+    blocking: core_blocking.Blocking,
+    dispatcher: *dispatcher_mod.Dispatcher,
     read_fd: c.fd_t,
-    reader: protocol.FrameReader,
+    source: dispatcher_mod.Source,
+    frame_task: dispatcher_mod.DispatchTask = dispatcher_mod.DispatchTask.uninitialized(),
+    timer_task: dispatcher_mod.DispatchTask = dispatcher_mod.DispatchTask.uninitialized(),
 
-    fn init(read_fd: c.fd_t) LocalTransportDiagnosticsDrain {
+    fn init(blocking: core_blocking.Blocking, read_fd: c.fd_t) !LocalTransportDiagnosticsDrain {
+        const d = dispatcher_mod.get();
+        var source = try d.frameSource(read_fd);
+        errdefer source.deinit();
         return .{
+            .blocking = blocking,
+            .dispatcher = d,
             .read_fd = read_fd,
-            .reader = protocol.FrameReader.init(app_allocator.allocator()),
+            .source = source,
         };
     }
 
     fn deinit(self: *LocalTransportDiagnosticsDrain) void {
-        self.reader.deinit();
+        self.frame_task.deinit();
+        self.timer_task.deinit();
+        self.source.deinit();
     }
 
-    fn run(self: *LocalTransportDiagnosticsDrain, blocking: core_blocking.Blocking, timeout_ms: u64) !void {
-        var clock = try NonSuspendingTimer.start();
-        const deadline_ms = visibleClientNowMs(&clock) +| timeout_ms;
-        while (true) {
-            var pollfds = [_]posix.pollfd{.{
-                .fd = self.read_fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            }};
-            const timeout = visibleClientPollTimeoutMs(&clock, deadline_ms);
-            const ready = try blocking.poll(pollfds[0..], timeout);
-            if (ready == 0) return;
+    fn run(self: *LocalTransportDiagnosticsDrain, timeout_ms: u64) !void {
+        self.frame_task = dispatcher_mod.dispatchTask(LocalTransportDiagnosticsDrain, app_allocator.allocator(), self, drainDiagnosticsFrames);
+        try self.frame_task.requireSource(self.source);
+        try self.frame_task.schedule(self.dispatcher);
 
-            const revents = pollfds[0].revents;
-            if ((revents & posix.POLL.IN) != 0) {
-                if (try self.drainReadable(blocking)) return;
-            }
-            if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) return;
-            if (visibleClientNowMs(&clock) >= deadline_ms) return;
-        }
+        self.timer_task = dispatcher_mod.timerDispatchTask(LocalTransportDiagnosticsDrain, app_allocator.allocator(), self, stopDiagnosticsDrain);
+        self.timer_task.setTimerAfter(self.dispatcher, timeout_ms);
+        try self.timer_task.schedule(self.dispatcher);
+
+        _ = try self.blocking.loop();
     }
 
-    fn drainReadable(self: *LocalTransportDiagnosticsDrain, blocking: core_blocking.Blocking) !bool {
+    fn drainReadable(self: *LocalTransportDiagnosticsDrain) !bool {
         while (true) {
-            var frame = switch (try self.reader.readReady(self.read_fd)) {
-                .blocked, .progress => return false,
+            var frame = switch (self.source.readFrame() catch |err| switch (err) {
+                error.TruncatedFrame => return true,
+                else => return err,
+            }) {
+                .blocked => return false,
                 .frame => |frame| frame,
-                .eof, .truncated_frame => return true,
+                .eof => return true,
             };
             defer frame.deinit(app_allocator.allocator());
             switch (frame.message_type) {
-                .client_daemon => switch (try handleClientDaemonFrame(blocking, frame.payload)) {
+                .client_daemon => switch (try handleClientDaemonFrame(self.blocking, frame.payload)) {
                     .handled => {},
                     .transport_closed, .unexpected => return true,
                 },
@@ -669,98 +896,26 @@ const LocalTransportDiagnosticsDrain = struct {
     }
 };
 
-fn visibleClientNowMs(clock: *NonSuspendingTimer) u64 {
-    return @intCast(clock.read() / std.time.ns_per_ms);
+fn drainDiagnosticsFrames(
+    drain: *LocalTransportDiagnosticsDrain,
+    d: *dispatcher_mod.Dispatcher,
+    _: *dispatcher_mod.DispatchTask,
+) !dispatch_io.DispatchTaskStatus {
+    if (try drain.drainReadable()) {
+        d.stop();
+        return .done;
+    }
+    return .pending;
 }
 
-fn visibleClientPollTimeoutMs(clock: *NonSuspendingTimer, deadline_ms: u64) i32 {
-    const now_ms = visibleClientNowMs(clock);
-    if (now_ms >= deadline_ms) return 0;
-    const remaining_ms = deadline_ms - now_ms;
-    const max_poll_ms: u64 = @intCast(std.math.maxInt(i32));
-    return @intCast(@min(remaining_ms, max_poll_ms));
-}
-
-fn pollTerminalWorkerRecovery(
-    blocking: core_blocking.Blocking,
-    read_fd: c.fd_t,
-    session: *VisibleClientSessionState,
-    timeout_ms: i32,
-) !?TerminalWorkerRecovery {
-    var pollfds = [_]posix.pollfd{.{
-        .fd = read_fd,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try blocking.poll(pollfds[0..], timeout_ms);
-    if (ready == 0) return null;
-
-    const revents = pollfds[0].revents;
-    if ((revents & posix.POLL.IN) != 0) {
-        return readTerminalWorkerRecoveryFrame(blocking, read_fd, session);
-    }
-    if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-        return .transport_closed;
-    }
-    return null;
-}
-
-// Interpret one worker frame while deciding whether a previously unresponsive
-// connection has recovered. Recovery requires a fresh draw/repaint boundary, not
-// just arbitrary bytes, so stale output is ignored until the repaint state allows
-// it.
-fn readTerminalWorkerRecoveryFrame(blocking: core_blocking.Blocking, read_fd: c.fd_t, session: *VisibleClientSessionState) !?TerminalWorkerRecovery {
-    const reader = session.recoveryReader(read_fd);
-    var frame = switch (try reader.readReady(read_fd)) {
-        .blocked, .progress => return null,
-        .frame => |frame| frame,
-        .eof, .truncated_frame => return .transport_closed,
-    };
-    defer frame.deinit(app_allocator.allocator());
-    switch (frame.message_type) {
-        .client_remote => {
-            var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
-            defer item.deinit(app_allocator.allocator());
-            const item_payload = item.payload orelse return error.UnexpectedFrame;
-            switch (item_payload) {
-                .draw => |draw| {
-                    if (session.pending_repaint.active()) return null;
-                    try handleDrawMessage(draw, DrawApplyContext.forSession(blocking, session, .ignore));
-                    return .recovered;
-                },
-                .repaint_response => |response| {
-                    const applied = try handleRepaintResponseMessage(response, DrawApplyContext.forSession(blocking, session, .ignore));
-                    return if (applied) .recovered else null;
-                },
-                .input_ack => |ack| {
-                    _ = handleInputAckMessage(ack, session);
-                    if (session.pending_repaint.requiresRepaintForRecovery()) return null;
-                    return .recovered;
-                },
-                .tty_transcript_chunk => |chunk| {
-                    handleTtyTranscriptChunkMessage(chunk);
-                    return .recovered;
-                },
-                .session_ended => |ended| {
-                    session.recordSessionEnded(ended);
-                    _ = finishVisibleClientBlocking(blocking, .session_ended, session);
-                    return .session_ended;
-                },
-                else => return error.UnexpectedFrame,
-            }
-        },
-        .client_daemon => switch (try handleClientDaemonFrame(blocking, frame.payload)) {
-            .handled => return null,
-            .transport_closed => return .remote_transport_closed,
-            .unexpected => return error.UnexpectedFrame,
-        },
-        .error_message => {
-            try printErrorPayload(blocking, frame.payload);
-            _ = finishVisibleClientBlocking(blocking, .session_ended, session);
-            return .session_ended;
-        },
-        else => return error.UnexpectedFrame,
-    }
+fn stopDiagnosticsDrain(
+    _: *LocalTransportDiagnosticsDrain,
+    d: *dispatcher_mod.Dispatcher,
+    _: *dispatcher_mod.DispatchTask,
+    _: dispatcher_mod.TimerEvent,
+) !dispatch_io.DispatchTaskStatus {
+    d.stop();
+    return .done;
 }
 
 fn readVisibleClientSessionState(blocking: core_blocking.Blocking, read_fd: c.fd_t) !VisibleClientSessionState {
@@ -783,41 +938,6 @@ fn readVisibleClientSessionState(blocking: core_blocking.Blocking, read_fd: c.fd
                 var session = VisibleClientSessionState{};
                 try session.setIdentity(ready.session_guid);
                 return session;
-            },
-            .client_daemon => switch (try handleClientDaemonFrame(blocking, frame.payload)) {
-                .handled => {},
-                .transport_closed => return error.RemoteTransportClosed,
-                .unexpected => return error.UnexpectedFrame,
-            },
-            else => return error.UnexpectedFrame,
-        }
-    }
-}
-
-fn readSessionReady(blocking: core_blocking.Blocking, conn: c.fd_t) !void {
-    return readSessionReadyInner(blocking, conn, null);
-}
-
-fn readSessionReadyInner(
-    blocking: core_blocking.Blocking,
-    read_fd: c.fd_t,
-    cancelled: ?*const bool,
-) !void {
-    // Reconnect opens wait for a fresh session_ready but may be cancelled by the
-    // visible UI if the user hangs up before the replacement transport wins.
-    while (true) {
-        var frame = try readVisibleClientFrameMaybeCancelled(blocking, read_fd, cancelled);
-        defer frame.deinit(app_allocator.allocator());
-        switch (frame.message_type) {
-            .error_message => return initialSessionError(blocking, frame.payload),
-            .client_remote => {
-                var item = try protocol.decodeClientRemoteTerminalEmulatorItem(app_allocator.allocator(), frame.payload);
-                defer item.deinit(app_allocator.allocator());
-                const item_payload = item.payload orelse return error.UnexpectedFrame;
-                switch (item_payload) {
-                    .session_ready => return,
-                    else => return error.UnexpectedFrame,
-                }
             },
             .client_daemon => switch (try handleClientDaemonFrame(blocking, frame.payload)) {
                 .handled => {},
@@ -852,6 +972,20 @@ fn initialSessionError(blocking: core_blocking.Blocking, payload: []const u8) an
     }
     try printParsedError(blocking, parsed);
     return process_exit.request(1);
+}
+
+fn reconnectTerminalError(blocking: core_blocking.Blocking, payload: []const u8) anyerror {
+    // Reconnect opens an existing session id on the remote daemon. If the new
+    // daemon reports that session missing, the old remote daemon died and took
+    // the session with it; retrying would only keep asking for an impossible
+    // session. Other errors are real terminal errors and should remain visible.
+    const parsed = try parseErrorPayload(payload);
+    if (std.mem.eql(u8, parsed.code, "SESSION_NOT_FOUND")) {
+        freeErrorPayload(parsed);
+        return error.RemoteDaemonDied;
+    }
+    try printParsedError(blocking, parsed);
+    return error.RemoteError;
 }
 
 fn readVisibleClientFrameMaybeCancelled(
@@ -961,6 +1095,28 @@ fn sendSessionOpen(
     return repaint_request_seq;
 }
 
+fn queueSessionOpen(
+    writer: *dispatch_io.FrameSink,
+    size: WindowSize,
+    session: *const VisibleClientSessionState,
+) !u64 {
+    const repaint_request_seq = repaint_mod.allocateRequestSeq();
+    const message = pb.TerminalEmulatorItem.Open{
+        .session_guid = session.guidSlice(),
+        .resize = visible_client_messages.resizeMessage(.{
+            .size = size,
+            .viewport_offset = visible_client_messages.nonZeroViewportOffset(session.viewport_offset),
+            .repaint_request = .{
+                .repaint_request_seq = repaint_request_seq,
+                .scrollback_cursor = session.scrollback_cursor.slice(),
+            },
+        }),
+        .capture_tty_transcript = tty_transcript.enabled(),
+    };
+    try queueTerminalEmulatorPayload(writer, .{ .open = message });
+    return repaint_request_seq;
+}
+
 fn sendTerminalEmulatorPayloadForeground(
     blocking: core_blocking.Blocking,
     fd: c.fd_t,
@@ -971,6 +1127,17 @@ fn sendTerminalEmulatorPayloadForeground(
     });
     defer app_allocator.allocator().free(encoded);
     try writeVisibleClientFrameForeground(blocking, fd, .client_remote, encoded);
+}
+
+fn queueTerminalEmulatorPayload(
+    writer: *dispatch_io.FrameSink,
+    payload: protocol.TerminalEmulatorPayload,
+) !void {
+    const encoded = try protocol.encodeClientRemotePayload(app_allocator.allocator(), .{
+        .terminal_emulator = .{ .payload = payload },
+    });
+    defer app_allocator.allocator().free(encoded);
+    try writer.writeFrame(.client_remote, encoded);
 }
 
 fn readSessionEndedOrError(blocking: core_blocking.Blocking, conn: c.fd_t) !bool {

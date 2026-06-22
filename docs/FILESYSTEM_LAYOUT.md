@@ -21,7 +21,7 @@ The local daemon socket is scoped by compatibility namespace:
 <protocol-major.dev.hash>/sesshd.sock
 ```
 
-The namespace directory also contains `sesshd`, `sessh-broker`, `sessh-proxy`,
+The namespace directory also contains `sesshd`, `sessh-bridge`, `sessh-proxy`,
 `sessh-terminal-remote`, and `sessh-proxy-remote` symlinks pointing at the
 active executable.
 

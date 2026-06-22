@@ -4,13 +4,14 @@ const posix = std.posix;
 const app_allocator = @import("../core/app_allocator.zig");
 const config = @import("../core/config.zig");
 const core_fds = @import("../core/fds.zig");
+const dispatcher = @import("../core/dispatcher.zig");
 const guid_ref = @import("../core/guid.zig");
 const terminal = @import("../tty/terminal.zig");
 const remote_process = @import("remote_process.zig");
 const vt = @import("vt.zig");
 
 const WindowSize = terminal.WindowSize;
-const max_pty_input_queue_bytes = 16 * 1024 * 1024;
+pub const max_pty_input_queue_bytes = 16 * 1024 * 1024;
 
 pub const Session = struct {
     id: guid_ref.FixedSessionGuid = .{},
@@ -27,8 +28,7 @@ pub const Session = struct {
     alive: bool = false,
     pending_plain_output: std.ArrayList(u8) = .empty,
     pending_plain_starts_at_boundary: bool = false,
-    pending_pty_input: std.ArrayList(u8) = .empty,
-    pending_pty_input_offset: usize = 0,
+    pty_sink: dispatcher.Sink = dispatcher.Sink.uninitialized(),
     synchronized_output_since_ms: i64 = 0,
     pty_eof_wait_started_ms: i64 = 0,
 
@@ -63,60 +63,39 @@ pub const Session = struct {
     }
 
     pub fn hasPendingPtyInput(self: *const Session) bool {
-        return self.pending_pty_input_offset < self.pending_pty_input.items.len;
+        return self.pty_sink.isInitialized() and self.pty_sink.hasPendingWrite();
     }
 
     pub fn queuedPtyInputBytes(self: *const Session) usize {
-        return self.pending_pty_input.items.len - self.pending_pty_input_offset;
-    }
-
-    fn compactPendingPtyInput(self: *Session) void {
-        if (self.pending_pty_input_offset == 0) return;
-        const remaining = self.pending_pty_input.items[self.pending_pty_input_offset..];
-        @memmove(self.pending_pty_input.items[0..remaining.len], remaining);
-        self.pending_pty_input.items.len = remaining.len;
-        self.pending_pty_input_offset = 0;
+        if (!self.pty_sink.isInitialized()) return 0;
+        return self.pty_sink.byte().pendingBytes();
     }
 
     pub fn queuePtyInput(self: *Session, bytes: []const u8) !void {
         if (bytes.len == 0) return;
         if (!self.alive or !self.process.hasOpenPty()) return error.SessionPtyClosed;
-        self.compactPendingPtyInput();
-        if (bytes.len > max_pty_input_queue_bytes or
-            self.pending_pty_input.items.len > max_pty_input_queue_bytes - bytes.len)
-        {
-            return error.SessionPtyInputQueueFull;
-        }
-        try self.pending_pty_input.appendSlice(app_allocator.allocator(), bytes);
-        if (!self.flushPtyInput()) return error.SessionPtyInputWriteFailed;
+        if (!self.pty_sink.isInitialized()) return error.SessionPtyWriterMissing;
+        self.pty_sink.writeBytes(bytes) catch |err| switch (err) {
+            error.ByteSinkFull => return error.SessionPtyInputQueueFull,
+            else => return err,
+        };
     }
 
-    pub fn flushPtyInput(self: *Session) bool {
-        if (!self.alive or !self.process.hasOpenPty()) return true;
-        while (self.hasPendingPtyInput()) {
-            const remaining = self.pending_pty_input.items[self.pending_pty_input_offset..];
-            switch (self.process.writeSomeInput(remaining) catch return false) {
-                .would_block => return true,
-                .wrote => |n| {
-                    self.pending_pty_input_offset += n;
-                    if (self.pending_pty_input_offset == self.pending_pty_input.items.len) {
-                        self.pending_pty_input.clearRetainingCapacity();
-                        self.pending_pty_input_offset = 0;
-                        return true;
-                    }
-                },
-            }
-        }
-        return true;
+    pub fn closePty(self: *Session) void {
+        self.pty_sink.deinit();
+        self.process.closePty();
+    }
+
+    pub fn closePtyForHangup(self: *Session) void {
+        self.pty_sink.deinit();
+        self.process.closePtyForHangup();
     }
 
     pub fn deinit(self: *Session) void {
         self.pending_plain_output.deinit(app_allocator.allocator());
         self.pending_plain_output = .empty;
         self.pending_plain_starts_at_boundary = false;
-        self.pending_pty_input.deinit(app_allocator.allocator());
-        self.pending_pty_input = .empty;
-        self.pending_pty_input_offset = 0;
+        self.pty_sink.deinit();
         self.synchronized_output_since_ms = 0;
         self.pty_eof_wait_started_ms = 0;
     }
@@ -128,13 +107,39 @@ test "session PTY input queue flushes through nonblocking writes" {
     defer posix.close(pipe[1]);
     try core_fds.setNonBlocking(pipe[1]);
 
+    var d = try dispatcher.Dispatcher.init(std.testing.allocator);
+    defer d.deinit();
+
     var session = Session{
         .process = .{ .pty_fd = pipe[1] },
         .alive = true,
+        .pty_sink = try d.byteSink(.{
+            .allocator = std.testing.allocator,
+            .fd = pipe[1],
+            .max_pending_bytes = max_pty_input_queue_bytes,
+            .low_watermark = max_pty_input_queue_bytes / 4,
+        }),
     };
     defer session.deinit();
 
+    const Context = struct {
+        session: *Session,
+
+        fn run(self: *@This(), dispatch: *dispatcher.Dispatcher, task: *dispatcher.DispatchTask) !@import("../core/dispatch_io.zig").DispatchTaskStatus {
+            _ = task;
+            if (!self.session.hasPendingPtyInput()) dispatch.stop();
+            return .done;
+        }
+    };
+    var context = Context{ .session = &session };
+    var task = dispatcher.dispatchTask(Context, std.testing.allocator, &context, Context.run);
+    defer task.deinit();
+    task.setSourceReadiness(.any);
+    try task.requireSink(session.pty_sink);
+
     try session.queuePtyInput("abc");
+    try task.schedule(&d);
+    _ = try d.loopForBlocking();
     try std.testing.expectEqual(@as(usize, 0), session.queuedPtyInputBytes());
 
     var out: [3]u8 = undefined;

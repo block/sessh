@@ -2,7 +2,6 @@
 // keeps terminal presentation, input ACKs, repaint sequencing, transcript state,
 // and local title fallback together for one user-visible session.
 const std = @import("std");
-const c = std.c;
 
 const app_allocator = @import("../core/app_allocator.zig");
 const core_blocking = @import("../core/blocking.zig");
@@ -65,9 +64,6 @@ pub const VisibleClientSessionState = struct {
     app_title_present: ?bool = null,
     initial_draw_alignment: InitialDrawAlignment = .{},
     initial_kitty_keyboard_flags: u5 = 0,
-    recovery_reader: protocol.FrameReader = undefined,
-    recovery_reader_fd: c.fd_t = -1,
-    recovery_reader_initialized: bool = false,
 
     pub fn adoptReconnectState(self: *VisibleClientSessionState, reconnected: *const VisibleClientSessionState) void {
         self.pending_repaint = reconnected.pending_repaint;
@@ -102,25 +98,8 @@ pub const VisibleClientSessionState = struct {
     }
 
     pub fn deinit(self: *VisibleClientSessionState) void {
-        self.resetRecoveryReader();
         self.visible_client_end_restore.deinit(app_allocator.allocator());
         self.visible_client_end_restore = .empty;
-    }
-
-    fn resetRecoveryReader(self: *VisibleClientSessionState) void {
-        if (!self.recovery_reader_initialized) return;
-        self.recovery_reader.deinit();
-        self.recovery_reader_initialized = false;
-        self.recovery_reader_fd = -1;
-    }
-
-    pub fn recoveryReader(self: *VisibleClientSessionState, fd: c.fd_t) *protocol.FrameReader {
-        if (self.recovery_reader_initialized and self.recovery_reader_fd == fd) return &self.recovery_reader;
-        self.resetRecoveryReader();
-        self.recovery_reader = protocol.FrameReader.init(app_allocator.allocator());
-        self.recovery_reader_fd = fd;
-        self.recovery_reader_initialized = true;
-        return &self.recovery_reader;
     }
 
     pub fn idSlice(self: *const VisibleClientSessionState) []const u8 {

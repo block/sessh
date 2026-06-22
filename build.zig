@@ -184,10 +184,10 @@ fn artifactExecutable(
     name: []const u8,
     target: std.Build.ResolvedTarget,
 ) *std.Build.Step.Compile {
-    // Ship runtime safety checks in packaged binaries. sessh handles terminal
-    // input, remote output, and network frames; catching bounds/overflow bugs at
-    // runtime is worth the size tradeoff. We still strip symbols/debug info from
-    // these bootstrapped artifacts because that does not disable safety checks.
+    // Ship ReleaseSafe checks in packaged binaries. sessh handles terminal
+    // input, remote output, and network frames; catching bounds/overflow bugs is
+    // worth the size tradeoff. We still strip symbols/debug info from these
+    // bootstrapped artifacts because that does not disable safety checks.
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

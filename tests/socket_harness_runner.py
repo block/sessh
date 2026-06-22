@@ -80,7 +80,7 @@ def main():
                     wait_file(expected_socket)
                     for role_name in (
                         "sesshd",
-                        "sessh-broker",
+                        "sessh-bridge",
                         "sessh-proxy",
                         "sessh-terminal-remote",
                         "sessh-proxy-remote",
@@ -119,7 +119,7 @@ def main():
                     if Path(daemon_command.split()[0]).name != "sesshd":
                         raise AssertionError(f"auto-started daemon command was {daemon_command!r}")
                     for role_name in (
-                        "sessh-broker",
+                        "sessh-bridge",
                         "sessh-proxy",
                         "sessh-terminal-remote",
                         "sessh-proxy-remote",
@@ -150,7 +150,7 @@ def main():
             run_session_create_command_argv_test(env)
             run_session_create_shell_command_test(env)
             run_session_create_tty_settings_test(env)
-            run_broker_starts_daemon_session_test(env)
+            run_bridge_starts_daemon_session_test(env)
             run_minor_version_compatibility_test(env)
             run_live_draw_protocol_test(env)
             run_synchronized_output_protocol_test(env)

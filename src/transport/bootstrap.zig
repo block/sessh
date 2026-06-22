@@ -1,5 +1,5 @@
 // Remote bootstrap protocol for getting a compatible sessh binary running on
-// the far side of ssh. It stays line-oriented until the remote broker can enter
+// the far side of ssh. It stays line-oriented until the remote bridge can enter
 // the framed daemon-tunnel protocol.
 const std = @import("std");
 const builtin = @import("builtin");

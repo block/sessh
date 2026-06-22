@@ -9,6 +9,7 @@ const core_blocking = @import("../core/blocking.zig");
 const core_fds = @import("../core/fds.zig");
 const fd_passing = @import("../core/fd_passing.zig");
 const protocol = @import("../protocol/mod.zig");
+const protocol_frame = @import("../protocol/frame.zig");
 
 const cancellation_poll_ms: i32 = 50;
 
@@ -24,7 +25,7 @@ pub fn readFrame(options: ReadOptions) !protocol.OwnedFrame {
     // Read one complete frame during foreground setup. The loop is synchronous
     // by design, but uses poll so callers with reconnect cancellation can wake
     // periodically instead of blocking forever in read(2).
-    var reader = protocol.FrameReader.init(options.allocator);
+    var reader = protocol_frame.FrameReader.init(options.allocator);
     defer reader.deinit();
 
     // foreground setup/reconnect reads are process-local
@@ -47,7 +48,8 @@ pub fn readFrame(options: ReadOptions) !protocol.OwnedFrame {
         if ((revents & posix.POLL.IN) != 0) {
             while (true) {
                 switch (try reader.readReady(options.fd)) {
-                    .blocked, .progress => break,
+                    .blocked => break,
+                    .progress => continue,
                     .frame => |frame| return frame,
                     .eof => return error.EndOfStream,
                     .truncated_frame => return error.TruncatedFrame,

@@ -312,10 +312,10 @@ def run_terminal_remote_crash_client_error_test(base_env):
             cleanup_runtime(env)
 
 
-def run_broker_starts_daemon_session_test(base_env):
-    with tempfile.TemporaryDirectory(prefix="sessh-broker-", dir="/tmp") as tmp:
+def run_bridge_starts_daemon_session_test(base_env):
+    with tempfile.TemporaryDirectory(prefix="sessh-bridge-", dir="/tmp") as tmp:
         env = isolated_env(tmp)
-        shell = Path(tmp) / "broker-shell"
+        shell = Path(tmp) / "bridge-shell"
         shell.write_text(
             "#!/bin/sh\n"
             "printf 'BROKER_READY\\n'\n"
@@ -327,7 +327,7 @@ def run_broker_starts_daemon_session_test(base_env):
         shell.chmod(0o700)
 
         proc = subprocess.Popen(
-            [str(BIN), ":broker:"],
+            [str(BIN), ":bridge:"],
             cwd=ROOT,
             env=env,
             stdin=subprocess.PIPE,
