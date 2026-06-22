@@ -69,6 +69,9 @@ pub fn registerAcceptedClient(options: RegisterAcceptedClientOptions) !void {
     try context.task.schedule(options.daemon_dispatcher);
 }
 
+// Where this accepted fd is in the local-daemon protocol. The generic router
+// only remains owner through handshake and first-request classification; after
+// transfer, a role-specific module owns the fd.
 const ClientStage = enum {
     waiting_peer_hello,
     waiting_peer_reply,
@@ -76,6 +79,9 @@ const ClientStage = enum {
     daemon_log,
 };
 
+// Temporary owner for one accepted daemon client. Long-lived roles leave this
+// context by transferring `fd` and the first decoded frame to their own
+// dispatcher task. One-shot roles queue a response here and close after write.
 const ClientContext = struct {
     allocator: std.mem.Allocator,
     blocking: core_blocking.Blocking,
@@ -208,6 +214,9 @@ const DaemonClientFrameAction = enum {
     transferred,
 };
 
+// Decoded client frame plus helpers for the optional SCM_RIGHTS fd that may
+// have arrived with it. Only proxy fd-pass setup may consume the descriptor; all
+// other initial requests reject and close it explicitly.
 const DaemonClientFrame = struct {
     frame: *protocol.OwnedFrame,
 

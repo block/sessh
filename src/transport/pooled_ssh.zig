@@ -79,7 +79,7 @@ const PooledSshTransportFrameWriteKind = union(enum) {
     hello_ok,
     hello_error,
     pong,
-    client_mux_open_envelope: struct {
+    client_mux_envelope_open: struct {
         client: *PooledSshTransportClient,
         typed_open_bytes: []u8,
     },
@@ -95,7 +95,7 @@ const PooledSshTransportFrameWrite = struct {
 
     fn deinit(self: *PooledSshTransportFrameWrite) void {
         switch (self.kind) {
-            .client_mux_open_envelope => |*open| {
+            .client_mux_envelope_open => |*open| {
                 if (open.typed_open_bytes.len != 0) self.frame.allocator.free(open.typed_open_bytes);
             },
             else => {},
@@ -162,6 +162,12 @@ const PendingCleanupRequest = cleanup_identity.PendingRequest;
 const RawProxyClient = raw_proxy_client.RawProxyClient;
 const PooledClientStartupTiming = pooled_client_startup_timing.PooledClientStartupTiming;
 
+// One local client attached to a pooled daemon-to-daemon SSH transport.
+//
+// For terminal and process-isolated proxy clients, `fd` speaks framed sessh
+// protocol with the local daemon. For fd-pass proxy clients, `fd` carries raw
+// OpenSSH proxy bytes and `raw_proxy` stores the one-shot setup response fd.
+// In both cases the client maps to exactly one mux stream on `transport`.
 const PooledSshTransportClient = struct {
     fd: c.fd_t,
     transport: *PooledSshTransport = undefined,
@@ -208,6 +214,10 @@ const PooledSshTransportClient = struct {
     }
 };
 
+// Lifecycle of the underlying OpenSSH process that carries the daemon tunnel.
+// Bootstrap states write shell/script bytes before any sessh frames exist;
+// handshake states exchange sessh hellos; ready means logical clients may open
+// mux streams.
 const PooledSshTransportState = enum {
     starting,
     bootstrap_writing_exec,
@@ -220,6 +230,12 @@ const PooledSshTransportState = enum {
     closed,
 };
 
+// Shared SSH transport to one resolved user/host/port/config key.
+//
+// `remote_*` fields describe the daemon-to-daemon framed tunnel. `clients` are
+// local terminal/proxy clients waiting for or using logical mux streams on that
+// tunnel. `remote_write` is the single in-flight write to the SSH process; it is
+// what turns backpressure into read-pausing instead of queue growth.
 const PooledSshTransport = struct {
     allocator: std.mem.Allocator,
     key: []u8,
@@ -1548,8 +1564,9 @@ fn writePooledSshTransportFrame(fd: c.fd_t, frame: *PooledSshTransportFrameWrite
 }
 
 // Apply the state transition associated with a completed remote frame write.
-// Some logical writes are two physical frames: the mux-open envelope must be
-// followed by the typed open payload before client reads can resume.
+// See proto/sessh.proto's MuxStreamFrame comments for "mux envelope" and "typed
+// payload" terminology. During stream startup, client reads stay paused until
+// both the envelope open and typed open payload are on the shared tunnel.
 fn completePooledSshTransportRemoteFrameWrite(
     transport: *PooledSshTransport,
     daemon_dispatcher: *dispatcher.Dispatcher,
@@ -1574,7 +1591,7 @@ fn completePooledSshTransportRemoteFrameWrite(
             try resumePooledSshTransportRemoteRead(daemon_dispatcher, transport);
             try startNextPendingCleanupRequest(daemon_dispatcher, transport);
         },
-        .client_mux_open_envelope => |*open| {
+        .client_mux_envelope_open => |*open| {
             const typed_open_bytes = open.typed_open_bytes;
             const client = open.client;
             open.typed_open_bytes = &.{};
@@ -1589,6 +1606,9 @@ fn completePooledSshTransportRemoteFrameWrite(
             frame.frame.deinit();
             if (client.state == .opening_stream) client.state = .active;
             try resumePooledSshTransportClientReads(daemon_dispatcher, transport);
+            if (!pooledSshTransportHasClientWrites(transport)) {
+                try resumePooledSshTransportRemoteRead(daemon_dispatcher, transport);
+            }
             try startNextPendingCleanupRequest(daemon_dispatcher, transport);
         },
         .proxy_ack, .remote_process_recorded, .cleanup_request => {
@@ -1739,7 +1759,9 @@ fn readPooledSshTransportClientInner(
         if (!try writePooledSshTransportClient(pooledClientContext(daemon_dispatcher, client))) return;
     }
     if (!fd_event.readable) {
-        if (fd_event.hangup) finishPooledSshTransportClient(pooledClientContext(daemon_dispatcher, client), .send);
+        if (fd_event.hangup) {
+            finishPooledSshTransportClient(pooledClientContext(daemon_dispatcher, client), .send);
+        }
         return;
     }
     if (client.read_paused or transport.remote_write != null or client.write != null) {
@@ -1757,7 +1779,11 @@ fn readPooledSshTransportClientInner(
         switch (try client.reader.readReady(client.fd)) {
             .blocked => return,
             .progress => continue,
-            .eof, .truncated_frame => {
+            .eof => {
+                finishPooledSshTransportClient(pooledClientContext(daemon_dispatcher, client), .send);
+                return;
+            },
+            .truncated_frame => {
                 finishPooledSshTransportClient(pooledClientContext(daemon_dispatcher, client), .send);
                 return;
             },
@@ -2379,9 +2405,7 @@ fn appendFilteredClientEnvironmentToTerminalOpen(
     }
 }
 
-// Send a terminal mux open as an open envelope followed by the typed terminal
-// open payload. Splitting the two lets the remote allocate the stream before it
-// sees terminal-specific data without requiring an extra round trip.
+// Send terminal stream startup as envelope open followed by typed open payload.
 fn sendPooledTerminalMuxOpen(
     ctx: PooledClientContext,
     request: pb.TerminalEmulatorItem.Open,
@@ -2397,14 +2421,14 @@ fn sendPooledTerminalMuxOpen(
         } },
     });
     errdefer transport.allocator.free(typed_open_bytes);
-    const envelope_bytes = try mux_tunnel.encodeOpenEnvelopeBytes(transport.allocator, client.stream_id, client.inbound_next_offset);
-    errdefer transport.allocator.free(envelope_bytes);
+    const envelope_open_bytes = try mux_tunnel.encodeMuxEnvelopeOpenFrameBytes(transport.allocator, client.stream_id, client.inbound_next_offset);
+    errdefer transport.allocator.free(envelope_open_bytes);
     client.read_paused = true;
     try ensurePooledSshTransportClientSource(daemon_dispatcher, client);
     try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, .{
-        .bytes = envelope_bytes,
-        .kind = .{ .client_mux_open_envelope = .{
+        .bytes = envelope_open_bytes,
+        .kind = .{ .client_mux_envelope_open = .{
             .client = client,
             .typed_open_bytes = typed_open_bytes,
         } },
@@ -2462,14 +2486,14 @@ fn sendPooledRawProxyMuxOpen(ctx: PooledClientContext) !void {
         } },
     });
     errdefer transport.allocator.free(typed_open_bytes);
-    const envelope_bytes = try mux_tunnel.encodeOpenEnvelopeBytes(transport.allocator, client.stream_id, client.inbound_next_offset);
-    errdefer transport.allocator.free(envelope_bytes);
+    const envelope_open_bytes = try mux_tunnel.encodeMuxEnvelopeOpenFrameBytes(transport.allocator, client.stream_id, client.inbound_next_offset);
+    errdefer transport.allocator.free(envelope_open_bytes);
     client.read_paused = true;
     try ensurePooledSshTransportClientSource(daemon_dispatcher, client);
     try pausePooledSshTransportClientReads(daemon_dispatcher, transport);
     try startPooledSshTransportRemoteFrameBytes(transport, daemon_dispatcher, .{
-        .bytes = envelope_bytes,
-        .kind = .{ .client_mux_open_envelope = .{
+        .bytes = envelope_open_bytes,
+        .kind = .{ .client_mux_envelope_open = .{
             .client = client,
             .typed_open_bytes = typed_open_bytes,
         } },
@@ -2648,7 +2672,9 @@ fn handlePooledRemoteMuxStreamFrame(
 ) !bool {
     var owned_mux_frame = mux_frame;
     defer owned_mux_frame.deinit(transport.allocator);
-    const client = findPooledSshTransportClient(transport, owned_mux_frame.stream_id) orelse return true;
+    const client = findPooledSshTransportClient(transport, owned_mux_frame.stream_id) orelse {
+        return true;
+    };
     const client_ctx = pooledClientContext(daemon_dispatcher, client);
     const message = owned_mux_frame.message orelse return error.UnexpectedDaemonFrame;
     if (client.kind == .proxy) {

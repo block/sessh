@@ -46,9 +46,14 @@ const PendingWorkerClient = visible_client_router.PendingWorkerClient;
 const WorkerFdWatch = visible_client_router.WorkerFdWatch;
 const WindowSize = terminal.WindowSize;
 
+// In-memory terminal session worker. It owns the remote PTY process, the
+// headless VT model, and at most one visible client connection at a time. The
+// same struct is used whether the worker runs in this daemon process or in an
+// isolated worker process.
 const TerminalWorker = struct {
     session: Session = .{},
     visible_client: VisibleClient = .{},
+    visible_client_generation: u64 = 0,
     pending_client: PendingWorkerClient = .{},
     running: bool = true,
     monotonic_clock: ?NonSuspendingTimer = null,
@@ -56,6 +61,7 @@ const TerminalWorker = struct {
     started_session: bool = false,
 };
 
+/// Handle details for a terminal worker running as a separate process.
 pub const TerminalWorkerProcessHandle = struct {
     socket_path: []u8,
     pid: c.pid_t = 0,
@@ -66,11 +72,17 @@ pub const TerminalWorkerProcessHandle = struct {
     }
 };
 
+/// Where the terminal worker lives for this isolation mode.
 pub const TerminalWorkerHandleKind = union(enum) {
     process: TerminalWorkerProcessHandle,
     in_daemon: *DispatcherTerminalWorker,
 };
 
+/// Registry entry for one live terminal worker.
+///
+/// Daemon cleanup and mux routing hold these handles, not raw worker pointers,
+/// so the same registry can close either an in-daemon worker or a separate
+/// process-backed worker.
 pub const TerminalWorkerHandle = struct {
     allocator: std.mem.Allocator,
     guid: []u8,
@@ -119,6 +131,10 @@ pub const TerminalWorkerHandle = struct {
     }
 };
 
+// Dispatcher-owned terminal worker for process-mode/shared-daemon placement.
+// Its fd task watches the PTY, visible client, pending handoff client, and
+// optional listener socket; its timer task handles delayed maintenance such as
+// synchronized-output flush and PTY EOF grace.
 const DispatcherTerminalWorker = struct {
     allocator: std.mem.Allocator,
     control: ?*TerminalWorkerHandle = null,
@@ -201,6 +217,9 @@ const DispatcherTerminalWorker = struct {
             self.session_watch.cancel(daemon_dispatcher);
         }
 
+        const pending_client = &self.terminal_worker.pending_client;
+        if (!pending_client.active) self.pending_watch.cancel(daemon_dispatcher);
+
         const visible_client = &self.terminal_worker.visible_client;
         if (visible_client.active) {
             const debug_unresponsive = visible_client.debug_unresponsive_until_ms > clock.monotonic_ms;
@@ -212,12 +231,12 @@ const DispatcherTerminalWorker = struct {
                     .readable = !visible_client.close_after_flush and !debug_unresponsive,
                     .writable = !debug_unresponsive and visible_client.pendingBytes() > 0,
                 },
+                .token = visible_client.generation,
             });
         } else {
             self.visible_watch.cancel(daemon_dispatcher);
         }
 
-        const pending_client = &self.terminal_worker.pending_client;
         if (pending_client.active) {
             try self.ensureWatch(.{
                 .daemon_dispatcher = daemon_dispatcher,
@@ -225,8 +244,6 @@ const DispatcherTerminalWorker = struct {
                 .fd = pending_client.fd,
                 .events = pending_client.watchEvents(),
             });
-        } else {
-            self.pending_watch.cancel(daemon_dispatcher);
         }
 
         try self.refreshFdTask(daemon_dispatcher);
@@ -238,6 +255,7 @@ const DispatcherTerminalWorker = struct {
         watch: *WorkerFdWatch,
         fd: c.fd_t,
         events: dispatcher.FdEvents,
+        token: u64 = 0,
     };
 
     fn ensureWatch(self: *DispatcherTerminalWorker, options: EnsureWatchOptions) !void {
@@ -249,7 +267,7 @@ const DispatcherTerminalWorker = struct {
         const watch = options.watch;
         const fd = options.fd;
         const events = options.events;
-        if (watch.active() and watch.fd != fd) {
+        if (watch.active() and (watch.fd != fd or watch.token != options.token)) {
             watch.cancel(daemon_dispatcher);
         }
         if (watch.active()) {
@@ -257,6 +275,7 @@ const DispatcherTerminalWorker = struct {
         } else {
             watch.source = try daemon_dispatcher.fdSource(fd, events);
             watch.fd = fd;
+            watch.token = options.token;
         }
     }
 
@@ -1185,10 +1204,13 @@ fn connectVisibleClient(options: ConnectVisibleClientOptions) !void {
     const session = &terminal_worker.session;
     disconnectVisibleClient(terminal_worker);
     try core_fds.setNonBlocking(client_fd);
+    terminal_worker.visible_client_generation +%= 1;
+    if (terminal_worker.visible_client_generation == 0) terminal_worker.visible_client_generation = 1;
 
     const visible_client = &terminal_worker.visible_client;
     visible_client.* = .{
         .fd = client_fd,
+        .generation = terminal_worker.visible_client_generation,
         .size = resize.size,
         .connected_at_unix_ms = nowUnixMs(),
         .active = true,

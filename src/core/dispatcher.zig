@@ -42,6 +42,9 @@ pub const TimerEvent = struct {
     fired_at_ms: u64,
 };
 
+// Concrete input object owned by the Dispatcher for one fd. Byte and frame
+// sources buffer real input; fd sources only remember readiness events such as
+// hangup/error for code that needs direct fd control.
 const SourceStorage = union(enum) {
     byte: *dispatch_io.ByteSource,
     frame: *dispatch_io.FrameSource,
@@ -108,6 +111,9 @@ const SourceKind = enum {
     fd,
 };
 
+// Readiness-only source for fds whose owner performs its own IO. This is used
+// for cases like listener sockets and worker process sockets where the event
+// itself, not buffered bytes, is the thing the task needs to handle.
 const FdSource = struct {
     fd: c.fd_t,
     events: FdEvents,
@@ -131,6 +137,12 @@ const FdSource = struct {
 
 const SourceSlots = slot_holder.SlotHolder(SourceStorage);
 
+/// Stable handle to one Dispatcher-owned input object.
+///
+/// Callers do not construct Sources directly. They ask the Dispatcher for the
+/// source for a fd, and the Dispatcher enforces "at most one source per fd".
+/// Internally this is a generation-checked slot handle, so stale copies become
+/// inert after `deinit()` instead of accidentally pointing at a reused fd slot.
 pub const Source = struct {
     handle: ?SourceSlots.Handle = null,
 
@@ -222,6 +234,9 @@ fn sourceStorage(source: Source) ?*SourceStorage {
     return handle.get();
 }
 
+// Concrete output object owned by the Dispatcher for one fd. The Dispatcher
+// treats byte and frame sinks uniformly for scheduling, but the sink itself
+// owns the protocol-specific write state.
 const SinkStorage = union(enum) {
     byte: *dispatch_io.ByteSink,
     frame: *dispatch_io.FrameSink,
@@ -283,6 +298,11 @@ const SinkKind = enum {
 
 const SinkSlots = slot_holder.SlotHolder(SinkStorage);
 
+/// Stable handle to one Dispatcher-owned output object.
+///
+/// As with Source, callers get sinks from the Dispatcher rather than building
+/// them by hand. That keeps each fd's write side serialized through exactly one
+/// object, which prevents byte/frame writes from interleaving accidentally.
 pub const Sink = struct {
     handle: ?SinkSlots.Handle = null,
 
@@ -362,6 +382,12 @@ fn sinkStorage(sink: Sink) ?*SinkStorage {
     return handle.get();
 }
 
+/// Unit of work scheduled by the Dispatcher.
+///
+/// A task can require Sources, require Sinks to be below their low-watermark,
+/// and/or set a timer. It runs only when those conditions are satisfied. The
+/// owner stores the DispatchTask field and controls its lifetime; deiniting the
+/// task cancels any pending schedule entry.
 pub const DispatchTask = struct {
     allocator: std.mem.Allocator = undefined,
     ctx: *anyopaque = undefined,
@@ -482,6 +508,7 @@ pub const SourceReadiness = enum {
     any,
 };
 
+/// Builds a typed task without requiring call sites to hand-write pointer casts.
 pub fn dispatchTask(
     comptime Context: type,
     allocator: std.mem.Allocator,
@@ -497,6 +524,7 @@ pub fn dispatchTask(
     return DispatchTask.init(allocator, ctx, Wrapper.callback);
 }
 
+/// Builds a typed task whose first required Source supplies an `FdEvent`.
 pub fn fdDispatchTask(
     comptime Context: type,
     allocator: std.mem.Allocator,
@@ -517,6 +545,7 @@ pub fn fdDispatchTask(
     return task;
 }
 
+/// Builds a typed task that runs after `DispatchTask.setTimerAt/After`.
 pub fn timerDispatchTask(
     comptime Context: type,
     allocator: std.mem.Allocator,
@@ -541,6 +570,9 @@ const TaskPollRef = union(enum) {
     sink: Sink,
 };
 
+// One Dispatcher per process. Role code calls `dispatcher.get()` instead of
+// accepting a dispatcher parameter everywhere; nested dispatch loops are still
+// explicit because only main/test code should initialize the global instance.
 var global_dispatcher: ?Dispatcher = null;
 
 pub fn initGlobal(allocator: std.mem.Allocator) !void {
@@ -560,6 +592,12 @@ pub fn deinitGlobal() void {
     }
 }
 
+/// Process-global, single-threaded scheduler.
+///
+/// `loop()` builds a poll set from Sources and Sinks required by ready tasks,
+/// waits for fd readiness or the next timer, then runs tasks round-robin. The
+/// round-robin index matters for fairness: a busy fd should not repeatedly run
+/// before other ready tasks get a chance to make progress.
 pub const Dispatcher = struct {
     allocator: std.mem.Allocator,
     clock: NonSuspendingTimer,

@@ -1708,10 +1708,15 @@ pub const DaemonTunnelItem = struct {
         }
     };
 
-    /// Framed payload, client daemon <-> server daemon.
+    /// One logical stream frame inside the daemon-to-daemon SSH tunnel. This is
+    /// the mux envelope: it names the logical stream and carries stream-level
+    /// sequencing, acknowledgements, EOF, and reset. The terminal/proxy message
+    /// inside Payload.item is the typed payload; it decides which application
+    /// handler owns the stream.
     ///
-    /// This is the only multiplexing envelope. All stream identity lives here; the
-    /// payload items inside remain usable on non-muxed local IPC sockets.
+    /// Keeping stream identity in the envelope lets TerminalEmulatorItem and
+    /// ProxyStreamItem remain usable on non-muxed local IPC sockets, where socket
+    /// ordering already supplies stream identity.
     pub const MuxStreamFrame = struct {
         stream_id: u64 = 0,
         message: ?message_union = null,
@@ -1746,9 +1751,9 @@ pub const DaemonTunnelItem = struct {
             .message = fd(null, .{ .oneof = message_union }),
         };
 
-        /// Opens or resumes a mux stream. Application-specific open details are
-        /// carried as typed payload items, not in the mux envelope, so this layer
-        /// only tracks the peer's durable receive offset.
+        /// Opens or resumes the mux envelope. The terminal/proxy-specific open is a
+        /// typed payload sent in Payload.item, so this shared open only reports the
+        /// peer's durable receive offset.
         pub const Open = struct {
             recv_next_offset: u64 = 0,
 
@@ -1884,10 +1889,10 @@ pub const DaemonTunnelItem = struct {
             }
         };
 
-        /// Ordered durable payload carried over a mux stream. The payload family
-        /// defines the offset semantics: terminal-emulator items count ordered
-        /// messages, while proxy data uses byte offsets and treats Open as setup
-        /// that does not consume byte-offset space.
+        /// Ordered durable payload carried by the mux envelope. The oneof below is
+        /// the typed payload: terminal-emulator items count ordered messages, while
+        /// proxy data uses byte offsets and treats ProxyStreamItem.Open as setup that
+        /// does not consume byte-offset space.
         pub const Payload = struct {
             offset: u64 = 0,
             item: ?item_union = null,
@@ -2785,8 +2790,8 @@ pub const DaemonTunnelItem = struct {
 };
 
 /// Ordered terminal-emulator protocol item. On local client/daemon IPC this is
-/// carried by Frame.client_remote. Across daemon-to-daemon tunnels it is carried
-/// inside DaemonTunnelItem.MuxStreamFrame.Payload.
+/// carried by Frame.client_remote. Across daemon-to-daemon tunnels it is the
+/// typed payload inside the MuxStreamFrame mux envelope.
 pub const TerminalEmulatorItem = struct {
     payload: ?payload_union = null,
 
@@ -4396,10 +4401,9 @@ pub const TerminalEmulatorItem = struct {
 };
 
 /// Ordered proxy byte-stream item. On local client/daemon IPC this is carried by
-/// Frame.client_remote. Across daemon-to-daemon tunnels it is carried inside
-/// DaemonTunnelItem.MuxStreamFrame.Payload. Data is offset-free here; mux
-/// offsets live in MuxStreamFrame.Payload, and local IPC relies on socket
-/// ordering.
+/// Frame.client_remote. Across daemon-to-daemon tunnels it is the typed payload
+/// inside the MuxStreamFrame mux envelope. Data is offset-free here; mux offsets
+/// live in MuxStreamFrame.Payload, and local IPC relies on socket ordering.
 pub const ProxyStreamItem = struct {
     payload: ?payload_union = null,
 

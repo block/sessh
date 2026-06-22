@@ -1636,7 +1636,7 @@ const test_support = if (builtin.is_test) struct {
     }
 
     fn expectProxyDataFrame(fd: c.fd_t, expected_offset: u64, expected_data: []const u8) !void {
-        // Test assertion for the proxy data envelope: daemon-tunnel frame,
+        // Test assertion for the nested proxy data frame: daemon-tunnel frame,
         // fixed proxy stream id, proxy payload, expected offset, expected bytes.
         var mux = try expectMuxStreamFrame(fd);
         defer mux.deinit(std.testing.allocator);

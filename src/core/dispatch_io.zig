@@ -29,6 +29,13 @@ pub const DispatchTaskStatus = enum {
     pending,
 };
 
+/// Non-blocking reader for raw bytes from one fd.
+///
+/// The dispatcher calls `readReady()` when `poll(2)` says the fd is readable.
+/// Any positive read is enough to wake the owning task; callers then use
+/// `read()` to take that byte slice. The internal buffer is deliberately not
+/// exposed as a queue because task code should reason in terms of "bytes became
+/// available", not "how much storage is currently filled".
 pub const ByteSource = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
@@ -54,6 +61,11 @@ pub const ByteSource = struct {
         self.* = undefined;
     }
 
+    /// Takes the currently available bytes or EOF marker.
+    ///
+    /// Returning bytes transfers that slice to the caller until the next
+    /// `readReady()` call. The source has a single consumer, so clearing
+    /// `filled` here is the transfer; no explicit discard API should exist.
     pub fn read(self: *ByteSource) ?Read {
         if (self.filled != 0) {
             const bytes = self.buffer[0..self.filled];
@@ -67,6 +79,11 @@ pub const ByteSource = struct {
         return null;
     }
 
+    /// Pull at most one readiness unit from the fd.
+    ///
+    /// A short read is not treated as "try again immediately"; on a
+    /// non-blocking fd the next read may block, and fairness is better if the
+    /// dispatcher gets a chance to run other ready tasks first.
     pub fn readReady(self: *ByteSource) !SourceReadStatus {
         if (self.filled != 0 or self.eof) return .ready;
         switch (try io.readSomeNonBlocking(self.fd, self.buffer[self.filled..])) {
@@ -87,6 +104,11 @@ pub const ByteSource = struct {
     }
 };
 
+/// Non-blocking writer for raw bytes to one fd.
+///
+/// `writeBytes()` accepts ownership of a copy of the bytes into bounded
+/// internal storage. The dispatcher calls `writeReady()` while the fd is
+/// writable until the stored bytes drain below task watermarks.
 pub const ByteSink = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
@@ -159,6 +181,12 @@ pub const ByteSinkOptions = struct {
     low_watermark: usize = 0,
 };
 
+/// Non-blocking reader for sessh frames from one fd.
+///
+/// This wraps `protocol.FrameReader`, which understands the four-byte frame
+/// length, the protobuf Frame message, optional attached raw bytes, and
+/// optional SCM_RIGHTS descriptor marker. The source returns complete frames
+/// only; task code never sees a partially decoded protocol message.
 pub const FrameSource = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
@@ -235,6 +263,11 @@ pub const FrameSource = struct {
     }
 };
 
+/// Non-blocking writer for sessh frames to one fd.
+///
+/// Callers ask to write logical frames. The sink serializes them one at a time
+/// so protobuf bytes, attached raw bytes, and SCM_RIGHTS descriptor markers
+/// never interleave with bytes from another frame.
 pub const FrameSink = struct {
     allocator: std.mem.Allocator,
     fd: c.fd_t,
@@ -386,6 +419,9 @@ pub const BoundedFrameWrite = struct {
     max_pending_bytes: usize,
 };
 
+// One queued logical frame. Ordinary frames are a contiguous byte string, while
+// SCM_RIGHTS frames have to write a normal prefix first and then a one-byte
+// marker with sendmsg so the descriptor is attached to that exact byte.
 const FrameSinkEntry = union(enum) {
     frame: protocol.FrameWriteState,
     scm_rights_frame: ScmRightsFrameWriteState,
@@ -436,6 +472,13 @@ const FrameSinkEntry = union(enum) {
     }
 };
 
+// Write state for one frame that carries an SCM_RIGHTS descriptor.
+//
+// The encoded frame is still one sessh frame: a length-prefixed protobuf
+// message followed by one attached marker byte. Only that marker byte is sent
+// with sendmsg/SCM_RIGHTS; the prefix is ordinary stream data. Splitting the
+// state this way keeps fd passing localized without making every frame write
+// use sendmsg.
 const ScmRightsFrameWriteState = struct {
     allocator: std.mem.Allocator,
     bytes: []u8,

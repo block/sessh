@@ -374,7 +374,6 @@ fn runVisibleRemoteClient(ctx: RemoteClientContext) !void {
             try user_error.printLine(ctx.blocking, "ssh remote session failed: {t}", .{err});
             return process_exit.request(1);
         };
-
         switch (end) {
             .session_ended => {
                 client_log.debug("event=session_ended host={s} session={s}", .{ ctx.target.host, ctx.session.idSlice() });

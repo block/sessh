@@ -1,6 +1,13 @@
-// Framed protobuf transport used after the compatibility handshake. The reader
-// and writer code here is fd-aware because local daemon IPC can attach
-// SCM_RIGHTS descriptors while daemon-to-daemon tunnels carry plain bytes.
+// Framed protobuf transport used after the compatibility handshake. Each
+// post-handshake frame is:
+//
+//   4-byte big-endian length
+//   protobuf Frame message of that length
+//   optional raw bytes declared by Frame.attached
+//
+// The reader and writer code here is fd-aware because local daemon IPC can
+// attach SCM_RIGHTS descriptors to the optional byte section, while
+// daemon-to-daemon tunnels carry plain bytes.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -416,9 +423,10 @@ fn readSome(fd: c.fd_t, buf: []u8) !ReadSomeResult {
     }
 }
 
-// Re-wrap a typed message payload into the correct top-level protobuf envelope.
-// Hello messages deliberately stay in HelloFrame, while post-handshake messages
-// share Frame and can advertise attached raw bytes or an SCM_RIGHTS carrier.
+// Put an already-encoded message into the protobuf container used on the wire.
+// The compatibility hello still uses HelloFrame. Everything after hello uses
+// Frame, which can also declare that raw bytes or an SCM_RIGHTS descriptor
+// marker follows the protobuf bytes.
 fn encodeMessagePayload(
     allocator: std.mem.Allocator,
     options: MessagePayloadOptions,
@@ -521,7 +529,7 @@ test "generated protobuf payload round trip" {
     try std.testing.expectEqualStrings("sessh", decoded.draw_bytes);
 }
 
-test "frame envelope round trip" {
+test "protobuf frame container round trip" {
     const blocking = core_blocking.fromTest();
     const payload = try encodePayload(std.testing.allocator, pb.ClientRemoteItem{
         .payload = .{ .terminal_emulator = .{ .payload = .{ .input_ack = .{ .input_seq = 42 } } } },
@@ -605,7 +613,7 @@ test "mux stream frame preserves stream id offset and proxy payload" {
     }
 }
 
-test "frame envelope preserves attached bytes appendix" {
+test "protobuf frame container preserves attached bytes appendix" {
     const blocking = core_blocking.fromTest();
     const payload = try encodePayload(std.testing.allocator, pb.ClientDaemonItem{
         .payload = .{ .log_request = .{} },

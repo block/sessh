@@ -1,9 +1,21 @@
 const std = @import("std");
 
+/// Reusable slot storage with stale-handle detection.
+///
+/// Dispatcher sources/sinks need stable handles because tasks store references
+/// while the owning fd can be cancelled and a later fd may reuse the same slot.
+/// Each slot carries a generation counter; releasing a handle increments that
+/// generation, so old handles become harmlessly stale instead of accidentally
+/// mutating a newly-created source or sink.
 pub fn SlotHolder(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// A non-owning reference to one active slot.
+        ///
+        /// `get()` returns null after the slot is released or reused with a new
+        /// generation. That lets higher-level handle wrappers make `deinit()`
+        /// idempotent without adding separate `*_initialized` booleans.
         pub const Handle = struct {
             holder: *Self,
             index: usize,

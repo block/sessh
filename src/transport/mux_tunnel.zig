@@ -1,6 +1,6 @@
-// Logical stream registry for daemon-to-daemon tunnels. It tracks stream IDs,
-// typed opens, and pending frames so tunnel dispatch can stay independent of
-// terminal-session and proxy-stream implementations.
+// Shared mux helpers for daemon-to-daemon tunnels. One SSH connection carries
+// many independent byte streams, each identified by `MuxStreamFrame.stream_id`;
+// daemon/tunnel.zig owns the per-stream handler state.
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
@@ -12,140 +12,10 @@ const pb = protocol.pb;
 
 pub const first_stream_id: u64 = 1;
 
-pub const StreamKind = enum {
-    unknown,
-    terminal,
-    proxy,
-};
-
-const StreamEntry = struct {
-    stream_id: u64,
-    kind: StreamKind = .unknown,
-    pending_open: ?pb.DaemonTunnelItem.MuxStreamFrame.Open = null,
-};
-
-pub const StreamRegistry = struct {
-    allocator: std.mem.Allocator,
-    entries: std.ArrayList(StreamEntry) = .empty,
-
-    pub fn init(allocator: std.mem.Allocator) StreamRegistry {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *StreamRegistry) void {
-        self.entries.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    fn noteOpen(
-        self: *StreamRegistry,
-        stream_id: u64,
-        open: pb.DaemonTunnelItem.MuxStreamFrame.Open,
-    ) !void {
-        const entry_index = try self.indexOrAppend(stream_id);
-        self.entries.items[entry_index].pending_open = open;
-    }
-
-    fn setKindIfUnknown(
-        self: *StreamRegistry,
-        stream_id: u64,
-        stream_kind: StreamKind,
-    ) !SetKindResult {
-        const entry_index = try self.indexOrAppend(stream_id);
-        const entry = &self.entries.items[entry_index];
-        if (entry.kind == stream_kind) return .already_set;
-        if (entry.kind != .unknown) return .changed_kind;
-        entry.kind = stream_kind;
-        return .new_kind;
-    }
-
-    fn pendingOpen(self: *const StreamRegistry, stream_id: u64) ?pb.DaemonTunnelItem.MuxStreamFrame.Open {
-        const entry_index = self.index(stream_id) orelse return null;
-        return self.entries.items[entry_index].pending_open;
-    }
-
-    fn kind(self: *const StreamRegistry, stream_id: u64) StreamKind {
-        const entry_index = self.index(stream_id) orelse return .unknown;
-        return self.entries.items[entry_index].kind;
-    }
-
-    pub fn remove(self: *StreamRegistry, stream_id: u64) void {
-        const entry_index = self.index(stream_id) orelse return;
-        _ = self.entries.swapRemove(entry_index);
-    }
-
-    fn indexOrAppend(self: *StreamRegistry, stream_id: u64) !usize {
-        if (self.index(stream_id)) |entry_index| return entry_index;
-        try self.entries.append(self.allocator, .{ .stream_id = stream_id });
-        return self.entries.items.len - 1;
-    }
-
-    fn index(self: *const StreamRegistry, stream_id: u64) ?usize {
-        for (self.entries.items, 0..) |entry, entry_index| {
-            if (entry.stream_id == stream_id) return entry_index;
-        }
-        return null;
-    }
-};
-
-const SetKindResult = enum {
-    already_set,
-    new_kind,
-    changed_kind,
-};
-
-pub const StreamRoute = struct {
-    kind: StreamKind,
-    open_before_dispatch: ?pb.DaemonTunnelItem.MuxStreamFrame.Open = null,
-    closes_after_dispatch: bool = false,
-};
-
-pub const RouteResult = union(enum) {
-    pending_open,
-    stream: StreamRoute,
-    changed_kind,
-    unexpected,
-};
-
-pub fn routeIncomingFrame(
-    registry: *StreamRegistry,
-    mux_frame: pb.DaemonTunnelItem.MuxStreamFrame,
-) !RouteResult {
-    // Stream type is learned from the typed payload, but open frames can arrive
-    // before payload frames. Keep the open pending until the first terminal or
-    // proxy payload tells the daemon which handler owns the stream.
-    const stream_id = mux_frame.stream_id;
-    const message = mux_frame.message orelse return .unexpected;
-    switch (message) {
-        .open => |open| {
-            try registry.noteOpen(stream_id, open);
-            const existing_kind = registry.kind(stream_id);
-            if (existing_kind == .unknown) return .pending_open;
-            return .{ .stream = .{ .kind = existing_kind } };
-        },
-        .payload => |payload| {
-            const stream_kind = kindFromPayload(payload) orelse return .unexpected;
-            const kind_result = try registry.setKindIfUnknown(stream_id, stream_kind);
-            switch (kind_result) {
-                .already_set => return .{ .stream = .{ .kind = stream_kind } },
-                .changed_kind => return .changed_kind,
-                .new_kind => return .{ .stream = .{
-                    .kind = stream_kind,
-                    .open_before_dispatch = registry.pendingOpen(stream_id) orelse .{},
-                } },
-            }
-        },
-        .ack, .open_ok, .eof, .reset => {
-            const stream_kind = registry.kind(stream_id);
-            if (stream_kind == .unknown) return .unexpected;
-            return .{ .stream = .{
-                .kind = stream_kind,
-                .closes_after_dispatch = closesStream(message),
-            } };
-        },
-    }
-}
-
+/// Allocates stream ids for one side of a mux tunnel.
+///
+/// Zero is skipped because protobuf defaults make it too easy to confuse with
+/// "not set" in logs and validation.
 pub const StreamIdAllocator = struct {
     next: u64 = first_stream_id,
 
@@ -156,21 +26,6 @@ pub const StreamIdAllocator = struct {
         return id;
     }
 };
-
-fn kindFromPayload(payload: pb.DaemonTunnelItem.MuxStreamFrame.Payload) ?StreamKind {
-    const item = payload.item orelse return null;
-    return switch (item) {
-        .terminal_emulator => .terminal,
-        .proxy => .proxy,
-    };
-}
-
-fn closesStream(message: protocol.MuxStreamMessage) bool {
-    return switch (message) {
-        .eof, .reset => true,
-        else => false,
-    };
-}
 
 pub fn encodeDaemonTunnelPayload(
     allocator: std.mem.Allocator,
@@ -195,7 +50,9 @@ pub fn encodeMuxStreamPayload(
     return encodeDaemonTunnelPayload(allocator, .{ .mux_stream = mux_frame });
 }
 
-pub fn encodeOpenEnvelopeBytes(
+// Encodes only the MuxStreamFrame.Open envelope described in proto/sessh.proto;
+// the terminal/proxy typed open payload is sent as a separate mux frame.
+pub fn encodeMuxEnvelopeOpenFrameBytes(
     allocator: std.mem.Allocator,
     stream_id: u64,
     recv_next_offset: u64,
@@ -231,6 +88,9 @@ pub fn encodeOpenOkPayload(
 }
 
 pub fn TaggedFrameWrite(comptime Kind: type) type {
+    // Encoded-frame writes often complete asynchronously relative to their
+    // caller's state machine. The tag records why the frame was queued without
+    // requiring the completion path to decode serialized bytes.
     return struct {
         frame: protocol.FrameWriteState,
         kind: Kind,
@@ -330,130 +190,6 @@ test "stream id allocator starts at one and advances" {
     var allocator = StreamIdAllocator{};
     try std.testing.expectEqual(@as(u64, 1), allocator.take());
     try std.testing.expectEqual(@as(u64, 2), allocator.take());
-}
-
-test "stream registry tracks open kind and close" {
-    const allocator = std.testing.allocator;
-    var registry = StreamRegistry.init(allocator);
-    defer registry.deinit();
-
-    try registry.noteOpen(7, .{ .recv_next_offset = 3 });
-    try std.testing.expectEqual(StreamKind.unknown, registry.kind(7));
-    try std.testing.expectEqual(@as(u64, 3), registry.pendingOpen(7).?.recv_next_offset);
-
-    try std.testing.expectEqual(SetKindResult.new_kind, try registry.setKindIfUnknown(7, .terminal));
-    try std.testing.expectEqual(StreamKind.terminal, registry.kind(7));
-    try std.testing.expectEqual(SetKindResult.already_set, try registry.setKindIfUnknown(7, .terminal));
-    try std.testing.expectEqual(SetKindResult.changed_kind, try registry.setKindIfUnknown(7, .proxy));
-
-    registry.remove(7);
-    try std.testing.expectEqual(StreamKind.unknown, registry.kind(7));
-}
-
-test "mux router defers open until typed payload identifies stream kind" {
-    const allocator = std.testing.allocator;
-    var registry = StreamRegistry.init(allocator);
-    defer registry.deinit();
-
-    try std.testing.expectEqual(RouteResult.pending_open, try routeIncomingFrame(&registry, .{
-        .stream_id = 9,
-        .message = .{ .open = .{ .recv_next_offset = 4 } },
-    }));
-
-    const routed = try routeIncomingFrame(&registry, .{
-        .stream_id = 9,
-        .message = .{ .payload = .{
-            .offset = 0,
-            .item = .{ .proxy = .{ .payload = .{ .open = .{
-                .proxy_guid = "p-11111111-1111-4111-8111-111111111111",
-                .proxy_host = "localhost",
-                .proxy_port = 22,
-            } } } },
-        } },
-    });
-    switch (routed) {
-        .stream => |route| {
-            try std.testing.expectEqual(StreamKind.proxy, route.kind);
-            try std.testing.expectEqual(@as(u64, 4), route.open_before_dispatch.?.recv_next_offset);
-            try std.testing.expect(!route.closes_after_dispatch);
-        },
-        else => return error.ExpectedMuxStreamRoute,
-    }
-}
-
-test "mux router reports close after eof" {
-    const allocator = std.testing.allocator;
-    var registry = StreamRegistry.init(allocator);
-    defer registry.deinit();
-
-    _ = try routeIncomingFrame(&registry, .{
-        .stream_id = 11,
-        .message = .{ .payload = .{
-            .offset = 0,
-            .item = .{ .terminal_emulator = .{ .payload = .{ .open = .{
-                .session_guid = "s-11111111-1111-4111-8111-111111111111",
-                .resize = .{ .terminal_rows = 24, .terminal_cols = 80 },
-            } } } },
-        } },
-    });
-
-    const routed = try routeIncomingFrame(&registry, .{
-        .stream_id = 11,
-        .message = .{ .eof = .{ .final_offset = 3 } },
-    });
-    switch (routed) {
-        .stream => |route| {
-            try std.testing.expectEqual(StreamKind.terminal, route.kind);
-            try std.testing.expect(route.closes_after_dispatch);
-        },
-        else => return error.ExpectedMuxStreamRoute,
-    }
-}
-
-test "mux router keeps multiple streams independent and rejects kind changes" {
-    const allocator = std.testing.allocator;
-    var registry = StreamRegistry.init(allocator);
-    defer registry.deinit();
-
-    _ = try routeIncomingFrame(&registry, .{
-        .stream_id = 1,
-        .message = .{ .payload = .{
-            .offset = 0,
-            .item = .{ .terminal_emulator = .{ .payload = .{ .open = .{
-                .session_guid = "s-11111111-1111-4111-8111-111111111111",
-                .resize = .{ .terminal_rows = 24, .terminal_cols = 80 },
-            } } } },
-        } },
-    });
-    _ = try routeIncomingFrame(&registry, .{
-        .stream_id = 2,
-        .message = .{ .payload = .{
-            .offset = 0,
-            .item = .{ .proxy = .{ .payload = .{ .open = .{
-                .proxy_guid = "p-11111111-1111-4111-8111-111111111111",
-                .proxy_host = "localhost",
-                .proxy_port = 22,
-            } } } },
-        } },
-    });
-
-    try std.testing.expectEqual(StreamKind.terminal, registry.kind(1));
-    try std.testing.expectEqual(StreamKind.proxy, registry.kind(2));
-    try std.testing.expectEqual(RouteResult.changed_kind, try routeIncomingFrame(&registry, .{
-        .stream_id = 1,
-        .message = .{ .payload = .{
-            .offset = 1,
-            .item = .{ .proxy = .{ .payload = .{ .data = "wrong-kind" } } },
-        } },
-    }));
-
-    _ = try routeIncomingFrame(&registry, .{
-        .stream_id = 2,
-        .message = .{ .reset = .{ .code = "DONE", .message = "done" } },
-    });
-    registry.remove(2);
-    try std.testing.expectEqual(StreamKind.terminal, registry.kind(1));
-    try std.testing.expectEqual(StreamKind.unknown, registry.kind(2));
 }
 
 test "tagged frame writes preserves order and kind" {

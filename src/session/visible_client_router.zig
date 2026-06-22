@@ -18,6 +18,9 @@ const WindowSize = terminal.WindowSize;
 
 pub const VisibleClient = struct {
     fd: c.fd_t = -1,
+    // Distinguishes a new client connection from an old one that happened to
+    // use the same integer fd after close/reconnect.
+    generation: u64 = 0,
     size: WindowSize = .{},
     connected_at_unix_ms: u64 = 0,
     origin: ?terminal.Position = null,
@@ -205,6 +208,10 @@ pub const PendingWorkerClient = struct {
 pub const WorkerFdWatch = struct {
     source: dispatcher.Source = dispatcher.Source.uninitialized(),
     fd: c.fd_t = -1,
+    // Optional owner-provided identity for fd reuse. Without this, handoff from
+    // pending client to visible client can accidentally reuse and then cancel
+    // the same Dispatcher Source when the OS recycles the fd number.
+    token: u64 = 0,
 
     pub fn cancel(self: *WorkerFdWatch, daemon_dispatcher: *dispatcher.Dispatcher) void {
         _ = daemon_dispatcher;

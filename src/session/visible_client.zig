@@ -49,6 +49,12 @@ const printErrorPayload = error_payload.printPayload;
 const printParsedError = error_payload.printParsed;
 const transportExitCode = error_payload.transportExitCode;
 
+/// Why the foreground visible client stopped running.
+///
+/// These values are intentionally ssh-shaped: a normal remote process exit is
+/// different from losing the local daemon socket, and an unresponsive transport
+/// is different from confirmed remote daemon death because reconnect UI handles
+/// only the former.
 pub const VisibleClientEnd = enum {
     unresponsive,
     transport_closed,
@@ -57,6 +63,9 @@ pub const VisibleClientEnd = enum {
     client_hangup,
 };
 
+/// Result of reading worker frames while trying to recover from an
+/// unresponsive connection. Recovery is only accepted after terminal state is
+/// coherent again; arbitrary bytes are not enough when a repaint is pending.
 pub const TerminalWorkerRecovery = enum {
     recovered,
     transport_closed,
@@ -92,6 +101,9 @@ pub fn nowUnixMs() u64 {
     return @intCast(ms);
 }
 
+// Decoded draw frame plus the optional presentation bytes that need special
+// handling. Normal draw bytes update stdout immediately; exit-restore bytes are
+// retained until the visible client is actually leaving the session.
 const DrawPayload = struct {
     scrollback_cursor: []const u8,
     viewport_offset: i32,
@@ -488,6 +500,10 @@ pub fn reconnectSessionOnTerminalWorkerCancellable(
     });
 }
 
+// Shared reconnect request shape for blocking reconnect and cancellable
+// reconnect races. The cancellable form is used while an old transport may
+// still recover, so it must be able to abandon the new read without consuming
+// stale frames as success.
 const ReconnectTerminalWorkerRequest = struct {
     blocking: core_blocking.Blocking,
     worker_fds: TerminalWorkerFds,
@@ -1030,6 +1046,9 @@ fn runVisibleClientLoop(
     return end;
 }
 
+// Inputs needed to run the foreground terminal loop. Grouping them prevents the
+// dispatcher loop setup from taking a long list of loosely-related fd/session
+// parameters.
 const VisibleTerminalRun = struct {
     blocking: core_blocking.Blocking,
     input_fd: c.fd_t,
@@ -1038,6 +1057,9 @@ const VisibleTerminalRun = struct {
     options: VisibleClientOptions,
 };
 
+// Event-driven foreground loop for one visible terminal. It owns local stdin,
+// stdout, the worker frame connection, resize/repaint maintenance, ssh-style
+// escape controls, and terminal output backpressure.
 const VisibleTerminalLoop = struct {
     const Mode = enum {
         normal,

@@ -386,6 +386,10 @@ fn handleTerminalMuxPayloadOpen(
     if (ctx.daemon_dispatcher) |d| {
         ctx.sessions.items[stream_index].endpoint.initReader(ctx.allocator);
         try ctx.sessions.items[stream_index].endpoint.initDispatchSource(d);
+        // Try the first nonblocking flush now. The dispatcher remains
+        // responsible for backpressure if the worker socket cannot accept all
+        // queued bytes immediately.
+        _ = try ctx.sessions.items[stream_index].endpoint.drainWrites(d);
     }
     ctx.sessions.items[stream_index].session_guid = session_guid;
     ctx.sessions.items[stream_index].inbound_next_offset = @max(ctx.sessions.items[stream_index].inbound_next_offset, payload_offset +| 1);
@@ -481,7 +485,12 @@ fn handleTerminalMuxPayload(
         }
     }
     try queueTerminalWorkerItem(ctx.allocator, stream, te_item);
-    if (ctx.daemon_dispatcher != null) stream.endpoint.updateDispatchSource();
+    if (ctx.daemon_dispatcher) |d| {
+        // Queueing is enough for correctness, but an immediate nonblocking
+        // flush keeps in-daemon workers responsive even when no other tunnel
+        // event is about to wake this mux task.
+        _ = try stream.endpoint.drainWrites(d);
+    }
 }
 
 pub fn drainTerminalWorkerWrites(

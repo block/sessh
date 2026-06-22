@@ -152,6 +152,13 @@ pub const RecordRemoteProcessStartedOptions = struct {
     process: pb.DaemonTunnelItem.RemoteProcessIdentity,
 };
 
+/// Persist the identity of a remote worker process after the remote daemon has
+/// reported its pid/start-time/socket path.
+///
+/// If the local client or daemon dies before the normal hang-up request reaches
+/// the remote side, a later cleanup sweep uses this record to ask the remote
+/// daemon to close the worker. The filename owns the guid so rewrites cannot
+/// accidentally disagree with the resource identity.
 pub fn recordRemoteProcessStarted(options: RecordRemoteProcessStartedOptions) !void {
     const allocator = options.allocator;
     const local = options.local;
@@ -167,6 +174,9 @@ pub fn recordRemoteProcessStarted(options: RecordRemoteProcessStartedOptions) !v
     try writeRecord(allocator, record);
 }
 
+/// Delete one durable cleanup record after hang-up has been delivered or the
+/// target process is known to be gone. Missing records are success because
+/// multiple daemons may race to clean the same stale resource.
 pub fn deleteRecordByGuid(allocator: std.mem.Allocator, guid: []const u8) void {
     const path = recordPath(allocator, guid) catch return;
     defer allocator.free(path);
@@ -184,6 +194,11 @@ pub const RemoteProcessCleanupRequestQueuedOptions = struct {
     request: pb.DaemonTunnelItem.RemoteProcessCleanupRequest,
 };
 
+/// Handle a cleanup request received from the other daemon over the mux tunnel.
+///
+/// If the request targets this daemon process, close the in-memory terminal or
+/// proxy worker directly. If it targets an older compatible process, fall back
+/// to pid/start-time validation and SIGHUP.
 pub fn handleRemoteProcessCleanupRequestQueued(options: RemoteProcessCleanupRequestQueuedOptions) !void {
     const allocator = options.allocator;
     const mux_writer = options.mux_writer;
@@ -194,6 +209,8 @@ pub fn handleRemoteProcessCleanupRequestQueued(options: RemoteProcessCleanupRequ
     try queueRemoteProcessCleanupResponse(mux_writer, process, result);
 }
 
+/// The requesting side deletes its durable record once the remote side says the
+/// hang-up request was delivered or the process was already missing.
 pub fn handleRemoteProcessCleanupResponse(
     allocator: std.mem.Allocator,
     response: pb.DaemonTunnelItem.RemoteProcessCleanupResponse,
@@ -202,6 +219,10 @@ pub fn handleRemoteProcessCleanupResponse(
     deleteRecordByGuid(allocator, process.guid);
 }
 
+/// Try to become the daemon responsible for the periodic durable-record sweep.
+///
+/// This never waits for the lock. If another daemon is already sweeping, this
+/// daemon should keep serving clients and try again at the next wakeup.
 pub fn tryAcquireSweepLock(
     allocator: std.mem.Allocator,
 ) !?SweepLock {
@@ -244,6 +265,8 @@ pub fn sweepDueAndMark(
     wakeup_interval_ms: u64,
     now_ms: u64,
 ) !bool {
+    // The cleanup-sweep file's mtime is the shared throttle. It keeps multiple
+    // daemons from all scanning the state directory every wakeup interval.
     const stat = try lock.file.stat();
     const last_ms = if (stat.size == 0) 0 else fileMtimeUnixMs(stat);
     if (wakeup_interval_ms > 0 and last_ms > 0 and now_ms -| last_ms < wakeup_interval_ms) {
